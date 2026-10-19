@@ -730,7 +730,11 @@ class Emitter:
 
     def _scalar_reads(self) -> list[str]:
         """Bind the runtime scalars (as the user's names) and the runtime indices computed from them."""
-        lines = [f"{p} = {self._weak()}({self.scalars_ref}[{n}])" for n, p in enumerate(self.int_scalars)]
+        lines = []
+        for n, p in enumerate(self.int_scalars):  # a weak int32, or a narrower integer as itself (`scalar_aval`)
+            dtype, value = np.dtype(self.spec.specs[self.nest.params.index(p)].dtype), f"{self.scalars_ref}[{n}]"
+            read = f"{self._weak()}({value})" if dtype == np.int32 else f"{value}.astype(jnp.{dtype})"
+            lines.append(f"{p} = {read}")
         for n, (p, weak) in enumerate(self.float_scalars):
             value = f"{self.fscalars_ref}[{n}]"
             lines.append(f"{p} = {self._weak()}({value})" if weak else f"{p} = {value}")

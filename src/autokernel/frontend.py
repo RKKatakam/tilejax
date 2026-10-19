@@ -28,7 +28,7 @@ from __future__ import annotations
 import ast
 import inspect
 import textwrap
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -41,11 +41,13 @@ __all__ = [
     "Reduction",
     "Store",
     "assigned_name",
+    "free_loads",
     "function_ast",
     "is_simple_assignment",
     "parse",
     "parse_function",
     "reads",
+    "scope_bound",
 ]
 
 
@@ -168,9 +170,32 @@ def parse(fn: Callable) -> LoopNest:
 def parse_function(fdef: ast.FunctionDef, fn_name: str, first_line: int) -> LoopNest:
     """Parse an already-parsed function (lines relative to `first_line` of its file) into a LoopNest.
 
-    `fn_name` names the kernel in errors and generated code, so it must be an identifier.
+    `fn_name` names the kernel in errors and generated code, so it must be an identifier. `a @= b` is
+    rewritten to `a = a @ b` in `fdef` (the same thing for arrays), so `@` means one thing everywhere.
     """
+    _MatmulAssign().visit(fdef)
     return _Parser(fn_name, first_line, fdef).parse()
+
+
+class _MatmulAssign(ast.NodeTransformer):
+    """`a @= b` -> `a = a @ b`: `mxu.rewrite_matmuls` then gives it the MXU's accumulation, like any `@`."""
+
+    def visit_AugAssign(self, s: ast.AugAssign) -> ast.stmt:
+        if not (isinstance(s.op, ast.MatMult) and isinstance(s.target, ast.Name)):
+            return s
+        value = ast.copy_location(ast.BinOp(ast.Name(s.target.id, ast.Load()), ast.MatMult(), s.value), s)
+        return ast.fix_missing_locations(ast.copy_location(ast.Assign([s.target], value), s))
+
+
+def _local_names(fdef: ast.FunctionDef) -> set[str]:
+    """The function's local variables: its parameters and every name it assigns (not in a comprehension)."""
+    comprehension_vars = {id(t) for c in ast.walk(fdef) if isinstance(c, ast.comprehension) for t in ast.walk(c.target)}
+    stored = {
+        n.id
+        for n in ast.walk(fdef)
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store) and id(n) not in comprehension_vars
+    }
+    return stored | {a.arg for a in fdef.args.args}
 
 
 class _Parser:
@@ -244,17 +269,48 @@ class _Parser:
         return ret
 
     def _prologue(self, stmts: list[ast.stmt], top: ast.For) -> tuple[list[ast.stmt], list[Output]]:
-        """Split the statements before the loop nest into shape-level constants and output allocations."""
+        """Split the statements before the loop nest into shape-level constants and output allocations.
+
+        Each runs, as in Python, with the names assigned before it; but the kernel evaluates the allocations
+        after the whole prologue, so a name an allocation reads must not change after it.
+        """
         prologue, allocs = [], {}
+        local = _local_names(self.fdef)
+        assigned = set(self.params)
+        read_by: dict[str, ast.stmt] = {}  # a name an allocation reads -> that allocation
         for s in stmts:
+            for name in sorted(reads(s) & local - assigned):
+                raise self.err(
+                    s,
+                    f"`{name}` is read before it is assigned (the function assigns it later, so Python would raise "
+                    "UnboundLocalError here); assign it before this line or use another name",
+                )
             if self._is_assign_to(s, self.out_vars):
-                allocs[s.targets[0].id] = s.value
+                var, value = s.targets[0].id, s.value
+                if var in self.params and not (isinstance(value, ast.Name) and value.id == var):
+                    raise self.err(
+                        s,
+                        f"output `{var}` rebinds parameter `{var}`, which the loop nest would still read as the "
+                        "input; rename the output",
+                    )
+                allocs[var] = value
+                read_by.update((name, s) for name in reads(s) if name not in read_by)
+                assigned.add(var)
                 continue
             if not isinstance(s, (ast.Assign, ast.AnnAssign, ast.Assert, ast.Pass)):
                 raise self.err(s, "only simple constant assignments / asserts may precede the loop nest")
-            for t in ast.walk(s):
-                if isinstance(t, ast.Name) and isinstance(t.ctx, ast.Store) and t.id in self.params:
-                    raise self.err(s, f"the prologue may not rebind input `{t.id}`")
+            stored = {t.id for t in ast.walk(s) if isinstance(t, ast.Name) and isinstance(t.ctx, ast.Store)}
+            for name in sorted(stored & set(self.params)):
+                raise self.err(s, f"the prologue may not rebind input `{name}`")
+            for name in sorted(stored & set(read_by)):
+                alloc = read_by[name]
+                raise self.err(
+                    s,
+                    f"`{name}` is reassigned after the output allocation `{ast.unparse(alloc)}` (line "
+                    f"{self.first_line + alloc.lineno - 1}) reads it; the kernel evaluates the allocations after the "
+                    "prologue, so use another name here",
+                )
+            assigned |= stored
             prologue.append(s)
         for var in self.out_vars:
             if var not in allocs:
@@ -412,6 +468,19 @@ class _Parser:
             if target in self.params or target in loop_vars:
                 raise self.err(s, f"can't assign to input / loop variable `{target}` inside the loop nest")
         temporaries = {assigned_name(s) for s in nest.tile_statements()}
+        code = [*nest.tile_statements(), *(st.node for st in nest.stores)]
+        guards = [c for c in [nest.guard, *(r.guard for r in nest.reductions)] if c is not None]
+        for node in code + guards:
+            for n in ast.walk(node):
+                if isinstance(n, ast.NamedExpr):
+                    raise self.err(n, "`:=` isn't supported inside the loop nest; assign in a statement of its own")
+        for node in code:  # the kernel's code renames these names (masks run as the user's Python)
+            for name in sorted(scope_bound(node) & {*self.params, *nest.out_vars, *temporaries}):
+                raise self.err(
+                    node,
+                    f"a comprehension or lambda binds `{name}`, which is also an input, output or value of the "
+                    "loop nest; rename it",
+                )
         masks = [(nest.guard, nest.guard_node, "tile mask")]
         masks += [(r.guard, r.guard_node, "reduction mask") for r in nest.reductions]
         for cond, node, what in masks:
@@ -452,11 +521,19 @@ class _Parser:
         reduction loop's variable keeps its last value after the loop, as in Python.
         """
         defined: set[str] = set()
+        masked: dict[str, ast.stmt] = {}  # a name only a masked reduction loop assigns -> that loop's mask
 
         def check(node: ast.AST, names: set[str]) -> None:
             for name in sorted(names & tile_names - defined):
                 if name in {lp.var for lp in nest.loops}:
                     raise self.err(node, f"loop variable `{name}` is read before its loop starts")
+                if name in masked:
+                    line = self.first_line + masked[name].lineno - 1
+                    raise self.err(
+                        node,
+                        f"`{name}` is only assigned under the reduction mask (line {line}), which may skip every "
+                        "step of a tile and leave it unassigned; assign it before that reduction loop too",
+                    )
                 raise self.err(
                     node,
                     f"`{name}` is read before it is assigned in the tile; assign it inside the loop nest first "
@@ -476,23 +553,64 @@ class _Parser:
             defined.update(lp.var for lp in r.loops)
             if r.guard is not None:
                 check(r.guard_node, reads(r.guard))
+            before = set(defined)
             run(r.body)
+            if r.guard is not None:  # the mask may skip the whole loop: only what was assigned before is sure
+                masked.update((name, r.guard_node) for name in defined - before)
+                defined.intersection_update(before)
             run(seg)
         for st in nest.stores:
             check(st.node, reads(st.value))
 
 
+_COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)
+
+
+def free_loads(node: ast.AST, bound: frozenset[str] = frozenset()) -> Iterator[ast.Name]:
+    """The names `node` reads from its scope: not those its comprehensions and lambdas bind themselves."""
+    if isinstance(node, _COMPREHENSIONS):
+        gens = node.generators
+        inner = bound | {n.id for g in gens for n in ast.walk(g.target) if isinstance(n, ast.Name)}
+        yield from free_loads(gens[0].iter, bound)  # evaluated outside the comprehension
+        for g in gens:
+            for part in ([g.iter] if g is not gens[0] else []) + g.ifs:
+                yield from free_loads(part, inner)
+        for part in (node.key, node.value) if isinstance(node, ast.DictComp) else (node.elt,):
+            yield from free_loads(part, inner)
+        return
+    if isinstance(node, ast.Lambda):
+        a = node.args
+        for part in [*a.defaults, *(d for d in a.kw_defaults if d is not None)]:
+            yield from free_loads(part, bound)
+        yield from free_loads(node.body, bound | {p.arg for p in ast.walk(a) if isinstance(p, ast.arg)})
+        return
+    if isinstance(node, ast.Name):
+        if isinstance(node.ctx, ast.Load) and node.id not in bound:
+            yield node
+        return
+    for child in ast.iter_child_nodes(node):
+        yield from free_loads(child, bound)
+
+
+def scope_bound(node: ast.AST) -> set[str]:
+    """The names the comprehensions and lambdas in `node` bind for themselves."""
+    names = set()
+    for n in ast.walk(node):
+        if isinstance(n, ast.comprehension):
+            names |= {t.id for t in ast.walk(n.target) if isinstance(t, ast.Name)}
+        elif isinstance(n, ast.Lambda):
+            names |= {a.arg for a in ast.walk(n.args) if isinstance(a, ast.arg)}
+    return names
+
+
 def reads(node: ast.AST) -> set[str]:
-    """The names a statement (or expression) reads, not counting those its comprehensions and lambdas bind.
+    """The names a statement (or expression) reads, not counting those its comprehensions and lambdas bind
+    where they bind them (`t + sum(t for t in r)` reads `t`).
 
     An augmented assignment `x += v` reads `x`.
     """
     expr = node.value if isinstance(node, (ast.Assign, ast.AugAssign)) else node
-    loaded = {n.id for n in ast.walk(expr) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
-    bound = {n.id for n in ast.walk(expr) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
-    bound |= {
-        a.arg for n in ast.walk(expr) if isinstance(n, ast.Lambda) for a in ast.walk(n.args) if isinstance(a, ast.arg)
-    }
+    loaded = {n.id for n in free_loads(expr)}
     if isinstance(node, ast.AugAssign):
         loaded.add(node.target.id)
-    return loaded - bound
+    return loaded

@@ -22,11 +22,13 @@ __all__ = ["helpers", "traceable_masks"]
 
 _WHERE = "_autokernel_where"
 _MISSING = "_autokernel_missing"
-_XP = "xp"  # the module `analysis._vectorize` writes array operations with
 
 
 class _Missing:
-    """A variable a masked step assigns that had no value before (it stays as the step computes it)."""
+    """A variable a masked step assigns that had no value before (it stays as the step computes it).
+
+    Only a value the reduction body itself uses can be missing: the frontend rejects reading one after its
+    loop unless it was assigned before the loop too, so a skipped step's value is never observed."""
 
 
 def _where(keep: Any, new: Any, old: Any) -> Any:
@@ -37,19 +39,17 @@ def _where(keep: Any, new: Any, old: Any) -> Any:
 
 def helpers() -> dict[str, Any]:
     """The names a reference built from `traceable_masks` needs."""
-    return {_WHERE: _where, _MISSING: _Missing(), _XP: jnp}
+    return {_WHERE: _where, _MISSING: _Missing(), analysis.XP: jnp}
 
 
 def traceable_masks(nest: frontend.LoopNest) -> ast.FunctionDef:
     """A copy of the nest's function with every mask that reads input values evaluated as an array."""
     memo: dict[int, Any] = {}
     fdef = copy.deepcopy(nest.fdef, memo)
-    if any(isinstance(n, ast.Name) and n.id == _XP for n in ast.walk(fdef)):
-        return fdef  # the user's own `xp`: leave the masks as Python
     masks = [(nest.guard_node, True)] + [(r.guard_node, False) for r in nest.reductions]
     found: dict[int, tuple[int, bool]] = {}
     for k, (node, tile) in enumerate(masks):
-        if node is not None and analysis._reads_inputs(nest, node.test):
+        if node is not None and analysis.reads_inputs(nest, node.test):
             found[id(memo[id(node)])] = (k, tile)
     if not found:
         return fdef
@@ -65,7 +65,7 @@ def traceable_masks(nest: frontend.LoopNest) -> ast.FunctionDef:
         var = f"_autokernel_keep{k}"
         rest = body[1:] if skip else guard.body
         rewrite = (lambda s: _masked_store(s, var) if id(s) in stores else s) if tile else (lambda s: _masked(s, var))
-        assign = ast.Assign([ast.Name(var, ast.Store())], analysis._vectorize(ast.copy_location(keep, guard.test)))
+        assign = ast.Assign([ast.Name(var, ast.Store())], analysis.vectorize(ast.copy_location(keep, guard.test)))
         parent.body = [ast.copy_location(assign, guard), *map(rewrite, rest)]
     return ast.fix_missing_locations(fdef)
 

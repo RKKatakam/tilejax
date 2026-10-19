@@ -30,10 +30,11 @@ from jax.extend.core import Literal
 
 from . import hardware, mxu
 from .errors import AutoKernelError
-from .frontend import Loop, LoopNest, Reduction, assigned_name, reads
+from .frontend import Loop, LoopNest, Reduction, assigned_name, free_loads, reads
 from .views import ViewError, ViewMap, Window
 
 __all__ = [
+    "XP",
     "Accumulator",
     "Block",
     "Environment",
@@ -48,8 +49,10 @@ __all__ = [
     "environment",
     "evaluate_mask",
     "is_scalar_spec",
+    "reads_inputs",
     "specialize",
     "user_globals",
+    "vectorize",
 ]
 
 Scalar = bool | int | float
@@ -268,14 +271,17 @@ class Specialization:
         """A copy of `node` (from `unit`, or None for the output stores) with `@` as an MXU matmul and the
         variables of finished reduction loops as their final values."""
         done = self.finished_loops(len(self.phases) if unit is None else unit.index)
+        code = mxu.rewrite_matmuls(node)
+        # Only the loop variables themselves: not a comprehension's or lambda's own variable of the same name.
+        free = {id(n) for n in free_loads(code) if n.id in done}
 
         class Finished(ast.NodeTransformer):
             def visit_Name(self, n: ast.Name) -> ast.AST:
-                if n.id in done and isinstance(n.ctx, ast.Load):
+                if id(n) in free:
                     return ast.copy_location(ast.Constant(done[n.id]), n)
                 return n
 
-        return ast.fix_missing_locations(Finished().visit(mxu.rewrite_matmuls(node)))
+        return ast.fix_missing_locations(Finished().visit(code))
 
     def namespace(self, arrays: Sequence[Any] | None = None, **extra: Any) -> dict[str, Any]:
         """What the user's code can see: constants, the inputs (as `arrays`, or their specs) and `extra`."""
@@ -300,14 +306,12 @@ class Specialization:
 
     def operand(self, node: ast.Subscript, phase: int | None) -> Operand:
         """The operand a tile slice of an input refers to (`node` may be a copy of the collected read)."""
-        key = (node.value.id, ast.dump(node.slice), phase)
-        op = self._reads.get(key)
-        if op is None:  # not one of the collected reads: match it by block
+        op = self._reads.get((node.value.id, ast.dump(node.slice), phase))
+        if op is None:  # not one of the collected reads (`_reads` stays as collected: it keys the trace cache)
             block = self.resolve_input(node, phase)
             op = next((o for o in self.operands if (o.param, o.block.key) == (node.value.id, block.key)), None)
             if op is None:
                 raise AssertionError(f"operand for {ast.unparse(node)} was not collected")  # analysis bug
-            self._reads[key] = op
         return op
 
 
@@ -401,8 +405,15 @@ def user_globals(fn: Callable | Environment) -> dict[str, Any]:
     """The names `fn`'s body can see besides its parameters: module globals and closure cells."""
     if isinstance(fn, Environment):
         return dict(fn.names)
+    fn = fn.__func__ if inspect.ismethod(fn) else fn
     env = dict(fn.__globals__)
-    env.update(inspect.getclosurevars(fn).nonlocals)
+    for name, cell in zip(fn.__code__.co_freevars, fn.__closure__ or (), strict=True):
+        try:
+            env[name] = cell.cell_contents
+        except ValueError:  # an empty cell
+            raise AutoKernelError(
+                f"{fn.__name__}: closure variable `{name}` has no value yet; assign it before calling the kernel"
+            ) from None
     return env
 
 
@@ -522,7 +533,8 @@ def _added_to(s: ast.stmt | None, var: str) -> ast.expr | None:
 
 def _is_zeros(spec: Specialization, value: ast.expr) -> bool:
     """Is `value` (a tile statement's expression) an array of zeros, whatever the code evaluating it reads?"""
-    if any(name in spec.loops or name in spec.nest.params for name in reads(value)):
+    # Evaluated on its own, so it may only read names the tile doesn't assign (they'd be the globals here).
+    if any(name in spec.code.rebound or name in spec.nest.params for name in reads(value)):
         return False
     try:
         fill = _constant_fill(spec, spec.code.compile(value, "eval"))
@@ -537,10 +549,13 @@ def is_scalar_spec(s: Any) -> bool:
 
 
 def scalar_aval(s: Any) -> jax.ShapeDtypeStruct:
-    """How the kernel reads a runtime scalar of this type: a weakly typed int32 for any integer (as a Python
-    int); an f32 for an f32, weakly typed if it is; and a weakly typed f32 for narrower floats (a bf16 is read
-    as f32, then mixes with tiles like a Python float, which is also what a bf16 does with float tiles)."""
+    """How the kernel reads a runtime scalar of this type: a weakly typed int32 for a 32-bit integer (as a
+    Python int); a narrower integer (int8, uint16, ...) as itself, strongly typed, so its arithmetic wraps as
+    in Python; an f32 for an f32, weakly typed if it is; and a weakly typed f32 for narrower floats (a bf16 is
+    read as f32, then mixes with tiles like a Python float, which is also what a bf16 does with float tiles)."""
     if jnp.issubdtype(s.dtype, jnp.integer):
+        if np.dtype(s.dtype).itemsize < 4 and not getattr(s, "weak_type", False):
+            return jax.ShapeDtypeStruct((), s.dtype)
         return jax.ShapeDtypeStruct((), jnp.int32, weak_type=True)
     weak = bool(getattr(s, "weak_type", False)) or np.dtype(s.dtype) != np.float32
     return jax.ShapeDtypeStruct((), jnp.float32, weak_type=weak)
@@ -555,7 +570,12 @@ def _bounds(lp: Loop, code: UserCode, env: dict[str, Any], nest: LoopNest) -> Lo
             f"loop `{lp.var}`: range({start}, {stop}, {step}) must be non-empty, positive-step and aligned "
             "(start and stop-start divisible by step)",
         )
+    if start < _INT32_MIN or stop - step > _INT32_MAX:
+        raise nest.error(lp.node, f"loop `{lp.var}`: range({start}, {stop}, {step}) doesn't fit the kernel's int32")
     return LoopBounds(lp.var, start, stop, step)
+
+
+_INT32_MIN, _INT32_MAX = int(np.iinfo(np.int32).min), int(np.iinfo(np.int32).max)
 
 
 def _units(nest: LoopNest) -> list[Unit]:
@@ -591,6 +611,8 @@ def _resolve_block(spec: Specialization, name: str, index: ast.expr, full: tuple
     text = _index_text(index)
     what = f"`{name}[{text}]`"
     dims = list(index.elts) if isinstance(index, ast.Tuple) else [index]
+    if any(isinstance(d, ast.Constant) and d.value is Ellipsis for d in dims):
+        raise spec.nest.error(index, f"{what}: `...` isn't supported in a tile index; index every dim")
     if len(dims) > len(full):
         raise spec.nest.error(index, f"{what}: {len(dims)} indices for a rank-{len(full)} array")
     dims += [ast.Slice()] * (len(full) - len(dims))
@@ -625,6 +647,12 @@ def _resolve_dim(
         if names & set(spec.loops):
             raise nest.error(
                 index, f"{what}: an integer index must be a loop variable or a constant, not `{ast.unparse(sl)}`"
+            )
+        for name in sorted(names & spec.code.rebound):
+            raise nest.error(
+                index,
+                f"{what}: the index `{ast.unparse(sl)}` can't read `{name}`, which the loop nest assigns: an integer "
+                "index is computed outside the tile body, from constants and scalar inputs",
             )
         if names & set(spec.scalars):
             _check_runtime_index(spec, index, what, sl)
@@ -767,7 +795,7 @@ def _view_window(spec: Specialization, param: str, block: Block) -> Window | Non
     nest = spec.nest
     # A mask or an allocation reading the view's values runs outside the kernel, on the view itself.
     guards = [nest.guard, *(r.guard for r in nest.reductions)]
-    if any(g is not None and param in reads(g) and _reads_inputs(nest, g) for g in guards):
+    if any(g is not None and param in reads(g) and reads_inputs(nest, g) for g in guards):
         raise ViewError(param, f"{nest.fn_name}: a mask reads `{param}`, a view: it needs the view's values")
     if any(param in reads(o.alloc) for o in nest.outputs):
         raise ViewError(param, f"{nest.fn_name}: an output allocation reads `{param}`, a view")
@@ -912,16 +940,20 @@ _STATIC_ATTRS = frozenset({"shape", "dtype", "ndim", "size"})  # what an input's
 _ELEMENTWISE_BUILTINS = {"max": "maximum", "min": "minimum", "abs": "abs"}
 
 
-def _reads_inputs(nest: LoopNest, cond: ast.expr) -> bool:
+# The module `vectorize` writes array operations with, named so it can't hide a user's name.
+XP = "_autokernel_xp"
+
+
+def reads_inputs(nest: LoopNest, cond: ast.expr) -> bool:
     """Does a mask read input values (not just an input's `.shape`, `.dtype`, ...)?"""
     static = {id(n.value) for n in ast.walk(cond) if isinstance(n, ast.Attribute) and n.attr in _STATIC_ATTRS}
-    return any(isinstance(n, ast.Name) and n.id in nest.params and id(n) not in static for n in ast.walk(cond))
+    return any(n.id in nest.params and id(n) not in static for n in free_loads(cond))
 
 
-def _vectorize(cond: ast.expr) -> ast.expr:
+def vectorize(cond: ast.expr) -> ast.expr:
     """Rewrite a scalar mask condition so it evaluates elementwise on arrays of loop coordinates.
 
-    `xp` is numpy at trace time or jax.numpy on device. Each rewrite keeps Python's value, not just its
+    `xp` (`XP` in the code) is jax.numpy. Each rewrite keeps Python's value, not just its
     truth: `a and b` / `a or b` become `xp.where(a, b, a)` / `xp.where(a, a, b)`, `not` becomes
     `xp.logical_not`, `~` inverts integers (`~True` is -2 in Python, not False), chained comparisons are
     joined with `xp.logical_and`, `a if c else b` becomes `xp.where`, and the builtins `max`, `min` and
@@ -930,7 +962,7 @@ def _vectorize(cond: ast.expr) -> ast.expr:
     """
 
     def call(fn: str, *args: ast.expr) -> ast.expr:
-        return ast.Call(ast.Attribute(ast.Name("xp", ast.Load()), fn, ast.Load()), list(args), [])
+        return ast.Call(ast.Attribute(ast.Name(XP, ast.Load()), fn, ast.Load()), list(args), [])
 
     class Vectorizer(ast.NodeTransformer):
         def visit_BoolOp(self, n: ast.BoolOp) -> ast.AST:
@@ -1011,7 +1043,7 @@ def evaluate_mask(spec: Specialization, phase: int | None, inputs: dict[str, Any
     The mask is evaluated once per combination of the values of the loops it reads, then spread over the
     tiles and steps. Without `inputs` (a static mask), each evaluation is the user's Python on Python ints,
     so it means exactly what it says. A mask reading `inputs` runs on device: jax.numpy, vectorised over the
-    combinations with `jax.vmap`, with its Python operators rewritten into their array forms (`_vectorize`).
+    combinations with `jax.vmap`, with its Python operators rewritten into their array forms (`vectorize`).
     """
     cond, _, _ = _mask(spec, phase)
     loops = list(spec.parallel) + (list(spec.phases[phase].loops) if phase is not None else [])
@@ -1027,10 +1059,11 @@ def evaluate_mask(spec: Specialization, phase: int | None, inputs: dict[str, Any
             values[at] = bool(eval(code, env))
         xp = np
     else:
-        code = spec.code.compile(_vectorize(cond), "eval")
-        env["xp"] = jnp
+        code = spec.code.compile(vectorize(cond), "eval")
+        env[XP] = jnp
 
-        def one(*coords):
+        def one(*coords):  # the coordinates as weakly typed int32s, the Python ints they are in the loops
+            coords = [_convert_element_type(c, np.dtype(np.int32), weak_type=True) for c in coords]
             return jnp.asarray(eval(code, {**env, **dict(zip([lb.var for lb in read], coords, strict=True))}))
 
         mesh = np.meshgrid(*[np.asarray(g, np.int32) for g in grids], indexing="ij")
@@ -1092,7 +1125,7 @@ def _tile_mask(spec: Specialization) -> tuple[list[tuple[int, ...]], list[tuple[
         if isinstance(n, ast.Name) and n.id in reduction_vars:
             raise nest.error(nest.guard_node, f"the tile mask can't depend on the reduction loop `{n.id}`")
     spec.tiles = tiles  # evaluate_mask reads them
-    if _reads_inputs(nest, nest.guard):
+    if reads_inputs(nest, nest.guard):
         _check_mask(spec, None, runtime=True)
         return tiles, [], True  # every tile is a candidate; the device decides
     keep = _check_mask(spec, None, runtime=False)
@@ -1108,7 +1141,7 @@ def _phase_masks(spec: Specialization) -> tuple[list[np.ndarray | None], list[bo
     runtime: list[bool] = []
     for phase in spec.phases:
         guard = phase.reduction.guard
-        on_device = guard is not None and _reads_inputs(spec.nest, guard)
+        on_device = guard is not None and reads_inputs(spec.nest, guard)
         keep = None if guard is None else _check_mask(spec, phase.index, on_device)
         masks.append(None if keep is None else np.array(keep, bool))
         runtime.append(on_device)
