@@ -597,3 +597,21 @@ def test_long_nests_are_not_fused_when_fusing_would_hide_too_little(monkeypatch)
     lowered = autokernel.tpu(mlp).lower(*mlp_inputs())
     assert lowered.names == ["mlp_h", "mlp_y"]
     assert "fusing would hide only" in " ".join(str(c) for c in lowered.cuts)
+
+
+def test_a_users_vmem_limit_is_the_fused_kernels_budget():
+    args = mlp_inputs()
+    fused = autokernel.tpu(mlp).lower(*args)[0][1]
+    alone = max(lw.estimate.vmem_bytes for _, lw in fused.parts)
+    assert alone < fused.estimate.vmem_bytes
+    limit = (alone + fused.estimate.vmem_bytes) // 2  # each nest fits on its own, the two together don't
+    lowered = autokernel.tpu(mlp, vmem_limit_bytes=limit).lower(*args)
+    assert lowered.names == ["mlp_h", "mlp_y"] and any("of VMEM" in c for c in lowered.cuts)
+    roomy = autokernel.tpu(mlp, vmem_limit_bytes=2 * fused.estimate.vmem_bytes).lower(*args)
+    assert roomy.names == ["mlp_h+mlp_y"]
+    assert f"vmem_limit_bytes={2 * fused.estimate.vmem_bytes}" in roomy[0][1].source
+
+
+def test_the_fused_wrapper_says_how_each_part_buffers_its_inputs():
+    source = autokernel.tpu(mlp).source(*mlp_inputs())
+    assert "0. mlp_h: 8 steps of 4 tiles; streamed inputs 3-buffered, others fetched once per tile" in source

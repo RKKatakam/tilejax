@@ -1122,7 +1122,9 @@ class Emitter:
         aliased allocations don't read them.
         """
         prep, smem, inits = self._wrapper_inputs()
-        body = [*self._wrapper_helpers(), *prep, f"return [{', '.join(smem)}], [{', '.join(inits)}]"]
+        helpers = self._wrapper_helpers()
+        weak = [*_WEAK.format(name=self.weak).splitlines(), "", ""] if helpers and self.weak is not None else []
+        body = [*weak, *helpers, *prep, f"return [{', '.join(smem)}], [{', '.join(inits)}]"]
         return self._contained(name, ", ".join(self._params().values()), body)
 
     def scratch(self) -> list[str]:
@@ -1133,6 +1135,9 @@ class Emitter:
 
     def describe(self) -> str:
         return self._describe()
+
+    def buffering(self) -> str:
+        return self._buffering()
 
     def _buffering(self) -> str:
         """How the wrapper comment describes the inputs' VMEM slots."""
@@ -1251,9 +1256,9 @@ class Emitter:
 
         class Xp(ast.NodeTransformer):
             def visit_Name(self, n: ast.Name) -> ast.AST:
-                return ast.copy_location(ast.Name(xp, n.ctx), n) if n.id == "xp" else n
+                return ast.copy_location(ast.Name(xp, n.ctx), n) if n.id == analysis.XP else n
 
-        value = f"jnp.asarray({ast.unparse(Xp().visit(analysis._vectorize(cond)))})"
+        value = f"jnp.asarray({ast.unparse(Xp().visit(analysis.vectorize(cond)))})"
         tag = "tile" if phase is None else f"phase{phase}"
         steps = spec.phases[phase].steps if phase is not None else None
         shape = (len(spec.tiles),) if phase is None else (len(spec.tiles), steps)
@@ -1274,8 +1279,12 @@ class Emitter:
                 k = [b.var for b in spec.phases[phase].loops].index(lb.var)
                 pos = np.unravel_index(np.arange(steps), counts)[k][None, :].astype(np.int32)
             positions.append(self._array(f"{tag}_{lb.var}_positions", pos))
+        # The coordinates as weakly typed int32s: the Python ints they are in the loops.
+        names = [lb.var for lb in read]
+        weak = ", ".join(f"{self._weak()}({v})" for v in names)
         return [
-            f"{var} = jax.vmap(lambda {', '.join(args)}: {value})({', '.join(coords)})",
+            f"{var} = jax.vmap(lambda {', '.join(names)}: (lambda {', '.join(args)}: {value})({weak}))"
+            f"({', '.join(coords)})",
             f"{var} = {var}.astype(bool).reshape({tuple(len(g) for g in grids)})",
             f"{var} = jnp.broadcast_to({var}[{', '.join(positions)}], {shape})",
         ]
@@ -1343,7 +1352,8 @@ class Emitter:
         kernel = self._kernel(kernel_name)
         wrapper = self._wrapper(kernel_name)
         self._check_modules()
-        helpers = [*self._kernel_helpers(), *(["", "", *w] if (w := self._wrapper_helpers()) else [])]
+        wrapper_helpers = self._wrapper_helpers()  # first: they may need the weak-type helper too
+        helpers = [*self._kernel_helpers(), *(["", "", *wrapper_helpers] if wrapper_helpers else [])]
         code = "\n".join([*helpers, "", "", *kernel, "", "", *wrapper, ""])
         constants = self._constants(code, functions=True)
         head = "\n".join([self.header(), "", _IMPORTS, *constants, *([""] if constants else []), ""])

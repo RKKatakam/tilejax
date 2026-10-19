@@ -157,12 +157,18 @@ def scratch_split(lowered: Lowered, dependent: set[str] | frozenset[str]) -> tup
     `dependent` inputs, output slots, state, temporaries), as the cost model counts them."""
     p = lowered.plan
     early = sum(
-        (p.buffers if op.phase is not None else 2) * vmem_nbytes(op.block.kernel_shape, op.dtype)
+        cost_lib.slots_nbytes(p.buffers if op.phase is not None else 2, op.block.kernel_shape, op.dtype)
         for op in p.spec.operands
         if op.param not in dependent
     )
     early += sum(vmem_nbytes(o.block.kernel_shape, o.out.dtype) for o in p.spec.outputs if o.var in p.fills)
     return early, max(0, vmem_bytes(lowered) - early)
+
+
+def vmem_budget(parts: Sequence[Lowered], hw: hardware.Hardware) -> int:
+    """What a fused kernel may plan to use: the chip's budget, or the smallest VMEM limit a user set on a part."""
+    limits = [p.vmem_limit_bytes for p in parts if p.vmem_limit_bytes != hw.vmem_limit]
+    return min(min(limits), hw.vmem_bytes) if limits else hw.vmem_budget
 
 
 def fused_vmem(parts: Sequence[tuple[int, int]]) -> int:
@@ -262,9 +268,9 @@ def plan_segments(nests: Sequence[NestPlan], max_parts: int, hw: hardware.Hardwa
         for j in range(a, b):
             dependent = {p for p, (i, _) in nests[j].sources.items() if a <= i < j}
             parts.append(scratch_split(nests[j].lowered, dependent))
-        need = fused_vmem(parts)
-        if need > hw.vmem_budget:
-            return f"together they would need {_mib(need)} of VMEM, more than the {_mib(hw.vmem_budget)} budget"
+        need, budget = fused_vmem(parts), vmem_budget([nests[j].lowered for j in range(a, b)], hw)
+        if need > budget:
+            return f"together they would need {_mib(need)} of VMEM, more than the {_mib(budget)} budget"
         return None
 
     best: list[tuple[int, int, int] | None] = [None] * (n + 1)  # (kernels, bytes across cuts, start of last)
@@ -439,7 +445,7 @@ def fuse(name: str, parts: Sequence[Part], matmul_precision: str, hw: hardware.H
         at += 1
     split = [scratch_split(p.lowered, {q for q, s in p.sources.items() if s[0] == "part"}) for p in parts]
     vmem = fused_vmem(split)
-    limit = hw.vmem_limit
+    limit = min(p.lowered.vmem_limit_bytes for p in parts)
     estimate = cost_lib.Estimate(
         sum(p.lowered.estimate.seconds for p in parts),
         sum(p.lowered.estimate.flops for p in parts),
@@ -451,7 +457,7 @@ def fuse(name: str, parts: Sequence[Part], matmul_precision: str, hw: hardware.H
     split_over = f", each split over {cores} TensorCores" if cores > 1 else ""
     wrapper.append(f"    # One gridless kernel running {len(parts)} nests in turn{split_over}:")
     for k, (part, e) in enumerate(zip(parts, emitters, strict=True)):
-        wrapper.append(f"    #   {k}. {part.name}: {e.describe()}, inputs {e.buffers}-buffered")
+        wrapper.append(f"    #   {k}. {part.name}: {e.describe()}{e.buffering()}")
     for k, part in enumerate(parts):
         args = [part.sources[p][1] if part.sources[p][0] == "input" else "None" for p in part.params]
         wrapper.append(f"    smem_{k}, init_{k} = _prepare_{k}({', '.join(args)})")
