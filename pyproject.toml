@@ -39,6 +39,8 @@ filterwarnings = [
     "error",
     # Expected off-TPU: kernels run in the Pallas TPU interpreter.
     "ignore:autokernel. no TPU found:UserWarning",
+    # TPU VMs without transparent hugepages (e.g. Colab): JAX warns at import; harmless for tests.
+    "ignore:.*[Tt]ransparent hugepages:UserWarning",
 ]
 
 [tool.ruff]
