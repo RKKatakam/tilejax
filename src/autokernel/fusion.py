@@ -499,7 +499,9 @@ def fuse(name: str, parts: Sequence[Part], matmul_precision: str, hw: hardware.H
         header += f"\n# It ends here because: {cut}"
     main = [*kernel, "", "", *wrapper, ""]
     exec(compile("\n".join(main), f"<autokernel:{name}>", "exec"), namespace)
-    source = "\n".join([header, "", prelude, "", "", *part_sources, *main])
+    source = "\n".join(
+        [header, "", prelude, *codegen.assignments({"_COST": namespace["_COST"]}), "", *part_sources, *main]
+    )
     return FusedLowered(
         name=name,
         source=source,

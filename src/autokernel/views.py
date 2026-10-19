@@ -35,7 +35,7 @@ import numpy as np
 
 from .errors import AutoKernelError
 
-__all__ = ["View", "ViewError", "ViewMap", "Window", "make_view"]
+__all__ = ["View", "ViewError", "ViewMap", "Window", "div_src", "make_view", "rem_src"]
 
 
 class ViewError(AutoKernelError):
@@ -252,17 +252,18 @@ class Window:
     dims: tuple[BaseDim, ...]
     base_shape: tuple[int, ...]
 
-    def render(self, starts: Sequence[tuple[str | None, int, int]]) -> list[str]:
+    def render(self, starts: Sequence[tuple[str | None, int, int]], div: str = "_div", rem: str = "_rem") -> list[str]:
         """Per base dim, the index (`pl.ds(start, size)`, or an integer for a squeezed dim), given each view
-        dim's start as `atom * mult + const` (atom None: a constant)."""
+        dim's start as `atom * mult + const` (atom None: a constant). `div` and `rem` name the generated
+        code's integer division and remainder helpers."""
         out = []
         for b in self.dims:
             expr = _Affine(None, 0, b.const)
             for t in b.terms:
                 atom, mult, const = starts[t.vd]
-                x = _Affine(atom, mult, const).floordiv(t.div)
+                x = _Affine(atom, mult, const).floordiv(t.div, div)
                 if t.mod is not None:
-                    x = x.mod(t.mod)
+                    x = x.mod(t.mod, rem)
                 expr = expr.add(x.scale(t.coef))
             start = expr.render()
             out.append(start if b.squeezed else f"pl.ds({start}, {b.size})")
@@ -298,7 +299,7 @@ class _Affine:
             return _Affine(None, 0, const)
         return _Affine(items[0][0], items[0][1], const, tuple(items[1:]))
 
-    def floordiv(self, n: int) -> _Affine:
+    def floordiv(self, n: int, div: str) -> _Affine:
         if n == 1:
             return self
         terms = self.terms()
@@ -306,18 +307,18 @@ class _Affine:
             return _Affine.of([(a, m // n) for a, m in terms], self.const // n)
         if len(terms) == 1 and self.const == 0 and n % terms[0][1] == 0:  # (a * m) // n == a // (n / m)
             a, m = terms[0]
-            return _Affine(_div_src(a, n // m), 1, 0)
-        return _Affine(_div_src(self.render(), n), 1, 0)
+            return _Affine(div_src(a, n // m, div), 1, 0)
+        return _Affine(div_src(self.render(), n, div), 1, 0)
 
-    def mod(self, n: int) -> _Affine:
+    def mod(self, n: int, rem: str) -> _Affine:
         terms = [(a, m % n) for a, m in self.terms()]
         terms = [(a, m) for a, m in terms if m]
         if not terms:
             return _Affine(None, 0, self.const % n)
         if len(terms) == 1 and self.const % n == 0 and n % terms[0][1] == 0:  # (a * m) % n == (a % (n / m)) * m
             a, m = terms[0]
-            return _Affine(_rem_src(a, n // m), m, 0)
-        return _Affine(_rem_src(_Affine.of(terms, self.const % n).render(), n), 1, 0)
+            return _Affine(rem_src(a, n // m, rem), m, 0)
+        return _Affine(rem_src(_Affine.of(terms, self.const % n).render(), n, rem), 1, 0)
 
     def render(self) -> str:
         parts = [a if m == 1 else f"{a} * {m}" for a, m in self.terms()]
@@ -326,12 +327,17 @@ class _Affine:
         return " + ".join(parts) if len(parts) == 1 else "(" + " + ".join(parts) + ")"
 
 
-def _div_src(x: str, n: int) -> str:
-    return f"({x} >> {n.bit_length() - 1})" if n & (n - 1) == 0 else f"_div({x}, {n})"
+def div_src(x: str, n: int, div: str = "_div") -> str:
+    """`x // n` for a non-negative x, as source: a shift for powers of two, else one integer division by the
+    generated code's helper `div`."""
+    if n == 1:
+        return x
+    return f"({x} >> {n.bit_length() - 1})" if n & (n - 1) == 0 else f"{div}({x}, {n})"
 
 
-def _rem_src(x: str, n: int) -> str:
-    return f"({x} & {n - 1})" if n & (n - 1) == 0 else f"_rem({x}, {n})"
+def rem_src(x: str, n: int, rem: str = "_rem") -> str:
+    """`x % n` for a non-negative x, as source: a mask for powers of two, else the helper `rem`."""
+    return f"({x} & {n - 1})" if n & (n - 1) == 0 else f"{rem}({x}, {n})"
 
 
 class _Builder:
