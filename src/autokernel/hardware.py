@@ -18,11 +18,33 @@ from jax.experimental.pallas import tpu as pltpu
 
 from .errors import AutoKernelError
 
-__all__ = ["DEFAULT_TARGET", "Hardware", "check_block", "nbytes", "on_tpu", "sublanes", "target"]
+__all__ = [
+    "DEFAULT_TARGET",
+    "DEFAULT_VPU_INT_BITS",
+    "VALU_SLOTS",
+    "VPU_INT_BITS",
+    "Hardware",
+    "check_block",
+    "nbytes",
+    "on_tpu",
+    "sublanes",
+    "target",
+    "vmem_nbytes",
+]
 
 DEFAULT_TARGET = "v5e"
 # Chips whose logical device spans two TensorCores (megacore); work can be split between them.
 _MEGACORE = {"v4": 2, "v5p": 2}
+# Integer widths the VPU does arithmetic on (elementwise ops, comparisons, reductions): narrower integer
+# vectors must be widened first (`.astype(jnp.int32)`); loading, storing, converting them and feeding
+# them to the MXU is fine. Mosaic on a v5e rejects 8-bit vector arithmetic ("Only vector<i16> and
+# vector<i32> are supported"). JAX's own sources don't say what other chips accept (Mosaic's rules live
+# in libtpu), so every chip gets the v5e's rule until measured otherwise.
+VPU_INT_BITS = {"v4": (16, 32), "v5e": (16, 32), "v5p": (16, 32), "v6e": (16, 32)}
+DEFAULT_VPU_INT_BITS = (16, 32)
+# Vector-ALU slots per VLIW bundle: whole-vreg elementwise ops the VPU issues per cycle. Fitted to the
+# attention timings measured on a v5e (see cost.py); the EUP (transcendentals) issues one more per cycle.
+VALU_SLOTS = 4
 
 
 @dataclass(frozen=True)
@@ -35,9 +57,15 @@ class Hardware:
     smem_bytes: int
     hbm_bytes_per_s: float
     mxu_flops_per_s: float  # bf16 matmul throughput
-    vpu_ops_per_s: float  # elementwise throughput: one op per lane and sublane per cycle
+    int8_flops_per_s: float  # 8-bit integer matmul throughput (the bf16 rate on chips without a faster int8 path)
+    fp8_flops_per_s: float  # 8-bit float matmul throughput (likewise)
+    clock_hz: float
+    valu_ops_per_s: float  # vector-ALU throughput, in whole-vreg (sublanes x lanes) ops per second
+    eup_ops_per_s: float  # transcendental unit (exp, log, reciprocal, ...) throughput, in vreg ops per second
+    vpu_bf16: bool  # the VPU computes on packed 16-bit vregs (v6 and newer); older chips unpack them to 32 bits
     lanes: int
     sublanes: int
+    vpu_int_bits: tuple[int, ...] = DEFAULT_VPU_INT_BITS  # integer widths the VPU does arithmetic on
 
     @property
     def vmem_budget(self) -> int:
@@ -45,14 +73,21 @@ class Hardware:
         return int(self.vmem_bytes * 0.75)
 
     @property
+    def vmem_limit(self) -> int:
+        """Mosaic's scoped-VMEM limit for a kernel: the chip's, not the kernel's estimate. Mosaic takes its own
+        scratch (spilled intermediates, relayouts) from what the limit leaves: on a v5e, sizing the limit from
+        the estimate made attention-heavy kernels up to 2.7% slower."""
+        return int(self.vmem_bytes * 0.9)
+
+    @property
     def smem_budget(self) -> int:
         return self.smem_bytes // 2
 
     def matmul_flops_per_s(self, dtype: Any, highest: bool) -> float:
-        """f32 matmuls at HIGHEST precision take about six bf16 MXU passes; 8-bit ints run twice as fast."""
+        """f32 matmuls at HIGHEST precision take about six bf16 MXU passes; 8-bit types run at the chip's rate."""
         dtype = np.dtype(dtype)
         if dtype.itemsize == 1:
-            return 2 * self.mxu_flops_per_s
+            return self.int8_flops_per_s if np.issubdtype(dtype, np.integer) else self.fp8_flops_per_s
         if dtype.itemsize >= 4 and highest:
             return self.mxu_flops_per_s / 6
         return self.mxu_flops_per_s
@@ -80,9 +115,15 @@ def target(name: str | None = None) -> Hardware:
         smem_bytes=info.smem_capacity_bytes,
         hbm_bytes_per_s=info.mem_bw_bytes_per_second,
         mxu_flops_per_s=info.bf16_ops_per_second,
-        vpu_ops_per_s=clock * info.num_lanes * info.num_sublanes,
+        int8_flops_per_s=max(info.int8_ops_per_second, info.bf16_ops_per_second),
+        fp8_flops_per_s=max(info.fp8_ops_per_second, info.bf16_ops_per_second),
+        clock_hz=clock,
+        valu_ops_per_s=clock * VALU_SLOTS,
+        eup_ops_per_s=clock,
+        vpu_bf16=info.generation >= 6,
         lanes=info.num_lanes,
         sublanes=info.num_sublanes,
+        vpu_int_bits=VPU_INT_BITS.get(name, DEFAULT_VPU_INT_BITS),
     )
 
 
@@ -122,3 +163,16 @@ def check_block(what: str, block: Shape, full: Shape, dtype: Any, lanes: int = 1
 
 def nbytes(shape: Sequence[int], dtype: Any) -> int:
     return int(np.prod(shape, dtype=np.int64)) * np.dtype(dtype).itemsize
+
+
+def vmem_nbytes(shape: Sequence[int], dtype: Any, lanes: int = 128) -> int:
+    """Bytes a VMEM buffer of this shape takes: Mosaic pads the last two dims to (sublanes, lanes) tiles."""
+    shape = tuple(shape)
+    if not shape:
+        return nbytes((1,), dtype)  # scalars live in SMEM, but count a word
+    padded = list(shape)
+    padded[-1] = -(-padded[-1] // lanes) * lanes
+    if len(padded) >= 2:
+        s = sublanes(dtype)
+        padded[-2] = -(-padded[-2] // s) * s
+    return nbytes(padded, dtype)

@@ -18,11 +18,26 @@ Write the tiling as ordinary Python loops and decorate it::
 
 Calling `matmul(x, y)` runs a generated gridless Pallas kernel; `matmul.source(x, y)` shows its code
 and `matmul.verify(x, y)` checks it against the Python loops.
+
+A function with several tile loop nests mixed with ordinary JAX code and Python control flow (a whole
+model) becomes a `TpuProgram`: every nest is its own kernel, and the code around them runs as JAX.
 """
 
 from .api import TpuKernel, tpu
 from .errors import AutoKernelError
+from .fusion import FusedLowered
 from .lowering import Lowered
+from .program import ProgramLowered, ProgramNest, TpuProgram
 
-__all__ = ["AutoKernelError", "Lowered", "TpuKernel", "__version__", "tpu"]
-__version__ = "0.2.0"
+__all__ = [
+    "AutoKernelError",
+    "FusedLowered",
+    "Lowered",
+    "ProgramLowered",
+    "ProgramNest",
+    "TpuKernel",
+    "TpuProgram",
+    "__version__",
+    "tpu",
+]
+__version__ = "0.3.0"

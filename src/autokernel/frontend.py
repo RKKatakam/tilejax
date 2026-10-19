@@ -18,6 +18,9 @@ The accepted shape of a function is::
 Masks are `if cond: continue` at the top of a loop body or `if cond:` around all of it. They depend on
 loop variables and constants, and may read input arrays (`block_mask[i // T, k // T]`), which makes them
 runtime masks. Expressions stay as AST until `analysis` evaluates them for concrete input shapes.
+
+The tiles must write every element of an output, except when its allocation is an input (`out = x`):
+then the elements no tile writes keep the input's values, as they would in Python.
 """
 
 from __future__ import annotations
@@ -26,11 +29,24 @@ import ast
 import inspect
 import textwrap
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 from .errors import AutoKernelError
 
-__all__ = ["Loop", "LoopNest", "Output", "Reduction", "Store", "assigned_name", "is_simple_assignment", "parse"]
+__all__ = [
+    "Loop",
+    "LoopNest",
+    "Output",
+    "Reduction",
+    "Store",
+    "assigned_name",
+    "function_ast",
+    "is_simple_assignment",
+    "parse",
+    "parse_function",
+    "reads",
+]
 
 
 def is_simple_assignment(s: ast.stmt) -> bool:
@@ -77,6 +93,9 @@ class Reduction:
 class Output:
     var: str
     alloc: ast.expr  # the allocation expression, e.g. `jnp.zeros((M, N))`
+    # The allocation is an input array (`out = x`): elements no tile writes keep its values, so the tiles
+    # needn't cover the whole output (a program passes an output's current value this way).
+    keeps: bool = False
 
 
 @dataclass
@@ -110,6 +129,9 @@ class LoopNest:
     segments: list[list[ast.stmt]]
     reductions: list[Reduction]
     stores: list[Store]
+    # Compiled fragments of the nest, by what they depend on: specialising it for many tile sizes (tuning)
+    # reuses them.
+    cache: dict[Any, Any] = field(default_factory=dict, repr=False, compare=False)
 
     def error(self, node: ast.AST | None, msg: str) -> AutoKernelError:
         return _error(self.fn_name, self.first_line, node, msg)
@@ -126,8 +148,8 @@ class LoopNest:
         return [s for seg in self.segments for s in seg] + [s for r in self.reductions for s in r.body]
 
 
-def parse(fn: Callable) -> LoopNest:
-    """Parse `fn`'s source into a LoopNest, or raise AutoKernelError naming the offending line."""
+def function_ast(fn: Callable) -> ast.FunctionDef:
+    """`fn`'s source as an AST, with line numbers relative to its first line (its first decorator)."""
     try:
         src = textwrap.dedent(inspect.getsource(fn))
     except (OSError, TypeError) as e:
@@ -135,7 +157,20 @@ def parse(fn: Callable) -> LoopNest:
     fdef = ast.parse(src).body[0]
     if not isinstance(fdef, ast.FunctionDef):
         raise AutoKernelError(f"{fn.__name__}: expected a plain `def` function")
-    return _Parser(fn.__name__, fn.__code__.co_firstlineno, fdef).parse()
+    return fdef
+
+
+def parse(fn: Callable) -> LoopNest:
+    """Parse `fn`'s source into a LoopNest, or raise AutoKernelError naming the offending line."""
+    return parse_function(function_ast(fn), fn.__name__, fn.__code__.co_firstlineno)
+
+
+def parse_function(fdef: ast.FunctionDef, fn_name: str, first_line: int) -> LoopNest:
+    """Parse an already-parsed function (lines relative to `first_line` of its file) into a LoopNest.
+
+    `fn_name` names the kernel in errors and generated code, so it must be an identifier.
+    """
+    return _Parser(fn_name, first_line, fdef).parse()
 
 
 class _Parser:
@@ -143,6 +178,7 @@ class _Parser:
         self.fn_name, self.first_line, self.fdef = fn_name, first_line, fdef
         self.params = [p.arg for p in fdef.args.args]
         self.out_vars: list[str] = []
+        self.hoisted_depth: dict[int, int] = {}  # id of a statement between parallel loops -> its loop's depth
 
     def err(self, node: ast.AST | None, msg: str) -> AutoKernelError:
         return _error(self.fn_name, self.first_line, node, msg)
@@ -223,7 +259,8 @@ class _Parser:
         for var in self.out_vars:
             if var not in allocs:
                 raise self.err(top, f"missing output allocation `{var} = jnp.zeros(...)` before the loop nest")
-        return prologue, [Output(var, allocs[var]) for var in self.out_vars]
+        keeps = {v for v, a in allocs.items() if isinstance(a, ast.Name) and a.id in self.params}
+        return prologue, [Output(var, allocs[var], var in keeps) for var in self.out_vars]
 
     # ------------------------------------------------------------------ pieces
 
@@ -280,6 +317,7 @@ class _Parser:
                 )
             if isinstance(body[0], ast.If):
                 raise self.err(body[0], "a tile mask goes on the innermost parallel loop, around the output stores")
+            self.hoisted_depth.update((id(s), len(loops) - 1) for s in body[:-1])
             hoisted += body[:-1]
             node = body[-1]
 
@@ -384,3 +422,77 @@ class _Parser:
                     raise self.err(
                         node, f"the {what} can only depend on loop variables, constants and inputs, not `{n.id}`"
                     )
+        self._check_hoisted(nest)
+        self._check_order(nest, temporaries | set(loop_vars))
+
+    def _check_hoisted(self, nest: LoopNest) -> None:
+        """Values assigned between parallel loops must not be reassigned further in.
+
+        The kernel runs those statements once per tile, which matches Python only while nothing deeper
+        changes their values: Python would carry such a change on to the inner loops' next iteration.
+        """
+        first: dict[str, tuple[int, ast.stmt]] = {}  # name -> (depth, statement) where a hoisted one assigns it
+        for s in nest.tile_statements():
+            name, depth = assigned_name(s), self.hoisted_depth.get(id(s), len(nest.parallel))
+            if name in first and first[name][0] < depth:
+                line = self.first_line + first[name][1].lineno - 1
+                raise self.err(
+                    s,
+                    f"`{name}` is assigned between the parallel loops (line {line}) and again further in; Python "
+                    "would carry the new value on to the next iteration of the inner loops, but the kernel "
+                    "recomputes it for every tile: use another name here",
+                )
+            if id(s) in self.hoisted_depth:
+                first.setdefault(name, (depth, s))
+
+    def _check_order(self, nest: LoopNest, tile_names: set[str]) -> None:
+        """Every loop variable and temporary the tile reads must be bound earlier in the tile, as in Python.
+
+        The kernel can't carry a value in from before the loop nest or from one tile to the next. A
+        reduction loop's variable keeps its last value after the loop, as in Python.
+        """
+        defined: set[str] = set()
+
+        def check(node: ast.AST, names: set[str]) -> None:
+            for name in sorted(names & tile_names - defined):
+                if name in {lp.var for lp in nest.loops}:
+                    raise self.err(node, f"loop variable `{name}` is read before its loop starts")
+                raise self.err(
+                    node,
+                    f"`{name}` is read before it is assigned in the tile; assign it inside the loop nest first "
+                    "(a value can't be carried in from before the loop nest, or from one tile to the next)",
+                )
+
+        def run(statements: list[ast.stmt]) -> None:
+            for s in statements:
+                depth = self.hoisted_depth.get(id(s), len(nest.parallel) - 1)
+                defined.update(lp.var for lp in nest.parallel[: depth + 1])
+                check(s, reads(s))
+                defined.add(assigned_name(s))
+
+        run(nest.segments[0])
+        defined.update(lp.var for lp in nest.parallel)
+        for r, seg in zip(nest.reductions, nest.segments[1:], strict=True):
+            defined.update(lp.var for lp in r.loops)
+            if r.guard is not None:
+                check(r.guard_node, reads(r.guard))
+            run(r.body)
+            run(seg)
+        for st in nest.stores:
+            check(st.node, reads(st.value))
+
+
+def reads(node: ast.AST) -> set[str]:
+    """The names a statement (or expression) reads, not counting those its comprehensions and lambdas bind.
+
+    An augmented assignment `x += v` reads `x`.
+    """
+    expr = node.value if isinstance(node, (ast.Assign, ast.AugAssign)) else node
+    loaded = {n.id for n in ast.walk(expr) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+    bound = {n.id for n in ast.walk(expr) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+    bound |= {
+        a.arg for n in ast.walk(expr) if isinstance(n, ast.Lambda) for a in ast.walk(n.args) if isinstance(a, ast.arg)
+    }
+    if isinstance(node, ast.AugAssign):
+        loaded.add(node.target.id)
+    return loaded - bound

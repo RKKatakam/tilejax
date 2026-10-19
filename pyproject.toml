@@ -1,6 +1,6 @@
 [project]
 name = "autokernel"
-version = "0.2.0"
+version = "0.3.0"
 description = "Compile Python tile loop nests into Pallas TPU kernels"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -41,6 +41,8 @@ filterwarnings = [
     "ignore:autokernel. no TPU found:UserWarning",
     # TPU VMs without transparent hugepages (e.g. Colab): JAX warns at import; harmless for tests.
     "ignore:.*[Tt]ransparent hugepages:UserWarning",
+    # Tests use small blocks on purpose; on a TPU autokernel suggests tuning them.
+    "ignore:autokernel. .*too small to hide:UserWarning",
 ]
 
 [tool.ruff]

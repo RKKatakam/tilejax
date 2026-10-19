@@ -1,5 +1,7 @@
 """Tile masks: skipped tiles, and how skipped tiles get their value."""
 
+import importlib.util
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -150,3 +152,92 @@ def test_background_fill_without_reduction_and_full_dims():
     out = np.asarray(first_rows(x))
     np.testing.assert_allclose(out[:96], np.asarray(x[:96]) * 2)
     assert np.all(out[96:] == 7.0)
+
+
+# --------------------------------------------------------------------------- what a mask means
+
+
+def _masked_row_sums(tmp_path, cond, extra_param=""):
+    """A kernel summing x's column blocks for each row block, skipping the steps where `cond` holds."""
+    path = tmp_path / "masked.py"
+    path.write_text(f"""
+import jax.numpy as jnp
+import numpy as np
+
+PATTERN = np.array([[1, 0], [0, 0]])  # a module constant a static mask reads
+W = 0
+
+
+def masked(x{extra_param}):
+    out = jnp.zeros((256, 128))
+    for i in range(0, 256, 128):
+        acc = jnp.zeros((128, 128))
+        for k in range(0, 256, 128):
+            if {cond}:
+                continue
+            acc += x[i : i + 128, k : k + 128]
+        out = out.at[i : i + 128, :].set(acc)
+    return out
+""")
+    spec = importlib.util.spec_from_file_location("masked", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return autokernel.tpu(module.masked)
+
+
+def _ints(shape):
+    return jnp.asarray(np.random.default_rng(0).integers(-4, 5, shape), jnp.float32)
+
+
+@pytest.mark.parametrize(
+    "cond",
+    [
+        "~(k // 128) == -2",  # `~` inverts ints (on bools too: `~True` is -2, not False)
+        "k < i - (W or 512)",  # `or` used for its value
+        "k > max(0, i - 128)",  # builtins on loop variables
+        "abs(k - i) > 0 and min(i, k) >= 0",
+        "k in (128,)",
+        "np.sum(PATTERN[i // 128, :]) == 0",  # an aggregate per step, not over every step at once
+        "k >= x.shape[0] // 2",  # an input's shape is known at trace time
+    ],
+)
+def test_static_masks_mean_what_python_says(tmp_path, cond):
+    kern, x = _masked_row_sums(tmp_path, cond), _ints((256, 256))
+    assert kern.lower(x).schedule != "runtime"
+    assert kern.verify(x) == 0.0
+
+
+def test_runtime_masks_are_evaluated_per_step(tmp_path):
+    """`jnp.any(m[k // 128, :])` reduces one row of the mask per step, not the whole mask at once."""
+    kern = _masked_row_sums(tmp_path, "not jnp.any(m[k // 128, :]) or not bool(m[i // 128, k // 128])", ", m")
+    x, m = _ints((256, 256)), jnp.asarray([[True, False], [False, False]])  # row 1 all False: k = 128 skipped
+    assert kern.lower(x, m).schedule == "runtime"
+    assert kern.verify(x, m) == 0.0
+    np.testing.assert_array_equal(kern(x, m), np.concatenate([x[:128, :128], np.zeros((128, 128))]))
+
+
+def test_runtime_mask_python_control_flow_is_rejected_at_lower_time(tmp_path):
+    kern = _masked_row_sums(tmp_path, "int(m[i // 128, k // 128]) == 0", ", m")
+    with pytest.raises(autokernel.AutoKernelError, match=r"line 14\).*reads inputs"):
+        kern.lower(rand((256, 256)), jnp.ones((2, 2), bool))
+
+
+def test_mask_reads_an_earlier_reduction_variable():
+    """After its loop a reduction variable keeps its last value, in a later phase's mask too."""
+
+    @autokernel.tpu
+    def two_phases(x):
+        out = jnp.zeros((256, 128))
+        for i in range(0, 256, 128):
+            acc = jnp.zeros((128, 128))
+            for k in range(0, 256, 128):
+                acc += x[i : i + 128, k : k + 128]
+            acc2 = jnp.zeros((128, 128))
+            for k2 in range(0, 256, 128):
+                if k2 < k:  # k == 128 here
+                    continue
+                acc2 += x[i : i + 128, k2 : k2 + 128]
+            out = out.at[i : i + 128, :].set(acc + 2 * acc2)
+        return out
+
+    assert two_phases.verify(_ints((256, 256))) == 0.0

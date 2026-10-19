@@ -1,7 +1,8 @@
 """Lower a parsed loop nest, for concrete input shapes, into a compiled Pallas kernel.
 
 `lower()` runs the pipeline: specialise (analysis) -> check TPU layout rules -> schedule the steps ->
-estimate cost and VMEM -> generate and compile the Pallas source.
+estimate cost and VMEM -> generate and compile the Pallas source. `plan()` stops before code generation,
+which is all the tuner needs to rank block sizes; `build()` finishes a plan.
 """
 
 from __future__ import annotations
@@ -15,16 +16,37 @@ import jax
 from . import codegen, hardware, mxu
 from . import cost as cost_lib
 from . import schedule as schedule_lib
-from .analysis import Operand, OutputSpec, StateVar, specialize
+from .analysis import Operand, OutputSpec, Specialization, StateVar, check_indices, specialize
 from .errors import AutoKernelError
 from .frontend import LoopNest
 
-__all__ = ["AUTOTUNE", "DEFAULT_BUFFERS", "Lowered", "Options", "lower"]
+__all__ = [
+    "AUTO",
+    "AUTOTUNE",
+    "DEFAULT_BUFFERS",
+    "Lowered",
+    "Options",
+    "Plan",
+    "VmemError",
+    "build",
+    "lower",
+    "plan",
+]
 
 AUTOTUNE = ("model", "measure")
 # Slots per streamed input when none is asked for: three where they fit in VMEM (on a v5e, three
 # buffers ran a 512^3-tiled bf16 matmul 14% faster than two), else two.
 DEFAULT_BUFFERS = (3, 2)
+# `tune` value asking for candidates to be generated, and the name standing for every block size the
+# kernel's loops use (`tune="auto"`).
+AUTO = "auto"
+ALL_NAMES = "*"
+
+TuneValues = tuple[Any, ...] | str  # candidate values, or AUTO
+
+
+class VmemError(AutoKernelError):
+    """The kernel's buffers don't fit in the chip's VMEM (bigger tiles never would: the tuner prunes them)."""
 
 
 @dataclass(frozen=True)
@@ -38,7 +60,7 @@ class Options:
     buffers: int | None = None
     target: str | None = None
     cores: int | None = None
-    tune: tuple[tuple[str, tuple[Any, ...]], ...] = ()
+    tune: tuple[tuple[str, TuneValues], ...] = ()
     autotune: str = "model"
     measure_top: int = 8
 
@@ -54,14 +76,23 @@ class Options:
         if self.autotune not in AUTOTUNE:
             raise AutoKernelError(f"autotune must be one of {list(AUTOTUNE)}, got {self.autotune!r}")
         for name, values in self.tune:
+            if isinstance(values, str) and values != AUTO:
+                raise AutoKernelError(f"tune[{name!r}] must be {AUTO!r} or a sequence of values, got {values!r}")
             if not values:
                 raise AutoKernelError(f"tune[{name!r}] has no candidate values")
         if self.target is not None:
             hardware.target(self.target)  # unknown targets fail here, at decoration time
 
     @staticmethod
-    def make_tune(tune: Mapping[str, Sequence[Any]] | None) -> tuple[tuple[str, tuple[Any, ...]], ...]:
-        return tuple((k, tuple(v)) for k, v in sorted((tune or {}).items()))
+    def make_tune(tune: Mapping[str, Sequence[Any] | str] | str | None) -> tuple[tuple[str, TuneValues], ...]:
+        """`tune` as given to `autokernel.tpu`: `"auto"`, or a mapping from names to values or `"auto"`."""
+        if isinstance(tune, str):
+            if tune != AUTO:
+                raise AutoKernelError(f"tune must be {AUTO!r} or a mapping of names to candidate values, got {tune!r}")
+            return ((ALL_NAMES, AUTO),)
+        if tune is not None and not isinstance(tune, Mapping):
+            raise AutoKernelError(f"tune must be {AUTO!r} or a mapping of names to candidate values, got {tune!r}")
+        return tuple((k, v if isinstance(v, str) else tuple(v)) for k, v in sorted((tune or {}).items()))
 
 
 @dataclass(frozen=True)
@@ -84,6 +115,30 @@ class Lowered:
     vmem_limit_bytes: int
     fill: str | None  # skipped tiles' values: "background" (fill DMAs), "prefill" (aliased input) or None
     overrides: dict[str, Any] = field(default_factory=dict)  # tuned constants this kernel was built with
+    scalars: list[str] = field(default_factory=list)  # runtime scalar inputs (0-d integers, read from SMEM)
+    plan: Plan | None = field(default=None, repr=False, compare=False)  # what it was generated from
+
+    def check_indices(self, values: Mapping[str, Any]) -> None:
+        """Raise AutoKernelError if known values of the runtime scalars index outside an input (traced ones are
+        clamped by the kernel, and checked under `jax.experimental.checkify`)."""
+        if self.plan is not None:
+            known = {k: v if isinstance(v, jax.core.Tracer) else int(v) for k, v in values.items()}
+            check_indices(self.plan.spec, known)  # traced values: a checkify check
+
+
+@dataclass(frozen=True)
+class Plan:
+    """A kernel specialised, checked, scheduled and costed, but not yet generated."""
+
+    spec: Specialization
+    sched: schedule_lib.Schedule
+    hw: hardware.Hardware
+    cores: int
+    buffers: int
+    fills: list[str]
+    aliased: list[str]
+    estimate: cost_lib.Estimate
+    overrides: dict[str, Any]
 
 
 def lower(
@@ -94,6 +149,23 @@ def lower(
     overrides: Mapping[str, Any] | None = None,
     buffers: int | None = None,
 ) -> Lowered:
+    return build(plan(nest, fn, specs, options, overrides, buffers), options)
+
+
+def plan(
+    nest: LoopNest,
+    fn: Callable,
+    specs: Sequence[jax.ShapeDtypeStruct],
+    options: Options,
+    overrides: Mapping[str, Any] | None = None,
+    buffers: int | None = None,
+    cost_cache: dict | None = None,
+) -> Plan:
+    """Everything up to code generation; raises AutoKernelError if the kernel can't run on the target.
+
+    `cost_cache` (any dict, reused across calls) memoises the per-unit cost analysis between plans of
+    the same nest that differ only in some constants, which is what makes tuning fast.
+    """
     spec = specialize(nest, fn, specs, dict(overrides or {}))
     hw = hardware.target(options.target)
     if options.check_tiling and (problems := codegen.check_layout(spec, hw.lanes)):
@@ -104,45 +176,51 @@ def lower(
     highest = options.matmul_precision == "highest"
     if buffers or options.buffers:
         buffers = buffers or options.buffers
-        est = cost_lib.estimate(spec, sched, hw, buffers, highest, fills)
+        est = cost_lib.estimate(spec, sched, hw, buffers, highest, fills, cost_cache)
     else:
         for buffers in DEFAULT_BUFFERS:  # the deepest default that fits
-            est = cost_lib.estimate(spec, sched, hw, buffers, highest, fills)
+            est = cost_lib.estimate(spec, sched, hw, buffers, highest, fills, cost_cache)
             if est.vmem_bytes <= hw.vmem_budget:
                 break
     if est.vmem_bytes > hw.vmem_budget:
-        raise AutoKernelError(
+        raise VmemError(
             f"{nest.fn_name}: needs about {est.vmem_bytes / 2**20:.0f} MiB of VMEM, more than the "
             f"{hw.vmem_budget / 2**20:.0f} MiB a {hw.name} kernel can use; use smaller tiles or fewer buffers"
         )
-    limit = options.vmem_limit_bytes or min(
-        int(hw.vmem_bytes * 0.9), max(32 * 2**20, int(est.vmem_bytes * 1.5) + 8 * 2**20)
-    )
+    return Plan(spec, sched, hw, cores, buffers, fills, aliased, est, dict(overrides or {}))
+
+
+def build(p: Plan, options: Options) -> Lowered:
+    """Generate and compile the Pallas kernel for a plan."""
+    est = p.estimate
+    limit = options.vmem_limit_bytes or p.hw.vmem_limit
     generated = codegen.generate(
-        spec,
-        sched,
-        buffers=buffers,
+        p.spec,
+        p.sched,
+        buffers=p.buffers,
         matmul_precision=options.matmul_precision,
-        fills=fills,
-        aliased=aliased,
+        fills=p.fills,
+        aliased=p.aliased,
         vmem_limit_bytes=limit,
         cost=est.cost_estimate(),
     )
     return Lowered(
         source=generated.source,
         entry=generated.entry,
-        schedule=sched.mode,
-        steps=sched.steps,
-        tiles=sched.tiles,
-        total_tiles=spec.total_tiles,
-        cores=cores,
-        core_steps=list(sched.core_steps),
-        buffers=buffers,
-        operands=spec.operands,
-        outputs=spec.outputs,
-        state=spec.state,
+        schedule=p.sched.mode,
+        steps=p.sched.steps,
+        tiles=p.sched.tiles,
+        total_tiles=p.spec.total_tiles,
+        cores=p.cores,
+        core_steps=list(p.sched.core_steps),
+        buffers=p.buffers,
+        operands=p.spec.operands,
+        outputs=p.spec.outputs,
+        state=p.spec.state,
         estimate=est,
         vmem_limit_bytes=limit,
-        fill="prefill" if aliased else "background" if fills else None,
-        overrides=dict(overrides or {}),
+        fill="prefill" if p.aliased else "background" if p.fills else None,
+        overrides=dict(p.overrides),
+        scalars=list(p.spec.scalars),
+        plan=p,
     )

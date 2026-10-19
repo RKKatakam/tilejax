@@ -1,6 +1,8 @@
 """What `@` means, what state variables are, what `verify` compares, and the kernel's step split: cases the
 compiler used to get wrong."""
 
+import importlib.util
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -12,6 +14,7 @@ from autokernel import AutoKernelError, schedule
 from autokernel import hardware as hardware_lib
 from autokernel import tune as tune_lib
 from autokernel.analysis import specialize
+from autokernel.api import check_outputs
 
 M, T = 512, 128
 STEP_TILE = 2.0  # named like one of the kernel's SMEM tables, on purpose
@@ -106,6 +109,182 @@ def test_loops_without_explicit_start_or_step():
     scale.verify(x)
 
 
+def _ints(shape, dtype=jnp.float32, seed=0):
+    return jnp.asarray(np.random.default_rng(seed).integers(-4, 5, shape), dtype)
+
+
+def test_reduction_variable_keeps_its_last_value_after_its_loop():
+    """As in Python, whatever the mask skipped, and in a later phase and the stores too."""
+
+    @autokernel.tpu
+    def after(x):
+        out = jnp.zeros((256, 128))
+        for i in range(0, 256, 128):
+            acc = x[i : i + 128, 0:128] * 0  # the same slice per tile and per step
+            for k in range(0, 384, 128):
+                if i == 0 and k == 256:  # skips tile 0's last step
+                    continue
+                acc += x[i : i + 128, k : k + 128]
+            from_k = acc * 0 + k
+            acc2 = jnp.zeros((128, 128))
+            for k2 in range(0, 256, 128):
+                acc2 += x[i : i + 128, k2 : k2 + 128] * k + x[i : i + 128, 0:128]
+            out = out.at[i : i + 128, :].set(acc + acc2 + from_k + k + k2)
+        return out
+
+    x = _ints((256, 384))
+    assert after.lower(x).schedule == "table"
+    assert after.verify(x) == 0.0
+
+
+@pytest.mark.parametrize("loop_var", ["o", "last", "blocks", "ph"])
+def test_loop_variables_named_like_generated_names(tmp_path, loop_var):
+    """A loop variable read only by the store must not be rebound by the kernel's own step variables."""
+    path = tmp_path / "named.py"
+    path.write_text(f"""
+import jax.numpy as jnp
+
+
+def f(x):
+    out = jnp.zeros((512, 128))
+    for {loop_var} in range(0, 512, 128):
+        acc = jnp.zeros((128, 128))
+        for k in range(0, 256, 128):
+            acc += x[{loop_var} : {loop_var} + 128, k : k + 128]
+        out = out.at[{loop_var} : {loop_var} + 128, :].set(acc + {loop_var})
+    return out
+""")
+    spec = importlib.util.spec_from_file_location("named", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert autokernel.tpu(module.f).verify(_ints((512, 256))) == 0.0
+
+
+def test_python_scalars_stay_weakly_typed():
+    """`int16 * 2` stays int16 (and wraps) in Python, whether the 2 is a loop value or kept in SMEM.
+
+    (int16 rather than int8: Mosaic on a v5e has no 8-bit integer vector arithmetic.)
+    """
+
+    @autokernel.tpu
+    def scaled(x):
+        out = jnp.zeros((256, 128), jnp.int32)
+        for i in range(0, 256, 128):
+            for j in range(0, 128, 128):
+                if j > i:  # a static tile mask: the tile ordinal comes from an SMEM table, not a Python int
+                    continue
+                n = 2
+                acc = jnp.zeros((128, 128), jnp.int32)
+                for k in range(0, 256, 128):
+                    acc += (x[i : i + 128, k : k + 128] * n * (i // 128 + 1)).astype(jnp.int32)
+                out = out.at[i : i + 128, j : j + 128].set(acc)
+        return out
+
+    x = jnp.full((256, 256), 20000, jnp.int16)
+    lowered = scaled.lower(x)
+    assert lowered.state["n"].aval.weak_type
+    assert "_weak(n_ref[0])" in lowered.source
+    assert scaled(x)[0, 0] == 2 * -25536  # 20000 * 2 wraps to -25536 in int16; two steps
+    assert scaled.verify(x) == 0.0
+
+    @autokernel.tpu
+    def float_scale(x):
+        out = jnp.zeros((256, 128))
+        for i in range(0, 256, 128):
+            s = 1 + i / 256  # a Python float: bf16 * s is bf16
+            acc = jnp.zeros((128, 128))
+            for k in range(0, 256, 128):
+                acc += (x[i : i + 128, k : k + 128] * s).astype(jnp.float32)
+            out = out.at[i : i + 128, :].set(acc)
+        return out
+
+    jaxpr = str(jax.make_jaxpr(float_scale.lower(x.astype(jnp.bfloat16)).entry)(x.astype(jnp.bfloat16)))
+    assert "bf16[128,128] = mul" in jaxpr
+
+
+def test_state_types_settle_over_steps():
+    """`acc + prev` is int8 + int8 on the first step only: from then on `prev` is an int32 tile."""
+
+    @autokernel.tpu
+    def lagged(x):
+        out = jnp.zeros((256, 128), jnp.int32)
+        for i in range(0, 256, 128):
+            acc = jnp.zeros((128, 128), jnp.int8)
+            prev = jnp.zeros((128, 128), jnp.int8)
+            for k in range(0, 512, 128):
+                acc = acc + prev
+                prev = x[i : i + 128, k : k + 128]
+            out = out.at[i : i + 128, :].set(acc.astype(jnp.int32))
+        return out
+
+    x = jnp.full((256, 512), 100, jnp.int32)
+    state = lagged.lower(x).state
+    assert (state["acc"].aval.dtype, state["prev"].aval.dtype) == (jnp.int32, jnp.int32)
+    assert lagged(x)[0, 0] == 300
+    assert lagged.verify(x) == 0.0
+
+
+def test_narrow_float_accumulators_round_like_python():
+    """A bf16 `acc += tile` rounds to bf16 every step in Python, so the kernel keeps it in bf16."""
+
+    @autokernel.tpu
+    def bf16_sum(x):
+        out = jnp.zeros((256, 128))
+        for i in range(0, 256, 128):
+            acc = jnp.zeros((128, 128), jnp.bfloat16)
+            for k in range(0, 1024, 128):
+                acc += x[i : i + 128, k : k + 128]
+            out = out.at[i : i + 128, :].set(acc)
+        return out
+
+    x = rand((256, 1024), dtype=jnp.bfloat16)
+    assert bf16_sum.lower(x).state["acc"].aval.dtype == jnp.bfloat16
+    assert bf16_sum.verify(x) == 0.0
+
+
+def test_negative_constant_indices_count_from_the_end():
+    @autokernel.tpu
+    def tail(x):
+        out = jnp.zeros((2, 128, 128))
+        for b in range(2):
+            for i in range(0, 128, 64):
+                out = out.at[b, i : i + 64, :].set(x[-1, i : i + 64, -256:-128] + b)
+        return out
+
+    x = _ints((3, 128, 512))
+    assert tail.verify(x) == 0.0
+    np.testing.assert_array_equal(tail(x)[0], x[2, :, 256:384])
+
+
+def test_stored_values_broadcast_to_the_tile():
+    @autokernel.tpu
+    def rows(x, b):
+        out = jnp.zeros((256, 256))
+        for i in range(0, 256, 128):
+            out = out.at[i : i + 128, :].set(b[0, :] + jnp.sum(x[i : i + 128, :], axis=1, keepdims=True))
+        return out
+
+    x, b = _ints((256, 128)), _ints((8, 256), seed=1)
+    assert rows.verify(x, b) == 0.0
+
+
+def test_parameters_named_like_the_wrappers_names():
+    @autokernel.tpu
+    def add(pl, interpret, tables):
+        out = jnp.zeros((256, 128))
+        for i in range(0, 256, 128):
+            acc = jnp.zeros((128, 128))
+            for k in range(0, 256, 128):
+                if tables[i // 128, k // 128] == 0:  # a runtime mask: the wrapper builds its step tables
+                    continue
+                acc += pl[i : i + 128, k : k + 128] + interpret[i : i + 128, k : k + 128]
+            out = out.at[i : i + 128, :].set(acc)
+        return out
+
+    mask = jnp.asarray([[1, 0], [1, 1]], jnp.int32)
+    assert add.verify(_ints((256, 256)), _ints((256, 256), seed=1), mask) == 0.0
+
+
 # --------------------------------------------------------------------------- verify
 
 
@@ -196,6 +375,50 @@ def test_measurement_happens_on_the_first_concrete_call(monkeypatch):
     assert len(timed) == 4 + 1  # the four block sizes, then the winner's other buffer depth
     np.testing.assert_allclose(out, kern.reference(a, b), atol=1e-4, rtol=1e-4)
     np.testing.assert_allclose(kern(a, b), out)  # recompiled for the new pick
+
+
+def test_verify_compares_with_the_tuned_constants():
+    """The tile mask is tile-granular, so its meaning depends on TM: the reference must use the tuned TM."""
+
+    def blocky(x, y):
+        out = jnp.zeros((256, 256))
+        for i in range(0, 256, TM):
+            for j in range(0, 256, 128):
+                if j > i:
+                    continue
+                acc = jnp.zeros((TM, 128))
+                for k in range(0, 256, 128):
+                    acc += x[i : i + TM, k : k + 128] @ y[k : k + 128, j : j + 128]
+                out = out.at[i : i + TM, j : j + 128].set(acc)
+        return out
+
+    TM = 128
+    kern = autokernel.tpu(blocky, tune={"TM": (256,)})
+    x, y = rand((256, 256)), rand((256, 256), 1)
+    assert kern.lower(x, y).overrides == {"TM": 256}
+    kern.verify(x, y)
+
+
+def test_check_handles_infinities_and_nans():
+    want = jnp.zeros((128, 128), jnp.bfloat16).at[0, 0].set(-jnp.inf).at[0, 1].set(jnp.nan)
+    assert check_outputs("k", want, want, "highest") == 0.0  # equal NaNs and infinities are exact
+    wrong = jnp.full((128, 128), 1000.0, jnp.bfloat16).at[0, 0].set(-jnp.inf).at[0, 1].set(jnp.nan)
+    with pytest.raises(AssertionError, match="16382/16384"):  # an inf in the reference excuses nothing
+        check_outputs("k", wrong, want, "highest")
+
+
+def test_verify_option_checks_numpy_inputs(monkeypatch):
+    @autokernel.tpu(verify=True)
+    def double(x):
+        out = jnp.zeros((64, 128))
+        for i in range(0, 64, 8):
+            out = out.at[i : i + 8, :].set(x[i : i + 8, :] * 2)
+        return out
+
+    checks = []
+    monkeypatch.setattr(double, "_check", lambda *a, **k: checks.append(a) or 0.0)
+    double(np.ones((64, 128), np.float32))
+    assert len(checks) == 1
 
 
 # --------------------------------------------------------------------------- the two-core split

@@ -123,6 +123,129 @@ def f(a):
 """,
             "can't be read inside the loop nest",
         ),
+        (  # Python carries `n` from one j to the next; the kernel recomputes it per tile
+            """
+def f(a):
+    out = jnp.zeros((64, 128))
+    for i in range(0, 64, 8):
+        n = 0.0
+        for j in range(0, 128, 128):
+            n = n + 1.0
+            out = out.at[i:i + 8, j:j + 128].set(a[i:i + 8, j:j + 128] * n)
+    return out
+""",
+            r"line 8\): `n` is assigned between the parallel loops \(line 6\) and again further in",
+        ),
+        (  # `acc` would carry over from one tile to the next
+            """
+def f(a):
+    out = jnp.zeros((64, 128))
+    acc = jnp.zeros((8, 128))
+    for i in range(0, 64, 8):
+        for k in range(0, 128, 128):
+            acc += a[i:i + 8, k:k + 128]
+        out = out.at[i:i + 8, :].set(acc)
+    return out
+""",
+            r"line 8\): `acc` is read before it is assigned in the tile",
+        ),
+        (
+            """
+def f(a):
+    out = jnp.zeros((64, 128))
+    for i in range(0, 64, 8):
+        last = k
+        acc = jnp.zeros((8, 128))
+        for k in range(0, 128, 128):
+            acc += a[i:i + 8, k:k + 128]
+        out = out.at[i:i + 8, :].set(acc + last)
+    return out
+""",
+            r"line 6\): loop variable `k` is read before its loop starts",
+        ),
+        (  # a triangular loop: its trip count would change from tile to tile
+            """
+def f(a):
+    out = jnp.zeros((64, 128))
+    for i in range(0, 64, 8):
+        acc = jnp.zeros((8, 128))
+        for k in range(0, i + 8, 8):
+            acc += a[i:i + 8, :] * k
+        out = out.at[i:i + 8, :].set(acc)
+    return out
+""",
+            r"can't use `i`, which the loop nest assigns; .*use a mask",
+        ),
+        (
+            """
+def f(a):
+    out = jnp.zeros((64, 128))
+    for i in range(0, 64, 8):
+        c = 1
+        out = out.at[i:i + 8, :].set(a[i:i + 8, c * 128:c * 128 + 128])
+    return out
+""",
+            "can't use `c`, which the loop nest assigns",
+        ),
+        (  # Python would read x[:, -128:0], an empty slice
+            """
+def f(a):
+    out = jnp.zeros((64, 128))
+    for i in range(0, 64, 8):
+        acc = jnp.zeros((8, 128))
+        for k in range(-128, 128, 128):
+            acc += a[i:i + 8, k:k + 128]
+        out = out.at[i:i + 8, :].set(acc)
+    return out
+""",
+            "loop `k` starts at -128",
+        ),
+        (
+            """
+def f(a):
+    out = jnp.zeros((64, 128))
+    for i in range(0, 64, 8):
+        w = 0.5 if i == 0 else 1.0
+        out = out.at[i:i + 8, :].set(a[i:i + 8, :] * w)
+    return out
+""",
+            r"line 6\): Python control flow .* can't depend on loop variables",
+        ),
+        (
+            """
+def f(a):
+    M, N, K = a.shape
+    out = jnp.zeros((M, N))
+    for i in range(0, M, 8):
+        out = out.at[i:i + 8, :].set(a[i:i + 8, :])
+    return out
+""",
+            r"line 4\): the prologue failed \(ValueError",
+        ),
+        (
+            """
+def f(a):
+    out = jnp.zeros((64, 128))
+    for i in range(0, 64, 8):
+        acc = jnp.zeros((8, 128))
+        for k in range(0, 128, 128):
+            b = a[i:i + 8, k:k + 128]
+            acc += b @ jnp.ones((128, 3))
+        out = out.at[i:i + 8, :].set(acc)
+    return out
+""",
+            r"line 9\): couldn't trace the tile body",
+        ),
+        (
+            """
+def f(a):
+    out = jnp.zeros((64, 128))
+    for i in range(0, 64, 8):
+        out = out.at[i:i + 8, :].set(a[i:i + 8, :64])
+    return out
+""",
+            r"value stored into `out` has shape \(8, 64\), which doesn't fit its tile \(8, 128\)",
+        ),
     ],
 )
 def test_rejects_unsupported_code(tmp_path, src, match):

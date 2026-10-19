@@ -29,19 +29,24 @@ _PRELUDE = """\
 def _mxu_params(x, y):
     # `@` accumulates in f32 (i32 for integer inputs). bf16/int8 operands are exact on the MXU in one pass;
     # only f32 operands take a precision.
-    acc = jnp.int32 if jnp.issubdtype(x.dtype, jnp.integer) else jnp.float32
+    acc = jnp.int32 if jnp.issubdtype(jnp.result_type(x, y), jnp.integer) else jnp.float32
     precision = {precision} if x.dtype == jnp.float32 or y.dtype == jnp.float32 else None
     return acc, precision
 
 
 def _mxu_dot(x, y):
-    # `x @ y`: leading dims are batch dims.
+    # `x @ y` with NumPy's rules: leading dims of equal-rank operands are batch dims.
     acc, precision = _mxu_params(x, y)
     if x.ndim == 2 and y.ndim == 2:
         return jnp.dot(x, y, preferred_element_type=acc, precision=precision)
-    batch = tuple(range(x.ndim - 2))
-    dims = (((x.ndim - 1,), (y.ndim - 2,)), (batch, batch))
-    return jax.lax.dot_general(x, y, dims, preferred_element_type=acc, precision=precision)
+    if x.ndim > 2 and y.ndim == 2:  # a stack of matrices times one matrix: one big matmul
+        out = jnp.dot(x.reshape(-1, x.shape[-1]), y, preferred_element_type=acc, precision=precision)
+        return out.reshape(*x.shape[:-1], y.shape[-1])
+    if x.ndim == y.ndim:
+        batch = tuple(range(x.ndim - 2))
+        dims = (((x.ndim - 1,), (y.ndim - 2,)), (batch, batch))
+        return jax.lax.dot_general(x, y, dims, preferred_element_type=acc, precision=precision)
+    return jnp.matmul(x, y, preferred_element_type=acc, precision=precision)
 
 
 def _mxu_dot_t(x, y):

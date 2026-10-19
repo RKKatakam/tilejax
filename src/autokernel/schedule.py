@@ -29,7 +29,7 @@ from typing import Any
 
 import numpy as np
 
-from .analysis import Specialization, evaluate_mask, phase_coords, tile_coords
+from .analysis import Specialization, evaluate_mask
 from .errors import AutoKernelError
 
 __all__ = ["RUNTIME_TABLES", "Column", "Schedule", "build_tables", "plan", "runtime_tables"]
@@ -213,25 +213,15 @@ def runtime_tables(spec: Specialization, schedule: Schedule, inputs: dict[str, A
     import jax.numpy as jnp
 
     tiles = len(spec.tiles)
-    tile_keep = None
-    if spec.nest.guard is not None:
-        tile_keep = jnp.broadcast_to(
-            jnp.asarray(evaluate_mask(spec, spec.nest.guard, tile_coords(spec, jnp), jnp, inputs), bool), (tiles,)
-        )
+    tile_keep = evaluate_mask(spec, None, inputs) if spec.tile_mask_runtime else None
     phase_masks = []
     for p, phase in enumerate(spec.phases):
-        guard = phase.reduction.guard
-        if guard is None:
+        if phase.reduction.guard is None:
             phase_masks.append(None)
         elif not spec.phase_runtime[p]:
             phase_masks.append(jnp.asarray(spec.phase_masks[p]))
         else:
-            coords = {
-                **tile_coords(spec, jnp, column=True),
-                **{k: jnp.asarray(v) for k, v in phase_coords(phase).items()},
-            }
-            m = evaluate_mask(spec, guard, coords, jnp, inputs)
-            phase_masks.append(jnp.broadcast_to(jnp.asarray(m, bool), (tiles, phase.steps)))
+            phase_masks.append(evaluate_mask(spec, p, inputs))
     keep = _column_mask(spec, phase_masks, tiles, jnp)
     step_tile, step_code, count = build_tables(keep, schedule.columns, jnp, tile_keep)
     n_tiles = tiles if tile_keep is None else tile_keep.sum()

@@ -105,7 +105,9 @@ def test_per_tile_operand_and_fused_epilogue():
     for B, D, H in [(16, 256, 256), (32, 128, 384)]:
         x, w, bias = rand((B, D)), rand((D, H), 1), rand((1, H), 2)
         linear_relu.verify(x, w, bias)
-        assert [op.phase for op in linear_relu.lower(x, w, bias).operands] == [0, 0, None]
+        # With one reduction step (D = 128) every input is a per-tile input.
+        want = [0, 0, None] if D > 128 else [None, None, None]
+        assert [op.phase for op in linear_relu.lower(x, w, bias).operands] == want
 
 
 def test_operand_that_never_changes():
@@ -159,7 +161,7 @@ def test_loop_index_as_value():
 
     x = rand((64, 128))
     add_row_block_offset.verify(x)
-    assert "i = i_blk * 16" in add_row_block_offset.source(x)
+    assert "i = _weak(i_blk * 16)" in add_row_block_offset.source(x)  # a weakly typed Python int
 
 
 def test_same_input_with_two_tilings():
@@ -209,3 +211,36 @@ def test_kernel_has_no_races():
     a, b = rand((M, K)), rand((K, N), 1)
     out = run_checking_races(matmul, a, b)
     np.testing.assert_allclose(out, matmul.reference(a, b), atol=1e-4, rtol=1e-4)
+
+
+def test_multi_step_accumulators_add_in_place():
+    """With several reduction steps the accumulator stays `acc_ref[...] = acc_ref[...] + a @ b`: splitting the
+    first step off (store, then add) measured slower on a v5e."""
+    a, b = rand((M, K)), rand((K, N), seed=1)
+    lowered = matmul.lower(a, b)
+    assert "acc_ref[...] = acc_ref[...] + _mxu_dot(" in lowered.source and "acc_step" not in lowered.source
+    run_checking_races(matmul, a, b)
+    assert matmul.verify(a, b) < 1e-4
+
+
+def test_a_tile_of_one_step_keeps_its_values_as_locals():
+    """With one reduction step per tile (TK = K), nothing survives between steps: no scratch, and the
+    accumulator is just the matmul."""
+
+    @autokernel.tpu
+    def full_k(a, b):
+        c = jnp.zeros((M, N), jnp.bfloat16)
+        for i in range(0, M, TM):
+            for j in range(0, N, TN):
+                acc = jnp.zeros((TM, TN))
+                for k in range(0, K, K):
+                    acc += a[i : i + TM, k : k + K] @ b[k : k + K, j : j + TN]
+                c = c.at[i : i + TM, j : j + TN].set(acc.astype(jnp.bfloat16))
+        return c
+
+    a, b = rand((M, K), dtype=jnp.bfloat16), rand((K, N), seed=1, dtype=jnp.bfloat16)
+    lowered = full_k.lower(a, b)
+    assert lowered.state == {} and "acc_ref" not in lowered.source
+    assert "acc = jnp.broadcast_to(jnp.asarray(_mxu_dot(" in lowered.source
+    assert all(op.phase is None for op in lowered.operands)  # fetched per tile, a tile ahead
+    assert full_k.verify(a, b) == 0.0

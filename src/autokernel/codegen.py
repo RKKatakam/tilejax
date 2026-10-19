@@ -20,6 +20,7 @@ point per TensorCore, and each core runs a contiguous run of tiles.
 from __future__ import annotations
 
 import ast
+import copy
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -32,12 +33,21 @@ from jax.experimental.pallas import tpu as pltpu
 
 from . import hardware, mxu
 from . import schedule as schedule_lib
-from .analysis import Block, LoopBounds, Operand, Specialization
+from .analysis import Block, LoopBounds, Operand, Specialization, StateVar, Unit
 from .errors import AutoKernelError
 from .frontend import assigned_name
 from .schedule import COLUMN_SHIFT, FIRST, LAST, RUNTIME_TABLES, Schedule
 
-__all__ = ["FILL_DMA_DEPTH", "Generated", "check_layout", "generate", "layout_error", "plan_fills"]
+__all__ = [
+    "FILL_DMA_DEPTH",
+    "Emitter",
+    "Generated",
+    "check_layout",
+    "generate",
+    "layout_error",
+    "plan_fills",
+    "prelude",
+]
 
 # Constant (masked-out) tiles are written with at most this many fill DMAs in flight.
 FILL_DMA_DEPTH = 4
@@ -50,6 +60,21 @@ def _div(a, b):
 
 def _rem(a, b):
     return jax.lax.rem(a, b)
+"""
+
+_SCALAR_PRELUDE = """\
+def _index(i, n):
+    # A runtime index into a dim of size n: Python's rules, so a negative index counts from the end. One
+    # outside the dim is clamped into it, so a copy never reads outside the array (that would halt the TPU
+    # core); the caller reports it (`analysis.check_indices`).
+    return jnp.minimum(jnp.maximum(jnp.where(i < 0, i + n, i), 0), n - 1)
+"""
+
+
+_WEAK = """\
+def {name}(x):
+    # A Python scalar's weak type, so it takes the other operand's type: `bf16_tile * i` stays bf16.
+    return jax._src.lax.lax._convert_element_type(x, weak_type=True)
 """
 
 
@@ -73,7 +98,7 @@ def generate(
     cost: pl.CostEstimate | None,
 ) -> Generated:
     """`fills` and `aliased` are the outputs `plan_fills` assigned to fill DMAs and to an aliased input."""
-    return _Emitter(spec, sched, buffers, matmul_precision, fills, aliased, vmem_limit_bytes, cost).emit()
+    return Emitter(spec, sched, buffers, matmul_precision, fills, aliased, vmem_limit_bytes, cost).emit()
 
 
 def plan_fills(spec: Specialization, background_fill: bool) -> tuple[list[str], list[str]]:
@@ -84,8 +109,8 @@ def plan_fills(spec: Specialization, background_fill: bool) -> tuple[list[str], 
     the output so the skipped tiles keep its values.
     """
     skipped = bool(spec.constant_tiles) or spec.tile_mask_runtime
-    if not skipped:
-        return [], []
+    if not skipped:  # outputs the tiles don't cover keep their allocation's values
+        return [], [o.var for o in spec.outputs if o.partial]
     fill_ok = background_fill and not spec.tile_mask_runtime
     fills = [o.var for o in spec.outputs if fill_ok and o.fill is not None]
     return fills, [o.var for o in spec.outputs if o.var not in fills]
@@ -121,6 +146,14 @@ def layout_error(spec: Specialization, problems: list[str]) -> AutoKernelError:
 
 def _dtype_src(dtype: Any) -> str:
     return f"jnp.{np.dtype(dtype).name}"
+
+
+def _stored_dtype(sv: StateVar) -> np.dtype:
+    """The dtype a state variable's scratch holds: its own, except that SMEM scalars take a 32-bit word."""
+    dtype = np.dtype(sv.aval.dtype)
+    if not sv.smem or dtype.itemsize >= 4:
+        return dtype
+    return np.dtype(np.float32 if jnp.issubdtype(dtype, jnp.floating) else np.int32)
 
 
 def _scalar_src(value: Any) -> str:
@@ -186,21 +219,29 @@ def _radix(index: str, loops: Sequence[LoopBounds], k: int) -> str:
     return f"({idx} + {base})" if base else idx
 
 
-class _Emitter:
-    def __init__(self, spec, sched, buffers, precision, fills, aliased, vmem_limit, cost):
+class Emitter:
+    """Generates one nest's kernel: as a whole `pallas_call` (`emit`), or as one part of a fused kernel
+    (`part` and `prepare`, used by `fusion`), where `dependent` names the inputs an earlier part writes."""
+
+    def __init__(self, spec, sched, buffers, precision, fills, aliased, vmem_limit, cost, dependent=frozenset()):
         self.spec, self.sched, self.nest = spec, sched, spec.nest
         self.buffers, self.precision, self.vmem_limit, self.cost = buffers, precision, vmem_limit, cost
+        self.dependent = frozenset(dependent)
+        self.names = spec.names.copy()  # emitting twice gives the same names
         self.P = len(spec.phases)
         self.cores = sched.cores
         # One unmasked reduction (or none): every step belongs to phase 0 and none is empty.
         self.trivial = sched.mode == "uniform" and self.P <= 1
         self.used_names: set[str] = set()  # names the rewritten user code reads
+        self.weak: str | None = None  # the weak-type helper's name, once something needs it
+        self._param_names: dict[str, str] | None = None
+        self._tables_local: str | None = None
         self._names(fills, aliased)
         self._tables()
 
     def _names(self, fills: Sequence[str], aliased: Sequence[str]) -> None:
         """Identifiers the generated code binds where the user's code can see them."""
-        spec, names = self.spec, self.spec.names
+        spec, names = self.spec, self.names
         self.fills = {var: names.fresh(f"{var}_fill") for var in fills}
         self.aliased = {var: names.fresh(f"{var}_init") for var in aliased}
         self.v = {
@@ -232,10 +273,25 @@ class _Emitter:
         self.out_hbm = {o.var: names.fresh(f"{o.var}_hbm") for o in spec.outputs}
         self.out_slots = {o.var: names.fresh(f"{o.ref}_slots") for o in spec.outputs}
         self.out_sems = {o.var: names.fresh(f"{o.ref}_sems") for o in spec.outputs}
+        # Runtime scalars live in SMEM: integers in one int32 array, floats in one f32 array.
+        avals = dict(zip(spec.nest.params, spec.specs, strict=True))
+        self.int_scalars = [p for p in spec.scalars if jnp.issubdtype(avals[p].dtype, jnp.integer)]
+        self.float_scalars = [(p, bool(avals[p].weak_type)) for p in spec.scalars if p not in self.int_scalars]
+        self.scalars_ref = names.fresh("scalars") if self.int_scalars else None
+        self.fscalars_ref = names.fresh("fscalars") if self.float_scalars else None
+        self.indices: dict[tuple[str, int], str] = {}  # (runtime index expression, dim size) -> its variable
+        for op in spec.operands:
+            for d, expr in enumerate(op.block.dynamic):
+                if expr is not None and (expr, op.full_shape[d]) not in self.indices:
+                    self.indices[(expr, op.full_shape[d])] = names.fresh(f"{op.param}_index{d}")
+        # A fused kernel's part: its pieces, run in turn by the fused kernel.
+        self.pieces = {
+            k: names.fresh(f"_{k}") for k in ("early", "with_scratch", "late", "run", "drain", "hook", "hook_at")
+        }
 
     def _tables(self) -> None:
         """Static SMEM tables (embedded as constants of the wrapper) and the runtime tables' names."""
-        spec, sched, names = self.spec, self.sched, self.spec.names
+        spec, sched, names = self.spec, self.sched, self.names
         self.tables: dict[str, np.ndarray] = {}  # kernel parameter -> contents
         self.table_consts: dict[str, str] = {}  # kernel parameter -> the wrapper's constant
 
@@ -297,12 +353,20 @@ class _Emitter:
         items = [names.get(var, "_") for var in self.spec.loops]
         return f"({items[0]},)" if len(items) == 1 else ", ".join(items)
 
-    def _slices(self, block: Block, blocks: dict[str, str], fill: str | None = None) -> str:
+    def _slices(self, block: Block, blocks: dict[str, str], fill: str | None = None, full: tuple[int, ...] = ()) -> str:
         """The HBM window of a block: `pl.ds` per tiled dim, a plain index per squeezed dim."""
         parts = []
-        for var, size, c, sq in zip(block.loops, block.shape, block.const, block.squeezed, strict=True):
-            if var is None:
+        for d, (var, size, c, sq) in enumerate(zip(block.loops, block.shape, block.const, block.squeezed, strict=True)):
+            expr = block.dynamic_index(d)
+            if expr is not None:  # a runtime index, read from SMEM at the start of the kernel
+                start = self.indices[(expr, full[d])]
+            elif var is None:
                 start = str(c * size)
+            elif self.spec.loops[var].count == 1:
+                # A loop of one block: a constant offset, so Mosaic sees e.g. a window spanning whole rows and
+                # copies it in one go (a traced 0 offset cost a single-step v5e matmul 2%).
+                lb = self.spec.loops[var]
+                start = str(lb.start // lb.step * size)
             else:
                 idx = f"{self.fill_tables[var]}[{fill}]" if fill is not None else blocks[var]
                 start = idx if size == 1 else f"{idx} * {size}"
@@ -319,8 +383,15 @@ class _Emitter:
         lines = []
         for var in sorted(self.used_names & set(self.spec.loops)):
             step = self.spec.loops[var].step
-            lines.append(f"{var} = {self.blk[var]} * {step}" if step != 1 else f"{var} = {self.blk[var]}")
+            value = f"{self.blk[var]} * {step}" if step != 1 else self.blk[var]
+            lines.append(f"{var} = {self._weak()}({value})")
         return lines
+
+    def _weak(self) -> str:
+        """The prelude helper giving a value a Python scalar's weak type (`bf16_tile * i` stays bf16)."""
+        if self.weak is None:
+            self.weak = self.names.fresh("_weak")
+        return self.weak
 
     # ------------------------------------------------------------------ step decoding
 
@@ -401,10 +472,27 @@ class _Emitter:
     def _copy_fn(self, op: Operand) -> str:
         return f"_{op.ref}_copy"
 
-    def _copies(self) -> list[str]:
+    def _window(self, op: Operand) -> str:
+        """The window of a view's base array that the view's tile `op` is (see `views`)."""
+        starts = []
+        for d, (var, size, c) in enumerate(zip(op.block.loops, op.block.shape, op.block.const, strict=True)):
+            expr = op.block.dynamic_index(d)
+            if expr is not None:
+                starts.append((self.indices[(expr, op.full_shape[d])], 1, 0))
+            elif var is None:
+                starts.append((None, 0, c * size))
+            else:
+                starts.append((self.blk[var], size, 0))
+        return ", ".join(op.window.render(starts))
+
+    def _copies(self, ops: Sequence[Operand] | None = None, outputs: bool = True) -> list[str]:
+        """The copy functions of `ops` (default: every input) and, with `outputs`, of the outputs and fills."""
         lines = []
-        for op in self.spec.operands:
-            src = f"{self.hbm[op.param]}.at[{self._slices(op.block, self.blk)}]"
+        for op in self.spec.operands if ops is None else ops:
+            if op.window is not None:  # a view: copy the window of its base array
+                src = f"{self.hbm[op.param]}.at[{self._window(op)}]"
+            else:
+                src = f"{self.hbm[op.param]}.at[{self._slices(op.block, self.blk, full=op.full_shape)}]"
             dst = f"{self.slots[op.ref]}.at[slot], {self.sems[op.ref]}.at[slot]"
             body = [
                 *self._unpack_blocks(op.block),
@@ -412,7 +500,7 @@ class _Emitter:
                 f"return pltpu.make_async_copy(src, {dst})",
             ]
             lines += [*_fn(self._copy_fn(op), "blocks, slot", body), ""]
-        for out in self.spec.outputs:
+        for out in self.spec.outputs if outputs else []:
             dst = f"{self.out_hbm[out.var]}.at[{self._slices(out.block, self.blk)}]"
             src = f"{self.out_slots[out.var]}.at[slot], dst, {self.out_sems[out.var]}.at[slot]"
             body = [
@@ -430,9 +518,12 @@ class _Emitter:
 
     # ------------------------------------------------------------------ user code -> kernel code
 
-    def _rewrite(self, node: ast.AST, phase: int | None) -> ast.AST:
-        """Inputs become their tile refs, state variables their scratch refs, `@` an MXU matmul."""
+    def _rewrite(self, node: ast.AST, unit: Unit | None) -> ast.AST:
+        """User code of `unit` (None: the stores) as kernel code: inputs become their tile refs, state variables
+        their scratch refs, `@` an MXU matmul, and finished reduction loops' variables their last values."""
         spec, params, state = self.spec, self.nest.params, self.spec.state
+        phase = unit.phase if unit is not None else None
+        weak = self._weak
 
         class Rewriter(ast.NodeTransformer):
             def visit_Subscript(self, n: ast.Subscript) -> ast.AST:
@@ -446,44 +537,82 @@ class _Emitter:
                     return n
                 sv = state[n.id]
                 index = ast.Constant(0) if sv.smem else ast.Constant(...)
-                return ast.copy_location(ast.Subscript(ast.Name(sv.ref, ast.Load()), index, n.ctx), n)
+                ref = ast.copy_location(ast.Subscript(ast.Name(sv.ref, ast.Load()), index, n.ctx), n)
+                if not isinstance(n.ctx, ast.Load):
+                    return ref
+                if _stored_dtype(sv) != sv.aval.dtype:  # back from its 32-bit SMEM word
+                    ref = ast.parse(f"{ast.unparse(ref)}.astype({_dtype_src(sv.aval.dtype)})", mode="eval").body
+                if sv.aval.weak_type:  # it holds Python scalars: read it as one
+                    ref = ast.Call(ast.Name(weak(), ast.Load()), [ref], [])
+                return ast.copy_location(ref, n)
 
-        out = Rewriter().visit(mxu.rewrite_matmuls(node))
+        out = Rewriter().visit(spec.unit_code(node, unit))
         self.used_names |= {n.id for n in ast.walk(out) if isinstance(n, ast.Name)}
         return out
 
-    def _statements(self, stmts: Sequence[ast.stmt], phase: int | None) -> list[str]:
+    def _statements(self, unit: Unit) -> list[str]:
         lines = []
-        for original in stmts:
-            s, target = original, assigned_name(original)
-            if isinstance(s, ast.AugAssign) and target in self.spec.state:  # x += v  ->  x = x + v, on the ref
-                value = ast.BinOp(ast.Name(target, ast.Load()), s.op, s.value)
-                s = ast.copy_location(ast.Assign([ast.Name(target, ast.Store())], value), s)
-            out = self._rewrite(s, phase)
-            cast = self.spec.casts.get(id(original))
-            if cast is not None and isinstance(out, ast.Assign):
-                out.value = ast.parse(f"jnp.asarray({ast.unparse(out.value)}, {_dtype_src(cast)})", mode="eval").body
-            lines.append(ast.unparse(out))
+        accumulators = {id(a.update): a for a in self.spec.accumulators}
+        skipped = {id(a.init) for a in self.spec.accumulators}
+        for original in unit.statements:
+            if id(original) in skipped:  # an accumulator's zeros: its first step stores instead of adding
+                continue
+            acc = accumulators.get(id(original))
+            if acc is not None:
+                lines += self._accumulate(acc, original, unit)
+                continue
+            lines.append(self._statement(original, original, unit))
         return lines
+
+    def _statement(self, s: ast.stmt, original: ast.stmt, unit: Unit) -> str:
+        """`s` (the user's statement `original`, or one standing in for it) as kernel code."""
+        target = assigned_name(s)
+        if isinstance(s, ast.AugAssign) and target in self.spec.state:  # x += v  ->  x = x + v, on the ref
+            value = ast.BinOp(ast.Name(target, ast.Load()), s.op, s.value)
+            s = ast.copy_location(ast.Assign([ast.Name(target, ast.Store())], value), s)
+        out = self._rewrite(s, unit)
+        dtypes = [self.spec.casts.get(id(original))]  # to the state variable's type
+        sv = self.spec.state.get(target)
+        if sv is not None and _stored_dtype(sv) != sv.aval.dtype:
+            dtypes.append(_stored_dtype(sv))  # then into its 32-bit SMEM word
+        for dtype in dtypes:
+            if dtype is not None and isinstance(out, ast.Assign):
+                value = f"jnp.asarray({ast.unparse(out.value)}, {_dtype_src(dtype)})"
+                out.value = ast.parse(value, mode="eval").body
+        return ast.unparse(out)
+
+    def _accumulate(self, acc: Any, original: ast.stmt, unit: Unit) -> list[str]:
+        """`var += expr` on a zero-initialised accumulator in a tile of one step: just `var = expr`."""
+        aval = self.spec.avals[id(original)]
+        # `zeros + expr` has the sum's type and shape (`expr` may broadcast, like a (rows, 1) column).
+        value = f"jnp.asarray({ast.unparse(self._rewrite(acc.expr, unit))}, {_dtype_src(aval.dtype)})"
+        return [f"{acc.var} = jnp.broadcast_to({value}, {tuple(aval.shape)})"]
 
     def _stores(self) -> list[str]:
         v, lines = self.v, []
         for out in self.spec.outputs:
             store = next(st for st in self.nest.stores if st.out == out.var)
-            value = ast.unparse(self._rewrite(store.value, None))
+            value = f"jnp.asarray({ast.unparse(self._rewrite(store.value, None))}).astype({out.ref}.dtype)"
+            if out.var in self.spec.broadcast_stores:  # `.at[...].set(v)` broadcasts v to the tile
+                value = f"jnp.broadcast_to({value}, {out.ref}.shape)"
             copy_fn = f"_{out.ref}_copy"
-            lines += _fn(
-                f"_reuse_{out.ref}_slot",  # the copy that last used this slot must have left
-                "",
-                [f"{copy_fn}(_blocks({v['o']} - 2, 0), {v['o']} & 1).wait()"],
-                when=f"{v['o']} - 2 >= {v['o_begin']}",
-            )
             lines += [
                 f"{out.ref} = {self.out_slots[out.var]}.at[{v['o']} & 1]",
-                f"{out.ref}[...] = jnp.asarray({value}).astype({out.ref}.dtype)",
+                f"{out.ref}[...] = {value}",
                 f"{copy_fn}({v['blocks']}, {v['o']} & 1).start()",
             ]
         return lines
+
+    def _free_output_slots(self) -> list[str]:
+        """Wait for the copies that last used this tile's output slots (two tiles ago) to leave.
+
+        Done before the tile's last step runs any of the user's code: a wait is a barrier Mosaic schedules
+        nothing across, so a value computed before it and stored after it (the tile's matmul) would be parked
+        in VMEM and read back (on a v5e, 2% of a matmul).
+        """
+        v = self.v
+        waits = [f"_{out.ref}_copy(_blocks({v['o']} - 2, 0), {v['o']} & 1).wait()" for out in self.spec.outputs]
+        return _fn("_free_output_slots", "", waits, when=f"{v['o']} - 2 >= {v['o_begin']}")
 
     def _units(self) -> list[str]:
         """The user's code for one step, guarded by the step's phase and flags."""
@@ -491,15 +620,18 @@ class _Emitter:
         segments = [u for u in units if u.kind == "segment"]
         bodies = [u for u in units if u.kind == "body"]
         fill_issue = self._fill_issue()
-        final = self._statements(segments[-1].statements, None) + self._stores()
+        final = self._statements(segments[-1]) + self._stores()
+        free = self._free_output_slots()
         if P == 0:
-            return fill_issue + final
-        lines = []
+            return free + fill_issue + final
+        if self.spec.single_step:  # the tile's one step: its code in order, values as plain locals
+            return free + fill_issue + self._statements(segments[0]) + self._statements(bodies[0]) + final
+        lines = _block("_last_step", free, self._flag_test(P - 1, v["ph"], v["last"]))
         for p in range(P):
-            lead = (fill_issue if p == 0 else []) + self._statements(segments[p].statements, None)
+            lead = (fill_issue if p == 0 else []) + self._statements(segments[p])
             if lead:
                 lines += _fn(f"_segment_{p}", "", lead, when=self._flag_test(p, v["ph"], v["first"]))
-            body = self._statements(bodies[p].statements, p)
+            body = self._statements(bodies[p])
             lines += _block(f"_body_{p}", body, self._phase_test(p, v["ph"], v["empty"]))
         return lines + _fn("_finish_tile", "", final, when=self._flag_test(P - 1, v["ph"], v["last"]))
 
@@ -539,22 +671,25 @@ class _Emitter:
     def _by_phase_ops(self, ops: Sequence[Operand]) -> list[tuple[int, list[Operand]]]:
         return [(p, [op for op in ops if op.phase == p]) for p in range(self.P) if any(op.phase == p for op in ops)]
 
-    def _fetch_ahead(self, step: str, name: str) -> list[str]:
-        """Start copying step `step`'s streamed inputs into their ring slots."""
+    def _fetch_ahead(self, step: str, name: str, ops: Sequence[Operand] | None = None) -> list[str]:
+        """Start copying step `step`'s streamed inputs (or just `ops`) into their ring slots."""
         slot = _rem_src(f"({step})", self.buffers)
         body = [f"o2, ph2, d2, _, _, empty2 = _decode({step})", "blocks2 = _blocks(o2, d2)"]
-        for p, ops in self._by_phase_ops(self.streamed):
-            starts = [f"{self._copy_fn(op)}(blocks2, {slot}).start()" for op in ops]
+        for p, phase_ops in self._by_phase_ops(self.streamed if ops is None else ops):
+            starts = [f"{self._copy_fn(op)}(blocks2, {slot}).start()" for op in phase_ops]
             body += _block(f"_fetch_phase_{p}", starts, self._phase_test(p, "ph2", "empty2"))
         return _fn(name, "", body, when=f"{step} < {self.v['s_end']}")
 
-    def _step(self) -> list[str]:
+    def _step(self, hook: bool = False) -> list[str]:
         v, N = self.v, self.buffers
         slot = _rem_src(v["s"], N)
         lines = [
             f"{v['o']}, {v['ph']}, {v['d']}, {v['first']}, {v['last']}, {v['empty']} = _decode({v['s']})",
             f"{v['blocks']} = _blocks({v['o']}, {v['d']})",
         ]
+        if hook:  # once this nest's own copies are all issued: start the next nest's first copies
+            hook_at, call = self.pieces["hook_at"], f"{self.pieces['hook']}()"
+            lines += _fn("_start_next_nest", "", [call], when=f"{v['s']} == {hook_at}")
         if self.streamed:  # 1. prefetch the step N - 1 ahead
             lines += self._fetch_ahead(f"{v['s']} + {N - 1}", "_prefetch")
         if self.per_tile:  # 2. per-tile inputs, at a tile's first step
@@ -565,7 +700,9 @@ class _Emitter:
                 *_fn("_next_tile_inputs", "", next_tile, when=f"{v['o']} + 1 < {v['o_end']}"),
                 *[f"{self._copy_fn(op)}({v['blocks']}, {v['o']} & 1).wait()" for op in self.per_tile],
             ]
-            lines += _block("_tile_inputs", body, self._flag_test(0, v["ph"], v["first"]) if self.P else None)
+            # A tile of one step is always at its first step: no test (Mosaic schedules unguarded waits better).
+            guard = self._flag_test(0, v["ph"], v["first"]) if self.P and not self.spec.single_step else None
+            lines += _block("_tile_inputs", body, guard)
         for p, ops in self._by_phase_ops(self.streamed):  # 3. this step's inputs
             waits = [f"{self._copy_fn(op)}({v['blocks']}, {slot}).wait()" for op in ops]
             lines += _block(f"_wait_phase_{p}", waits, self._phase_test(p, v["ph"], v["empty"]))
@@ -577,95 +714,222 @@ class _Emitter:
             lines.append(f"{self._blocks_tuple(self.blk)} = {v['blocks']}")
         return lines + values + units
 
-    def _kernel(self, name: str) -> list[str]:
-        spec, v, N = self.spec, self.v, self.buffers
+    def _arg_groups(self) -> dict[str, list[str]]:
+        """The kernel's parameters by kind, in order: SMEM inputs, HBM inputs, aliased inputs, outputs, scratch."""
         runtime = [self.step_tables[k] for k in RUNTIME_TABLES] if self.sched.mode == "runtime" else []
-        args = [
-            *self.tables,
-            *runtime,
-            *self.hbm.values(),
-            *self.aliased.values(),
-            *self.out_hbm.values(),
-            *[x for op in spec.operands for x in (self.slots[op.ref], self.sems[op.ref])],
-            *[x for o in spec.outputs for x in (self.out_slots[o.var], self.out_sems[o.var])],
-            *[sv.ref for sv in spec.state.values()],
-            *[x for fill in self.fills.values() for x in (fill, f"{fill}_sem")],
-        ]
-        body = [*self._bounds(), "", *self._decode(), "", *self._blocks(), "", *self._copies()]
-        for out in spec.outputs:
+        return {
+            "smem": [*self.tables, *runtime, *(r for r in (self.scalars_ref, self.fscalars_ref) if r)],
+            "hbm": list(self.hbm.values()),
+            "aliased": list(self.aliased.values()),
+            "outputs": list(self.out_hbm.values()),
+            "scratch": [name for names, _, _ in self._scratch_buffers() for name in names],
+        }
+
+    def _kernel_args(self) -> list[str]:
+        return [a for group in self._arg_groups().values() for a in group]
+
+    def _scalar_reads(self) -> list[str]:
+        """Bind the runtime scalars (as the user's names) and the runtime indices computed from them."""
+        lines = [f"{p} = {self._weak()}({self.scalars_ref}[{n}])" for n, p in enumerate(self.int_scalars)]
+        for n, (p, weak) in enumerate(self.float_scalars):
+            value = f"{self.fscalars_ref}[{n}]"
+            lines.append(f"{p} = {self._weak()}({value})" if weak else f"{p} = {value}")
+        lines += [f"{name} = _index({expr}, {size})" for (expr, size), name in self.indices.items()]
+        return lines
+
+    def _setup(self) -> list[str]:
+        """The kernel's definitions: this core's bounds, the runtime scalars, step decoding and copies."""
+        reads = self._scalar_reads()
+        lines = [*self._bounds(), *(["", *reads] if reads else []), ""]
+        return [*lines, *self._decode(), "", *self._blocks(), "", *self._copies()]
+
+    def _fill_init(self) -> list[str]:
+        lines = []
+        for out in self.spec.outputs:
             if out.var in self.fills:
                 fill = self.fills[out.var]
-                body.append(f"{fill}[...] = jnp.full({fill}.shape, {_scalar_src(out.fill)}, {fill}.dtype)")
-        body += ["", "# Fetch the first steps' inputs."]
-        if self.per_tile:
-            first = [
-                f"{self._copy_fn(op)}(_blocks({v['o_begin']}, 0), {v['o_begin']} & 1).start()" for op in self.per_tile
-            ]
-            body += _fn("_first_tile_inputs", "", first, when=f"{v['o_begin']} < {v['o_end']}")
-        if self.streamed:
+                lines.append(f"{fill}[...] = jnp.full({fill}.shape, {_scalar_src(out.fill)}, {fill}.dtype)")
+        return lines
+
+    def _first_fetches(self, dependent: bool | None = None) -> list[str]:
+        """Start the first steps' copies: of every input (None), or only those an earlier fused nest writes
+        (True) or doesn't (False)."""
+        v, N, lines = self.v, self.buffers, []
+
+        def wanted(op: Operand) -> bool:
+            return dependent is None or (op.param in self.dependent) == dependent
+
+        per_tile = [op for op in self.per_tile if wanted(op)]
+        streamed = [op for op in self.streamed if wanted(op)]
+        if per_tile:
+            first = [f"{self._copy_fn(op)}(_blocks({v['o_begin']}, 0), {v['o_begin']} & 1).start()" for op in per_tile]
+            lines += _fn("_first_tile_inputs", "", first, when=f"{v['o_begin']} < {v['o_end']}")
+        if streamed:
             for k in range(N - 1):
-                body += self._fetch_ahead(f"{v['s_begin']} + {k}", f"_prefetch_{k}")
-        body += ["", *_fn("_steps", v["s"], self._step(), loop=f"{v['s_begin']}, {v['s_end']}")]
-        body += ["", "# Wait for the copies still in flight."]
-        for out in spec.outputs:
+                lines += self._fetch_ahead(f"{v['s_begin']} + {k}", f"_prefetch_{k}", streamed)
+        return lines
+
+    def _run(self, hook: bool = False) -> list[str]:
+        """The step loop. With `hook`, it calls the next fused nest's prologue once its own copies are issued."""
+        v, N = self.v, self.buffers
+        lines = []
+        # The step bounds are read from SMEM (not Python ints) with runtime tables or several TensorCores.
+        traced = self.sched.mode == "runtime" or self.cores > 1
+        if hook:
+            at = f"{v['s_end']} - {N - 1}, {v['s_begin']}"
+            at = f"jnp.maximum({at})" if traced else f"max({at})"
+            lines.append(f"{self.pieces['hook_at']} = {at}")
+        lines += _fn("_steps", v["s"], self._step(hook), loop=f"{v['s_begin']}, {v['s_end']}")
+        if hook and traced:  # no steps at all (on this core): the loop never started the next nest
+            lines += _fn("_no_steps", "", [f"{self.pieces['hook']}()"], when=f"{v['s_end']} <= {v['s_begin']}")
+        return lines
+
+    def _drain(self) -> list[str]:
+        v, lines = self.v, []
+        for out in self.spec.outputs:
             for back in (2, 1):
                 wait = [f"_{out.ref}_copy(_blocks({v['o_end']} - {back}, 0), ({v['o_end']} - {back}) & 1).wait()"]
-                body += _fn(f"_drain_{out.ref}_{back}", "", wait, when=f"{v['o_end']} - {back} >= {v['o_begin']}")
-        body += self._fill_drain()
+                lines += _fn(f"_drain_{out.ref}_{back}", "", wait, when=f"{v['o_end']} - {back} >= {v['o_begin']}")
+        return lines + self._fill_drain()
+
+    def _kernel(self, name: str) -> list[str]:
+        body = [*self._setup(), *self._fill_init(), "", "# Fetch the first steps' inputs.", *self._first_fetches()]
+        body += ["", *self._run(), "", "# Wait for the copies still in flight.", *self._drain()]
+        return [f"def {name}({', '.join(self._kernel_args())}):", *_indent(body)]
+
+    def part(self, name: str, hook: bool) -> list[str]:
+        """This nest as one part of a fused kernel. `name(<its refs>, <its early scratch>)` defines its copies
+        and returns two functions, which the fused kernel runs in turn:
+
+        - early(): start the first copies of the inputs no earlier part writes (run while the previous part
+          finishes), into the part's *early* scratch (`scratch_groups`), allocated before it;
+        - with_scratch(<its other scratch>) -> (late, run, drain), once the rest of its scratch exists:
+          - late(): start the first copies of the inputs an earlier part wrote (after it has drained);
+          - run(hook): the step loop; `hook` (the next part's `early`) is called once this part's own copies
+            have all been issued;
+          - drain(): wait for this part's output copies.
+        """
+        p = self.pieces
+        early_ops = [op for op in self.spec.operands if op.param not in self.dependent]
+        late_ops = [op for op in self.spec.operands if op.param in self.dependent]
+        groups = self._arg_groups()
+        early_scratch, late_scratch = (names for names, _ in self.scratch_groups())
+        args = [*groups["smem"], *groups["hbm"], *groups["aliased"], *groups["outputs"], *early_scratch]
+        reads = self._scalar_reads()
+        body = [*self._bounds(), *(["", *reads] if reads else []), "", *self._decode(), "", *self._blocks(), ""]
+        body += self._copies(early_ops, outputs=False)
+        body += _fn(p["early"], "", [*self._fill_init(), *self._first_fetches(False)])
+        inner = [*self._copies(late_ops, outputs=True)]
+        inner += _fn(p["late"], "", self._first_fetches(True))
+        inner += _fn(p["run"], p["hook"] if hook else "", self._run(hook)) + _fn(p["drain"], "", self._drain())
+        inner.append(f"return {p['late']}, {p['run']}, {p['drain']}")
+        body += _fn(p["with_scratch"], ", ".join(late_scratch), inner)
+        body.append(f"return {p['early']}, {p['with_scratch']}")
         return [f"def {name}({', '.join(args)}):", *_indent(body)]
+
+    def scratch_groups(self) -> tuple[tuple[list[str], list[str]], tuple[list[str], list[str]]]:
+        """A fused part's scratch as ((names, shapes) early, (names, shapes) late): the early scratch is what
+        its `early` copies write (the rings of inputs no earlier part writes, and the skipped tiles' fill
+        values); the rest (the rings of inputs earlier parts write, output slots, state) is only needed once
+        the part runs."""
+        early: tuple[list[str], list[str]] = ([], [])
+        late: tuple[list[str], list[str]] = ([], [])
+        for names, shapes, is_early in self._scratch_buffers():
+            group = early if is_early else late
+            group[0].extend(names)
+            group[1].extend(shapes)
+        return early, late
 
     # ------------------------------------------------------------------ wrapper
 
-    def _scratch(self) -> list[str]:
-        spec, N, scratch = self.spec, self.buffers, []
+    def _scratch_buffers(self) -> list[tuple[list[str], list[str], bool]]:
+        """Each scratch buffer, in kernel-argument order: (its names, its shapes, written by a fused part's
+        `early` copies)."""
+        spec, N, out = self.spec, self.buffers, []
         for op in spec.operands:
             depth = N if op.phase is not None else 2
             shape = (depth, *op.block.kernel_shape)
-            scratch += [
+            lines = [
                 f"pltpu.VMEM({shape}, {_dtype_src(op.dtype)}),  # {op.param}[{op.block.text}]",
                 f"pltpu.SemaphoreType.DMA(({depth},)),",
             ]
-        for out in spec.outputs:
-            shape = (2, *out.block.kernel_shape)
-            scratch += [
-                f"pltpu.VMEM({shape}, {_dtype_src(out.out.dtype)}),  # {out.var}[{out.block.text}]",
+            out.append(([self.slots[op.ref], self.sems[op.ref]], lines, op.param not in self.dependent))
+        for o in spec.outputs:
+            shape = (2, *o.block.kernel_shape)
+            lines = [
+                f"pltpu.VMEM({shape}, {_dtype_src(o.out.dtype)}),  # {o.var}[{o.block.text}]",
                 "pltpu.SemaphoreType.DMA((2,)),",
             ]
+            out.append(([self.out_slots[o.var], self.out_sems[o.var]], lines, False))
         for sv in spec.state.values():
-            dtype = _dtype_src(sv.aval.dtype)
+            dtype = _dtype_src(_stored_dtype(sv))
             mem = f"pltpu.SMEM((1,), {dtype})" if sv.smem else f"pltpu.VMEM({tuple(sv.aval.shape)}, {dtype})"
-            scratch.append(f"{mem},  # {sv.name}")
-        for out in spec.outputs:
-            if out.var in self.fills:
-                shape = out.block.kernel_shape
-                scratch += [
-                    f"pltpu.VMEM({shape}, {_dtype_src(out.out.dtype)}),  # {out.var}'s skipped tiles",
+            out.append(([sv.ref], [f"{mem},  # {sv.name}"], False))
+        for o in spec.outputs:
+            if o.var in self.fills:
+                fill = self.fills[o.var]
+                lines = [
+                    f"pltpu.VMEM({o.block.kernel_shape}, {_dtype_src(o.out.dtype)}),  # {o.var}'s skipped tiles",
                     "pltpu.SemaphoreType.DMA(()),",
                 ]
-        return scratch
+                out.append(([fill, f"{fill}_sem"], lines, True))
+        return out
+
+    def _scratch(self) -> list[str]:
+        return [line for _, lines, _ in self._scratch_buffers() for line in lines]
+
+    def _params(self) -> dict[str, str]:
+        """The wrapper's parameters: the kernel's, renamed where they would hide a name the wrapper uses."""
+        if self._param_names is None:
+            reserved = {"interpret", "jax", "jnp", "np", "pl", "pltpu", "_COST", "_runtime_tables", "_index"}
+            self._param_names = {p: self.names.fresh(f"{p}_arg") if p in reserved else p for p in self.nest.params}
+        return self._param_names
+
+    def _wrapper_inputs(self) -> tuple[list[str], list[str], list[str]]:
+        """What the wrapper computes before the call: (its lines, the SMEM inputs, the aliased initial values)."""
+        spec, param = self.spec, self._params()
+        lines, smem, inits = [], list(self.table_consts.values()), []
+        if self.sched.mode == "runtime":
+            if self._tables_local is None:
+                self._tables_local = self.names.fresh("tables")
+            tables = self._tables_local
+            lines.append("# A mask reads inputs, so the steps are listed on device.")
+            lines.append(f"{tables} = _runtime_tables({', '.join(f'{p}={a}' for p, a in param.items())})")
+            smem += [f"{tables}[{k!r}]" for k in RUNTIME_TABLES]
+        if self.scalars_ref:
+            values = ", ".join(f"jnp.asarray({param[p]}, jnp.int32)" for p in self.int_scalars)
+            lines.append(f"{self.scalars_ref} = jnp.stack([{values}])  # runtime scalars, read from SMEM")
+            smem.append(self.scalars_ref)
+        if self.fscalars_ref:
+            values = ", ".join(f"jnp.asarray({param[p]}, jnp.float32)" for p, _ in self.float_scalars)
+            lines.append(f"{self.fscalars_ref} = jnp.stack([{values}])  # float runtime scalars, read from SMEM")
+            smem.append(self.fscalars_ref)
+
+        class Renamed(ast.NodeTransformer):
+            def visit_Name(self, n: ast.Name) -> ast.AST:
+                return ast.copy_location(ast.Name(param.get(n.id, n.id), n.ctx), n)
+
+        for var, init in self.aliased.items():
+            alloc = Renamed().visit(copy.deepcopy(next(o.alloc for o in spec.outputs if o.var == var)))
+            lines.append(f"{init} = {ast.unparse(alloc)}  # skipped tiles keep these values")
+            inits.append(init)
+        return lines, smem, inits
 
     def _wrapper(self, kernel: str) -> list[str]:
-        spec, nest, sched = self.spec, self.nest, self.sched
+        spec, nest = self.spec, self.nest
         smem, anyspace = "pl.BlockSpec(memory_space=pltpu.SMEM)", "pl.BlockSpec(memory_space=pl.ANY)"
-        n_smem = len(self.tables) + (len(RUNTIME_TABLES) if sched.mode == "runtime" else 0)
-        in_specs = [smem] * n_smem + [anyspace] * (len(self.hbm) + len(self.aliased))
+        prep, smem_args, inits = self._wrapper_inputs()
+        in_specs = [smem] * len(smem_args) + [anyspace] * (len(self.hbm) + len(inits))
         outs = [f"jax.ShapeDtypeStruct({tuple(o.out.shape)}, {_dtype_src(o.out.dtype)})" for o in spec.outputs]
         out_shape = f"({', '.join(outs)},)" if nest.returns_tuple else outs[0]
         out_specs = f"({', '.join([anyspace] * len(outs))},)" if nest.returns_tuple else anyspace
 
-        lines = [f"def {nest.fn_name}_pallas({', '.join(nest.params)}, *, interpret=False):"]
+        param = self._params()
+        lines = [f"def {nest.fn_name}_pallas({', '.join(param.values())}, *, interpret=False):"]
         lines.append(f"    # No grid: one loop over {self._describe()}; inputs {self.buffers}-buffered by hand.")
-        args = list(self.table_consts.values())
-        if sched.mode == "runtime":
-            lines.append("    # A mask reads inputs, so the steps are listed on device.")
-            lines.append(f"    tables = _runtime_tables({', '.join(f'{p}={p}' for p in nest.params)})")
-            args += [f"tables[{k!r}]" for k in RUNTIME_TABLES]
-        args += list(self.hbm)
-        for var, init in self.aliased.items():
-            alloc = next(o.alloc for o in spec.outputs if o.var == var)
-            lines.append(f"    {init} = {ast.unparse(alloc)}  # skipped tiles keep these values")
-            args.append(init)
-        aliases = {len(args) - len(self.aliased) + n: nest.out_vars.index(var) for n, var in enumerate(self.aliased)}
+        lines += _indent(prep)
+        args = [*smem_args, *[param[p] for p in self.hbm], *inits]
+        aliases = {len(args) - len(inits) + n: nest.out_vars.index(var) for n, var in enumerate(self.aliased)}
         params = [f"vmem_limit_bytes={self.vmem_limit}"] + (
             ['dimension_semantics=("parallel",)'] if self.cores > 1 else []
         )
@@ -688,6 +952,25 @@ class _Emitter:
         ]
         return lines
 
+    def prepare(self, name: str) -> list[str]:
+        """For a fused kernel: `name(*inputs)` -> (SMEM inputs, aliased initial values) of this part.
+
+        Inputs an earlier part writes are passed as None: the fused kernel only fuses nests whose masks and
+        aliased allocations don't read them.
+        """
+        prep, smem, inits = self._wrapper_inputs()
+        body = [*prep, f"return [{', '.join(smem)}], [{', '.join(inits)}]"]
+        return _fn(name, ", ".join(self._params().values()), body)
+
+    def scratch(self) -> list[str]:
+        return self._scratch()
+
+    def arg_groups(self) -> dict[str, list[str]]:
+        return self._arg_groups()
+
+    def describe(self) -> str:
+        return self._describe()
+
     def _describe(self) -> str:
         sched, spec = self.sched, self.spec
         total = spec.total_tiles
@@ -699,24 +982,42 @@ class _Emitter:
 
     # ------------------------------------------------------------------ assembly
 
-    def emit(self) -> Generated:
+    def header(self) -> str:
         spec, nest = self.spec, self.nest
-        kernel_name = spec.names.fresh(f"{nest.fn_name}_kernel")
-        kernel = self._kernel(kernel_name)
-        wrapper = self._wrapper(kernel_name)
         inputs = ", ".join(
             f"{p}: {_dtype_src(s.dtype)}{tuple(s.shape)}" for p, s in zip(nest.params, spec.specs, strict=True)
         )
         header = f"# Generated by autokernel from `{nest.fn_name}` ({spec.filename}:{nest.first_line}) for {inputs}"
         if spec.overrides:
             header += "\n# Tuned: " + ", ".join(f"{k}={v}" for k, v in sorted(spec.overrides.items()))
-        prelude = _PRELUDE + "\n\n" + mxu.prelude(self.precision)
-        source = "\n".join([header, "", prelude, "", *kernel, "", "", *wrapper, ""])
+        return header
 
+    def weak_helper(self) -> str:
+        """The weak-type helper's source, when the generated code uses it (after it is generated)."""
+        return _WEAK.format(name=self.weak) if self.weak is not None else ""
+
+    def namespace(self) -> dict[str, Any]:
+        """What the generated code runs with: the user's constants, the prelude's imports and the tables."""
+        spec = self.spec
         namespace: dict[str, Any] = dict(spec.consts)
-        namespace.update(jax=jax, jnp=jnp, pl=pl, pltpu=pltpu, _COST=self.cost)
+        namespace.update(jax=jax, jnp=jnp, np=np, pl=pl, pltpu=pltpu, _COST=self.cost)
         namespace.update({self.table_consts[name]: value for name, value in self.tables.items()})
         if self.sched.mode == "runtime":
             namespace["_runtime_tables"] = lambda **inputs: schedule_lib.runtime_tables(spec, self.sched, inputs)
+        return namespace
+
+    def emit(self) -> Generated:
+        nest = self.nest
+        kernel_name = self.names.fresh(f"{nest.fn_name}_kernel")
+        kernel = self._kernel(kernel_name)
+        wrapper = self._wrapper(kernel_name)
+        helpers = [prelude(self.precision, bool(self.spec.scalars)), self.weak_helper()]
+        source = "\n".join([self.header(), "", "\n\n".join(filter(None, helpers)), "", *kernel, "", "", *wrapper, ""])
+        namespace = self.namespace()
         exec(compile(source, f"<autokernel:{nest.fn_name}>", "exec"), namespace)
         return Generated(source, namespace[f"{nest.fn_name}_pallas"])
+
+
+def prelude(precision: str, scalars: bool) -> str:
+    """The helpers generated kernels use: index arithmetic, runtime scalars (when there are any), `@`."""
+    return "\n\n".join([_PRELUDE, *([_SCALAR_PRELUDE] if scalars else []), mxu.prelude(precision)])
