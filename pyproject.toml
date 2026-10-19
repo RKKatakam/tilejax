@@ -1,0 +1,59 @@
+[project]
+name = "autokernel"
+version = "0.1.0"
+description = "Compile Python tile loop nests into Pallas TPU kernels"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "jax>=0.11.2",
+    "numpy>=2.5.4",
+]
+keywords = ["jax", "pallas", "tpu", "compiler", "kernels"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Compilers",
+]
+
+[project.optional-dependencies]
+tpu = ["jax[tpu]>=0.11.2"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.14",
+]
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/autokernel"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers"]
+filterwarnings = [
+    "error",
+    # Expected off-TPU: kernels run in the Pallas TPU interpreter.
+    "ignore:autokernel. no TPU found:UserWarning",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+extend-exclude = [".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+ignore = [
+    "B023",  # closures over loop variables are intentional in the generated-code helpers
+    "RUF001",  # en dashes and similar in prose are fine
+    "SIM108",  # ternaries aren't always clearer
+]
+
+[tool.ruff.lint.per-file-ignores]
+"examples/*" = ["E402"]
+"benchmarks/*" = ["E402"]

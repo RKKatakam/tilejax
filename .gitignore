@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Environments and tool caches
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Compiler dumps (HLO / LLO / Mosaic)
+dumps/
+*.mlir
+
+# OS
+.DS_Store

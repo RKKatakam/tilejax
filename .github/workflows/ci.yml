@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - run: uv sync --locked
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      # On CPU: kernels run in the Pallas TPU interpreter, and are cross-lowered to Mosaic for a v5e.
+      - run: uv run pytest
+      - run: uv run python examples/tiled_matmul.py
+      - run: uv run python examples/causal_matmul.py
