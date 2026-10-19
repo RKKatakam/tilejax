@@ -37,16 +37,20 @@ CALLS = {"_mxu_dot": "_autokernel_mxu_dot", "_mxu_dot_t": "_autokernel_mxu_dot_t
 
 _PRELUDE = """\
 def {_mxu_params}(x, y):
-    # `@` accumulates in f32 (i32 for integer inputs). bf16/int8 operands are exact on the MXU in one pass;
-    # only f32 operands take a precision.
-    acc = jnp.int32 if jnp.issubdtype(jnp.result_type(x, y), jnp.integer) else jnp.float32
-    precision = {precision} if x.dtype == jnp.float32 or y.dtype == jnp.float32 else None
-    return acc, precision
+    # `@` accumulates in f32 (i32 for integer inputs). Operands of different types are promoted to a common
+    # one first, as NumPy does (Mosaic has no mixed-type matmul). bf16/int8 operands are exact on the MXU in
+    # one pass; only f32 operands take a precision.
+    if x.dtype != y.dtype:
+        common = jnp.promote_types(x.dtype, y.dtype)
+        x, y = x.astype(common), y.astype(common)
+    acc = jnp.int32 if jnp.issubdtype(x.dtype, jnp.integer) else jnp.float32
+    precision = {precision} if x.dtype == jnp.float32 else None
+    return x, y, acc, precision
 
 
 def {_mxu_dot}(x, y):
     # `x @ y` with NumPy's rules: leading dims are batch dims (broadcast when they differ).
-    acc, precision = {_mxu_params}(x, y)
+    x, y, acc, precision = {_mxu_params}(x, y)
     if x.ndim == 2 and y.ndim == 2:
         return jnp.dot(x, y, preferred_element_type=acc, precision=precision)
     if x.ndim > 2 and y.ndim == 2:  # a stack of matrices times one matrix: one big matmul
@@ -64,7 +68,7 @@ def {_mxu_dot_t}(x, y):
     # transposing it (a stack of matrices x as one big matmul).
     if y.ndim != 2 or x.ndim < 2:
         return {_mxu_dot}(x, y.T)
-    acc, precision = {_mxu_params}(x, y)
+    x, y, acc, precision = {_mxu_params}(x, y)
     dims = (((1,), (1,)), ((), ()))
     out = jax.lax.dot_general(x.reshape(-1, x.shape[-1]), y, dims, preferred_element_type=acc, precision=precision)
     return out if x.ndim == 2 else out.reshape(*x.shape[:-1], y.shape[0])

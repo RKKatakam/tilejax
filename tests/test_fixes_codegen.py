@@ -2,6 +2,7 @@
 hide the user's, SMEM and VMEM budgets, the TensorCore split, and generated source that runs on its own."""
 
 import itertools
+import re
 
 import jax
 import jax.numpy as jnp
@@ -188,8 +189,13 @@ def test_single_step_accumulator_keeps_a_python_floats_weak_type():
 
     kern = autokernel.tpu(weak_acc)
     x = rand((256, 128), 0, jnp.bfloat16)
+    assert re.search(r"\bacc = _weak\w*\(", kern.source(x))  # a Python float's weak type, not a strong f32
     out = run_checking_races(kern, x)
-    np.testing.assert_array_equal(np.float32(out), np.float32(kern.reference(x)))
+    assert out.dtype == jnp.bfloat16
+    if jax.default_backend() == "tpu":  # Mosaic and XLA may round fused bf16 math differently: one ulp
+        np.testing.assert_allclose(np.float32(out), np.float32(kern.reference(x)), rtol=2**-7, atol=2**-7)
+    else:
+        np.testing.assert_array_equal(np.float32(out), np.float32(kern.reference(x)))
 
 
 # --------------------------------------------------------------------------- budgets

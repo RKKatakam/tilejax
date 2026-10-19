@@ -31,7 +31,8 @@ matmul.verify(x, y)  # checks the kernel against the Python loops
 The Python function is the specification: `verify` runs it eagerly and compares. The one thing the
 kernel does differently from plain JAX is `@`: it accumulates in f32 (i32 for integers) like the MXU,
 instead of rounding `bf16 @ bf16` to bf16 or wrapping `int8 @ int8`; `verify` compares against that. The
-generated kernel is plain Pallas you can read, copy and edit.
+generated kernel is plain Pallas you can read, copy and edit: `source` carries its imports, constants and
+tables, so it runs on its own.
 
 The same decorator compiles a **whole model**: a function with many loop nests, JAX code between them and
 Python loops over layers becomes a program of gridless kernels, fused where they run back to back, with
@@ -206,14 +207,25 @@ def f(x, y, mask):  # positional array parameters
 - Tile bodies are assignments (`name = expr`, `name op= expr`) and reduction loops. Values that must
   survive between steps are found automatically and kept in VMEM, with the type Python gives them.
   Every value a tile reads must be assigned in it first (nothing carries over from one tile to the next),
-  and values assigned between parallel loops can't be reassigned further in.
+  and values assigned between parallel loops can't be reassigned further in. A value a masked reduction
+  loop assigns must also be assigned before that loop if anything reads it afterwards (the mask may skip
+  every step of a tile).
 - Loop variables may be used as values, e.g. `jax.lax.broadcasted_iota(...) + i`. They are Python ints,
   weakly typed (`bf16_tile * i` stays bf16), and a reduction loop's variable keeps its last value after
   the loop. Python control flow (`if`, `int(...)`) can't depend on them outside a mask: use `jnp.where`.
+  In the kernel they are int32: arithmetic on them wraps where Python ints wouldn't.
 - Every output element must be produced: each output's tiles cover it, apart from masked-out tiles.
 - `a @ b`, `a @ b.T` and batched `@` (NumPy's broadcasting rules) run on the MXU and accumulate in f32
-  (i32 when both inputs are integers), whatever the inputs' dtype; `reference` and `verify` use the same
-  semantics.
+  (i32 when both inputs are integers), whatever the inputs' dtype, and so does `a @= b` (a carried bf16
+  value becomes f32); `reference` and `verify` use the same semantics, through their own `jnp.matmul`,
+  not the kernel's code.
+- A single kernel takes its arguments positionally or by name, with defaults. Global and closure arrays its
+  tile body reads through slices are inputs, read with their current values on every call; changing a
+  module or closure constant the nest reads gives a new kernel, as it changes what the Python computes.
+  Integer scalar inputs narrower than 32 bits keep their dtype; other integer scalars act like Python ints.
+- Output allocations are evaluated after the whole prologue, so the prologue can't reassign a name an
+  allocation reads, and an output can't rebind a parameter of the same name (`x = jnp.zeros(...)`).
+  `...` in tile indices and `:=` in the nest aren't supported.
 
 Anything else is rejected with an `AutoKernelError` naming the line, before anything runs.
 
@@ -284,7 +296,9 @@ def mlp(x, w1, w2):
   the arrays it stores to. Any other loop, such as a scan `h = h.at[t].set(f(h[t - 1]))` or collecting
   results `outs = outs.at[layer].set(h)`, is ordinary Python, run as JAX. Nests can sit inside plain
   Python `for`, `if` and `with` blocks.
-- An output allocated just before its nest is allocated by the kernel. Otherwise the nest starts from the
+- An output allocated just before its nest is allocated by the kernel; if the allocation computes values
+  (`y = x * 2`), elements no tile writes keep them, while a constant fill (`jnp.zeros`, `jnp.full`) must be
+  covered by the tiles. Otherwise the nest starts from the
   array's current value (an allocation before an `if` or loop, an argument, an earlier nest's output), and
   elements no tile writes keep it, as in Python.
 - A nest's loop variables and temporaries don't exist after it: reading one later is an error naming the
@@ -293,16 +307,21 @@ def mlp(x, w1, w2):
   tuples are compiled into the kernel as constants, one kernel per distinct set, except **integers the
   nest only uses as indices of its inputs or as values in its tile body** (`w1[layer, ...]` above, or
   `x * layer`): those are *runtime scalars*, passed to the kernel in SMEM, so one kernel serves every
-  value. Integers it needs at trace time (loop bounds, masks, slices, allocations) stay constants. An
+  value. A Python integer that takes part in integer arithmetic in the tile body (`p * p`, `layer + 1`)
+  stays a runtime scalar only when that arithmetic, done in the kernel's int32, gives what Python gives for
+  the current values; otherwise it is compiled in. Integers it needs at trace time (loop bounds, masks, slices, allocations) stay constants. An
   integer computed by JAX (a traced 0-d array, `idx = jnp.argmax(scores)`) can index inputs the same way,
   and a 0-d float computed by JAX (`scale = 1 / jnp.sqrt(d)`) used only as a value in the tile body is a
   runtime scalar too (an f32 in SMEM; a bf16 is read as an f32 that mixes with tiles like a Python float).
   Global and closure arrays a nest reads through slices are inputs too, with their current values on
-  every call.
+  every call, and global and closure numbers a nest reads are compiled in with their current values.
 - **Python loops around nests** (`for layer in range(L)`) run as a `jax.lax.fori_loop`, so a deep model
   traces and compiles each kernel once, whatever its depth. The loop variable is then a traced integer;
   if the body needs its value at trace time (a nest's loop bound, Python control flow on it), the loop is
-  unrolled instead. `unroll=True` always unrolls.
+  unrolled instead, as it is when the body changes Python state other than its local values (attribute or
+  item assignments, `print`, methods of Python objects such as `list.append`), when a value it carries
+  isn't an array (a Python counter), or when a function defined outside the loop reads a value the loop
+  changes. `unroll=True` always unrolls; `program.unrolled` says why each loop was unrolled.
 - **Consecutive nests are fused** into one gridless kernel when nothing but views runs between them: the
   kernel runs one nest's step loop after the other's, starts fetching the next nest's weights (and other
   inputs no earlier nest writes) while the current nest finishes its last steps, and reads what an earlier
@@ -330,7 +349,8 @@ def mlp(x, w1, w2):
   `reference`, `verify` and `tuning` work as for one kernel, and every entry point takes keyword arguments
   and defaults. `verify` names the first nest whose kernel disagrees with its Python loops, and
   `verify_nests(*args)` (or `verify(*args, per_nest=True)`) checks each nest on the inputs the program
-  actually gives it. All options apply to every kernel; `tune` names a nest doesn't use are ignored for it.
+  actually gives it. `reference` runs the function's own control flow (Python loops as written), each nest
+  as its Python loops, so `verify` also checks how the program was rewritten. All options apply to every kernel; `tune` names a nest doesn't use are ignored for it.
 
 Runtime indices follow Python's rules: a negative index counts from the end. An index known when the
 program is traced (a Python int) is checked against the array and raises `AutoKernelError` when it's out
@@ -397,7 +417,8 @@ dim), aren't tuned. The candidates are powers of two and three times powers of t
 TPU layout allows for the dims the loop slices (128 on a tile's last axis, 8, 16 or 32 rows by dtype on its
 second-to-last) up to 4096, plus the constant's own value and one block for the whole loop (up to 8192: a
 single reduction step), keeping those that divide the loop. Combinations that can't fit in VMEM are pruned
-without planning (VMEM only grows with block sizes); up to 128 combinations are ranked exhaustively,
+without planning (VMEM grows with block sizes, except that a block covering a whole reduction loop runs
+one step per tile, with its tiles in two slots and no accumulator, so it is compared only with itself); up to 128 combinations are ranked exhaustively,
 larger spaces by coordinate descent over the cost model, which found the exhaustive best on every nest we
 compared (an 8192³ bf16 matmul's 490 combinations in 75 plans, 0.3 s; four names of eight values, 4096
 combinations, in under a second).
@@ -423,7 +444,7 @@ value) are generated as kernels. With `autotune="measure"` it also times those e
 the winner; the model's predictions for good block sizes are often within a few percent of each other,
 and only timing tells those apart. `kernel.tuning(*args)` lists every candidate with its predicted and
 measured time, or why it was rejected (`lowered` is set only for the generated ones). [examples/tuned_matmul.py](examples/tuned_matmul.py)
-shows it.
+shows it. `autotune="measure"` without `tune` times the kernel as written with 2 and 3 buffers.
 
 ## Options
 
@@ -437,7 +458,7 @@ shows it.
     target=None,                 # the TPU to plan for off-TPU: "v5e" (default), "v5p", "v6e", ...
     cores=None,                  # TensorCores to split across; default: all of the target's
     check_tiling=True,           # reject tiles that break TPU (8, 128) layout rules
-    vmem_limit_bytes=None,       # Mosaic's VMEM limit; default the chip's scoped VMEM
+    vmem_limit_bytes=None,       # Mosaic's VMEM limit, and the budget kernels are planned in; default the chip's
     matmul_precision="highest",  # "default" uses a single bf16 MXU pass for f32 (faster, less exact)
     background_fill=True,        # write masked-out tiles with in-kernel DMAs
     fuse=True,                   # programs: fuse consecutive nests (only views between them) into one kernel
@@ -468,8 +489,8 @@ or `jax.ShapeDtypeStruct`s.
   reductions (`x_i8 * 2`, `jnp.maximum(x_i8, 0)`) are rejected with an `AutoKernelError` naming the line,
   since Mosaic can't compile them on a v5e though the interpreter runs them; widen with
   `.astype(jnp.int32)`. 8-bit `@` runs on the MXU and is fine.
-- Step tables live in SMEM and must fit in half of it (512 KiB on v4 and newer). Kernels with no masks
-  need no tables at all.
+- Step, tile, fill and core tables and runtime scalars live in SMEM and must fit in half of it (512 KiB on
+  v4 and newer). Kernels with no masks need no tables at all.
 
 ## Install
 
@@ -505,7 +526,8 @@ src/autokernel/
   schedule.py   order and decode the steps: arithmetic, static step tables, or tables built on device;
                 split them across TensorCores
   codegen.py    emit the gridless Pallas kernel and its pallas_call wrapper
-  mxu.py        what `@` means: MXU dots accumulating in f32 / i32, shared by the kernel, the trace and verify
+  mxu.py        what `@` means: MXU dots accumulating in f32 / i32 for the kernel and the trace; plain
+                jnp.matmul with the same accumulators for reference and verify
   cost.py       the roofline cost model (jaxpr op counts + TPU specs)
   lowering.py   options, and the pipeline from parsed loops to a compiled kernel
   tune.py       block-size search

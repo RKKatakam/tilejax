@@ -3,6 +3,7 @@ global arrays, VMEM pruning, option validation, thread safety, and more."""
 
 import importlib.metadata
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -347,10 +348,20 @@ def test_vmap_with_no_batched_input():
 # --------------------------------------------------------------------------- examples and packaging
 
 
+def _subprocess_env(**extra: str) -> dict[str, str]:
+    """The environment for a child Python on the CPU (the TPU is held by this process), with `src` importable
+    whether or not autokernel is installed."""
+    env = {**os.environ, "JAX_PLATFORMS": "cpu", **extra}
+    src = os.path.join(os.path.dirname(HERE), "src")
+    env["PYTHONPATH"] = os.pathsep.join(p for p in (src, env.get("PYTHONPATH", "")) if p)
+    return env
+
+
 def test_the_tuned_matmul_example_runs():
     root = os.path.dirname(HERE)
     run = subprocess.run(
         [sys.executable, os.path.join(root, "examples", "tuned_matmul.py")],
+        env=_subprocess_env(),
         cwd=root,
         capture_output=True,
         text=True,
@@ -361,7 +372,13 @@ def test_the_tuned_matmul_example_runs():
 
 
 def test_the_version_is_the_installed_package_version():
-    assert autokernel.__version__ == importlib.metadata.version("autokernel")
+    try:
+        installed = importlib.metadata.version("autokernel")
+    except importlib.metadata.PackageNotFoundError:  # run from a checkout (PYTHONPATH=src): the fallback
+        with open(os.path.join(os.path.dirname(HERE), "pyproject.toml")) as f:
+            pyproject = f.read()
+        installed = re.search(r'^version = "([^"]+)"', pyproject, re.M).group(1)
+    assert autokernel.__version__ == installed
 
 
 # --------------------------------------------------------------------------- sharded inputs that are gathered
@@ -426,9 +443,8 @@ def sharding_fallbacks() -> None:
 
 
 def test_sharded_dims_that_cannot_split_are_gathered():
-    env = dict(os.environ)
-    env["XLA_FLAGS"] = (env.get("XLA_FLAGS", "") + " --xla_force_host_platform_device_count=4").strip()
-    env["JAX_PLATFORMS"] = "cpu"
+    flags = (os.environ.get("XLA_FLAGS", "") + " --xla_force_host_platform_device_count=4").strip()
+    env = _subprocess_env(XLA_FLAGS=flags)
     run = subprocess.run(
         [sys.executable, "-c", "import test_fixes_api as t; t.sharding_fallbacks()"],
         env=env,

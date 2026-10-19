@@ -248,7 +248,9 @@ def f(x, y, keep):
 
 
 @pytest.mark.parametrize("n", [jnp.int8(100), jnp.uint8(200), jnp.int16(20000)])
-def test_narrow_integer_scalars_keep_their_type(tmp_path, n):
+def test_narrow_integer_scalar_arithmetic_is_rejected(tmp_path, n):
+    # A narrow scalar keeps its type, so `n * 2` would wrap as in Python, but the TPU's scalar unit only
+    # does 32-bit integer arithmetic: Mosaic rejects it, so autokernel does first.
     src = """
 def f(x, n):
     out = jnp.zeros((M, N))
@@ -258,8 +260,24 @@ def f(x, n):
     return out
 """
     kernel = _kernel(tmp_path, src)
-    x = rand((M, N))
-    np.testing.assert_allclose(kernel(x, n), np.asarray(x) * np.asarray(n * 2), rtol=1e-6)
+    with pytest.raises(AutoKernelError, match=r"scalar unit has no (8|16)-bit integer arithmetic"):
+        kernel(rand((M, N)), n)
+
+
+@pytest.mark.parametrize("n", [jnp.int8(1), jnp.uint8(1), jnp.int16(-1)])
+def test_narrow_integer_scalars_index_and_mix_with_tiles(tmp_path, n):
+    src = """
+def f(x, w, n):
+    out = jnp.zeros((M, N))
+    for i in range(0, M, T):
+        for j in range(0, N, T):
+            out = out.at[i:i + T, j:j + T].set(w[n, i:i + T, j:j + T] * n + x[i:i + T, j:j + T])
+    return out
+"""
+    kernel = _kernel(tmp_path, src)
+    x, w = rand((M, N)), rand((2, M, N), 1)
+    want = np.asarray(w)[int(n)] * np.float32(n) + np.asarray(x)
+    np.testing.assert_allclose(kernel(x, w, n), want, rtol=1e-6)
 
 
 def test_a_32_bit_integer_scalar_is_still_a_python_int():

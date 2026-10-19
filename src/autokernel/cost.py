@@ -144,7 +144,7 @@ class _UnitCost:
     transcendentals: float  # transcendental elements, likewise
     peak_bytes: int  # most VMEM the unit's temporaries hold at once
     # Vector arithmetic on integers the VPU can't compute on: (statement or None, primitive, dtype).
-    unsupported: tuple[ast.AST | None, str, np.dtype] | None = None
+    unsupported: tuple[ast.AST | None, str, np.dtype, bool] | None = None  # (where, op, dtype, on vectors?)
 
     @property
     def mxu_flops(self) -> float:
@@ -176,11 +176,12 @@ def estimate(
     tile_costs = [_unit_cost(spec, u, vpu, cache) for u in segments] + [_unit_cost(spec, None, vpu, cache)]
     for c in [*body_costs, *tile_costs]:
         if c.unsupported:
-            node, name, dtype = c.unsupported
+            node, name, dtype, vector = c.unsupported
             what = f"`{ast.unparse(node)}`" if node is not None else "the tile code"
+            kind, unit = ("vectors", "vector unit") if vector else ("scalars", "scalar unit")
             raise spec.nest.error(
                 node,
-                f"{what} does `{name}` on {dtype.name} vectors, but a {hw.name}'s vector unit has no "
+                f"{what} does `{name}` on {dtype.name} {kind}, but a {hw.name}'s {unit} has no "
                 f"{dtype.itemsize * 8}-bit integer arithmetic (Mosaic rejects it when compiling for the chip; the "
                 "interpreter doesn't); widen the values first, e.g. `x.astype(jnp.int32)` (8-bit `@` matmuls "
                 "are fine: they run on the MXU)",
@@ -360,10 +361,10 @@ def _unit_cost(
         dots[dtype] = dots.get(dtype, 0.0) + f
     unsupported = None
     if counts.narrow:
-        name, dtype, line = counts.narrow[0]
+        name, dtype, line, vector = counts.narrow[0]
         nodes = [*stmts, *(st.node for st in nest.stores if unit is None)]
         node = next((n for n in nodes if line is not None and n.lineno <= line <= (n.end_lineno or n.lineno)), None)
-        unsupported = (node, name, np.dtype(dtype))
+        unsupported = (node, name, np.dtype(dtype), vector)
     return _UnitCost(
         tuple(sorted(dots.items())),
         counts.valu,
@@ -416,21 +417,23 @@ class _Counts:
         self.packed, self.int_bits = packed, int_bits
         self.dots: list[tuple[str, float]] = []
         self.valu = self.eup = self.elementwise = self.transcendentals = 0.0
-        self.narrow: list[tuple[str, Any, int | None]] = []  # VPU ops on integers it can't compute on
+        self.narrow: list[tuple[str, Any, int | None, bool]] = []  # ops on integers the chip can't compute on
 
     def check_ints(self, eqn: Any) -> None:
         """Record `eqn` if it's vector arithmetic on integers narrower than the VPU computes on."""
         if eqn.primitive.name not in _INT_ARITHMETIC:
             return
-        for v in [*eqn.invars, *eqn.outvars]:
-            aval = getattr(v, "aval", None)
-            if not getattr(aval, "shape", ()):
-                continue  # scalars run on the scalar unit, in 32 bits
+        avals = [a for v in [*eqn.invars, *eqn.outvars] if hasattr(a := getattr(v, "aval", None), "dtype")]
+        # An op on vectors runs on the VPU, at its widths (a 0-d operand is broadcast); one on scalars only runs
+        # on the scalar unit, which only does 32-bit integer arithmetic.
+        vector = any(getattr(a, "shape", ()) for a in avals)
+        bits = self.int_bits if vector else (32,)
+        for aval in avals:
             dtype = np.dtype(aval.dtype)
-            if np.issubdtype(dtype, np.integer) and dtype.itemsize * 8 not in self.int_bits:
+            if np.issubdtype(dtype, np.integer) and dtype.itemsize * 8 not in bits:
                 frames = list(source_info_util.user_frames(eqn.source_info.traceback))
                 lines = [f.start_line for f in frames if f.file_name.startswith("<autokernel cost:")]
-                self.narrow.append((eqn.primitive.name, dtype, lines[0] if lines else None))
+                self.narrow.append((eqn.primitive.name, dtype, lines[0] if lines else None, vector))
                 return
 
     def vregs(self, aval: Any) -> float:
