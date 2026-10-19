@@ -57,8 +57,12 @@ axes and slices become `BlockSpec`s, which chips with two TensorCores can split 
 
 ## Performance
 
-TPU v5e, 8192³, milliseconds (median of 3 × 20 runs). "Hand-written" is a manual-DMA gridless Pallas
-kernel written by hand for the same tiles.
+All numbers are from a TPU v5e (one TensorCore), in milliseconds; lower is better.
+
+### Matmul
+
+8192³, median of 3 × 20 runs. "Hand-written" is a manual-DMA gridless Pallas kernel written by hand
+for the same tiles.
 
 | Kernel | Tiles | XLA | Hand-written | autokernel (manual) | autokernel (grid) |
 | --- | --- | --- | --- | --- | --- |
@@ -68,21 +72,36 @@ kernel written by hand for the same tiles.
 | dense `x @ y`, bf16 | 1024×1024×512 | 5.90 | 5.92 | **5.89** | 5.92 |
 | dense `x @ y`, f32 | 512×512×1024 | 35.08 | 34.06 | **34.00** | 34.04 |
 
-Causal multi-head attention, bf16, D=128, milliseconds. "JAX Splash" is
-`jax.experimental.pallas.ops.tpu.splash_attention` with a causal mask and the same block sizes; XLA is
-`jax.nn.dot_product_attention(is_causal=True)`, which runs out of HBM at S=8192.
-
-| B, H, S | Blocks (q × kv) | XLA | JAX Splash | autokernel |
-| --- | --- | --- | --- | --- |
-| 4, 16, 4096 | 256 × 256 | 32.33 | 8.31 | **5.28** |
-| 4, 16, 4096 | 512 × 512 | 32.33 | 3.38 | **2.45** (112 TFLOP/s) |
-| 4, 16, 4096 | 1024 × 512 | 32.33 | 3.16 | **2.56** |
-| 2, 16, 8192 | 512 × 512 | out of memory | 6.19 | **4.46** (123 TFLOP/s) |
-| 2, 16, 8192 | 1024 × 512 | out of memory | 5.53 | **4.46** |
-
 The gridless backend matches or beats the hand-written kernel at every tile size measured (by up to 4%
 with small tiles, where per-step overhead dominates). A causal matmul with the tile mask is about 1.75×
 faster than XLA in bf16 and 1.9× in f32, because XLA computes the whole matrix.
+
+### Causal multi-head attention
+
+bf16, head dim 128, median of 3 × 10 runs. "JAX Splash" is
+`jax.experimental.pallas.ops.tpu.splash_attention` with a causal mask and the same block sizes.
+TFLOP/s counts the causal half of the work. Reproduce with `benchmarks/attention.py`.
+
+Batch 4, 16 heads, sequence 4096. XLA (`jax.nn.dot_product_attention(is_causal=True)`): 32.31 ms.
+
+| Blocks (q × kv) | JAX Splash | autokernel | Speedup |
+| --- | --- | --- | --- |
+| 256 × 256 | 8.31 (33 TFLOP/s) | **5.28** (52 TFLOP/s) | 1.57× |
+| 512 × 256 | 5.27 (52 TFLOP/s) | **3.60** (77 TFLOP/s) | 1.47× |
+| 512 × 512 | 3.37 (82 TFLOP/s) | **2.40** (114 TFLOP/s) | 1.40× |
+| 1024 × 512 | 3.16 (87 TFLOP/s) | **2.52** (109 TFLOP/s) | 1.26× |
+
+Batch 2, 16 heads, sequence 8192. XLA runs out of HBM (it materialises the 16 GB score matrix).
+
+| Blocks (q × kv) | JAX Splash | autokernel | Speedup |
+| --- | --- | --- | --- |
+| 256 × 256 | 16.04 (34 TFLOP/s) | **10.01** (55 TFLOP/s) | 1.60× |
+| 512 × 256 | 9.91 (56 TFLOP/s) | **6.63** (83 TFLOP/s) | 1.49× |
+| 512 × 512 | 6.19 (89 TFLOP/s) | **4.38** (126 TFLOP/s) | 1.41× |
+| 1024 × 512 | 5.53 (100 TFLOP/s) | **4.38** (126 TFLOP/s) | 1.26× |
+
+Both kernels' outputs agree with XLA (or, at sequence 8192, with each other) to within one bf16 rounding
+step.
 
 ## Supported code
 
@@ -220,7 +239,8 @@ uv sync --extra tpu          # on a TPU VM
 uv run pytest                # all tests, on CPU via the TPU interpreter (or natively on a TPU)
 uv run ruff check . && uv run ruff format --check .
 uv run python examples/causal_matmul.py
-uv run python benchmarks/matmul.py   # timings; meaningful only on a TPU
+uv run python benchmarks/matmul.py      # timings; meaningful only on a TPU
+uv run python benchmarks/attention.py   # autokernel vs JAX splash attention vs XLA
 ```
 
 The test suite also cross-lowers kernels to Mosaic for a TPU v5e on CPU, which catches lowering
