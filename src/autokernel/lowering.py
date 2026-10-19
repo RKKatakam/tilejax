@@ -118,6 +118,7 @@ class Lowered:
     overrides: dict[str, Any] = field(default_factory=dict)  # tuned constants this kernel was built with
     scalars: list[str] = field(default_factory=list)  # runtime scalar inputs (0-d integers, read from SMEM)
     plan: Plan | None = field(default=None, repr=False, compare=False)  # what it was generated from
+    user_vmem_limit: int | None = None  # the `vmem_limit_bytes` the user set (None: the chip's limit)
 
     def check_indices(self, values: Mapping[str, Any]) -> None:
         """Raise AutoKernelError if known values of the runtime scalars index outside an input (traced ones are
@@ -235,4 +236,5 @@ def build(p: Plan, options: Options) -> Lowered:
         overrides=dict(p.overrides),
         scalars=list(p.spec.scalars),
         plan=p,
+        user_vmem_limit=options.vmem_limit_bytes,
     )

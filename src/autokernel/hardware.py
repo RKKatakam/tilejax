@@ -21,6 +21,7 @@ from .errors import AutoKernelError
 __all__ = [
     "DEFAULT_TARGET",
     "DEFAULT_VPU_INT_BITS",
+    "SMEM_RESERVE",
     "VALU_SLOTS",
     "VPU_INT_BITS",
     "Hardware",
@@ -45,6 +46,9 @@ DEFAULT_VPU_INT_BITS = (16, 32)
 # Vector-ALU slots per VLIW bundle: whole-vreg elementwise ops the VPU issues per cycle. Fitted to the
 # attention timings measured on a v5e (see cost.py); the EUP (transcendentals) issues one more per cycle.
 VALU_SLOTS = 4
+# SMEM a kernel's tables and scalars leave for semaphores, Mosaic's own use and XLA. On a v5e (1 MiB of
+# SMEM), tile tables of 961 KiB compiled and ran; at 1026 KiB XLA ran out of SMEM.
+SMEM_RESERVE = 64 * 1024
 # TensorCore clocks, Hz. JAX's tables don't list clocks; bf16 rate / (MXUs x MXU size^2 x 2) gives them for the
 # chips with 128x128 MXUs (published: v4 1050 MHz; v5e 1.5 GHz; v5p 1.75 GHz), but JAX lists two 256x256
 # MXUs for v6e (918 TFLOP/s), which would mean a 3.5 GHz clock: Trillium has four, at about 1.75 GHz.
@@ -87,7 +91,8 @@ class Hardware:
 
     @property
     def smem_budget(self) -> int:
-        return self.smem_bytes // 2
+        """What a kernel's SMEM tables and runtime scalars may take: the chip's SMEM but `SMEM_RESERVE`."""
+        return self.smem_bytes - SMEM_RESERVE
 
     def matmul_flops_per_s(self, dtype: Any, highest: bool) -> float:
         """f32 matmuls at HIGHEST precision take about six bf16 MXU passes; 8-bit types run at the chip's rate."""

@@ -17,17 +17,21 @@ the body. On chips with two TensorCores per device the kernel gets a one-axis "p
 point per TensorCore, and each core runs a contiguous run of tiles.
 
 The source is self-contained: it imports what it uses and binds the values it reads from the user's module
-(constants, functions the tile code calls), its cost estimate and its SMEM tables, so it runs on its own.
-Every name it defines where the user's code can see it comes from the nest's `Namer`, so it can't hide a
-name of the user's.
+(constants, functions the tile code calls, each with its own module's values), its cost estimate and its
+SMEM tables, so it runs on its own. Every name it defines where the user's code can see it comes from the
+nest's `Namer`, so it can't hide a name of the user's; and where the user's code means something else by a
+name the generated code uses (`np` for jax.numpy, a loop variable `max`), the user's code gets a fresh name.
 """
 
 from __future__ import annotations
 
 import ast
+import builtins
 import copy
+import enum
 import importlib
 import inspect
+import math
 import symtable
 import textwrap
 import types
@@ -74,6 +78,10 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 """
 MODULES = {"jax": jax, "jnp": jnp, "np": np, "pl": pl, "pltpu": pltpu}
+# The builtins generated code uses (the step-table builders it carries, literals, ...).
+_BUILTINS = ("bool", "complex", "float", "frozenset", "int", "len", "max", "range", "set", "slice", "tuple", "zip")
+# Names the generated code reads as these values: user code meaning something else by one gets a fresh name.
+_RESERVED = {**MODULES, **{name: getattr(builtins, name) for name in _BUILTINS}}
 
 _PRELUDE = """\
 def {_div}(a, b):
@@ -180,7 +188,14 @@ def _stored_dtype(sv: StateVar) -> np.dtype:
 
 
 def _scalar_src(value: Any) -> str:
-    return repr(value) if np.isfinite(value) else f"float('{value}')"
+    """A Python (or NumPy) number as a Python number's source: `float('nan')` for nan, and so on."""
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, complex):
+        return f"complex({_scalar_src(value.real)}, {_scalar_src(value.imag)})"
+    if isinstance(value, float) and not math.isfinite(value):
+        return f"float('{value}')"
+    return repr(value)
 
 
 def _indent(lines: Sequence[str], depth: int = 1) -> list[str]:
@@ -250,96 +265,161 @@ def _globals_read(src: str) -> set[str]:
     return found - defined
 
 
-def _array_src(value: np.ndarray) -> str:
-    items = repr(value.tolist())
-    if np.issubdtype(value.dtype, np.floating) and not np.isfinite(value).all():
-        items = items.replace("nan", "float('nan')").replace("inf", "float('inf')")
+def _numeric(dtype: np.dtype) -> bool:
+    """Is `dtype` a number type (NumPy's, or one of ml_dtypes' like bfloat16) or bool?"""
+    return dtype == np.bool_ or bool(jnp.issubdtype(dtype, jnp.number))
+
+
+def _items_src(items: Any) -> str:
+    return f"[{', '.join(_items_src(v) for v in items)}]" if isinstance(items, list) else _scalar_src(items)
+
+
+def _array_src(value: np.ndarray) -> str | None:
+    if not _numeric(value.dtype):
+        return None
+    finite = not jnp.issubdtype(value.dtype, jnp.inexact) or bool(np.isfinite(value).all())
+    items = repr(value.tolist()) if finite else _items_src(value.tolist())  # nan and inf as float(...)
     out = f"np.array({items}, {_dtype_src(value.dtype)})"
     return out if value.size else f"{out}.reshape({value.shape})"
 
 
+def _number_type_src(dtype: np.dtype) -> str:
+    """The NumPy scalar type of a number dtype (`jnp.float32(x)` would make a JAX array instead)."""
+    if getattr(np, dtype.name, None) is dtype.type:
+        return f"np.{dtype.name}"
+    return f"np.dtype({_dtype_src(dtype)}).type"  # bfloat16 & co. (ml_dtypes)
+
+
 def _literal(value: Any) -> str | None:
-    """`value` as a Python expression over the generated code's imports, or None if it has none."""
-    if value is None or isinstance(value, (bool, int, str, bytes)):
+    """`value` as a Python expression over the generated code's imports, or None if it has none.
+
+    Types are matched exactly: a subclass's value (a NamedTuple's, an IntEnum's) isn't its base's literal.
+    """
+    kind = type(value)
+    if value is None or kind in (bool, int, str, bytes):
         return repr(value)
-    if isinstance(value, float):
+    if kind in (float, complex):
         return _scalar_src(value)
-    if isinstance(value, (tuple, list, set, frozenset)):
+    if kind in (tuple, list, set, frozenset):
         items = [_literal(v) for v in value]
         if None in items:
             return None
-        if isinstance(value, tuple):
+        if kind is tuple:
             return f"({items[0]},)" if len(items) == 1 else f"({', '.join(items)})"
         text = ", ".join(items)
-        return f"[{text}]" if isinstance(value, list) else f"{type(value).__name__}([{text}])"
-    if isinstance(value, dict):
+        return f"[{text}]" if kind is list else f"{kind.__name__}([{text}])"
+    if kind is dict:
         pairs = [(_literal(k), _literal(v)) for k, v in value.items()]
         if any(k is None or v is None for k, v in pairs):
             return None
         return "{" + ", ".join(f"{k}: {v}" for k, v in pairs) + "}"
-    if isinstance(value, slice):
-        return f"slice({_literal(value.start)}, {_literal(value.stop)}, {_literal(value.step)})"
+    if kind is slice:
+        parts = [_literal(value.start), _literal(value.stop), _literal(value.step)]
+        return None if None in parts else f"slice({', '.join(parts)})"
     if isinstance(value, np.dtype):
-        return f"np.dtype({_dtype_src(value)})"
-    if isinstance(value, np.generic):
-        return f"{_dtype_src(value.dtype)}({_literal(value.item())})"
-    if isinstance(value, np.ndarray):
+        return f"np.dtype({_dtype_src(value)})" if _numeric(value) else None
+    if isinstance(value, np.generic) and kind is value.dtype.type and _numeric(value.dtype):
+        return f"{_number_type_src(value.dtype)}({_scalar_src(value)})"  # a NumPy scalar, strongly typed
+    if kind is np.ndarray:
         return _array_src(value)
     if isinstance(value, jax.Array) and not isinstance(value, jax.core.Tracer):
-        return f"jnp.asarray({_array_src(np.asarray(value))})"
-    if isinstance(value, pl.CostEstimate):
+        array = _array_src(np.asarray(value))
+        return None if array is None else f"jnp.asarray({array})"
+    if kind is pl.CostEstimate:
         fields = ["flops", "transcendentals", "bytes_accessed"]
         fields += ["remote_bytes_transferred"] if value.remote_bytes_transferred else []
         return f"pl.CostEstimate({', '.join(f'{f}={getattr(value, f)!r}' for f in fields)})"
     return None
 
 
-def _import(name: str, value: Any) -> str | None:
-    """An import binding `name` to `value` (a module, or something a module defines by that name), if any."""
+def _import(name: str, value: Any) -> list[str] | None:
+    """Statements binding `name` to `value` by importing it (a module, something a module defines by that
+    name, or a member of an enum class a module defines), if there are any."""
     if isinstance(value, types.ModuleType):
         if "." in value.__name__:
             parent, attr = value.__name__.rsplit(".", 1)
-            return f"from {parent} import {attr}" + (f" as {name}" if attr != name else "")
-        return f"import {value.__name__}" + (f" as {name}" if value.__name__ != name else "")
+            return [f"from {parent} import {attr}" + (f" as {name}" if attr != name else "")]
+        return [f"import {value.__name__}" + (f" as {name}" if value.__name__ != name else "")]
+    if isinstance(value, enum.Enum):
+        cls = _import(name, type(value)) if getattr(type(value), value.name, None) is value else None
+        return None if cls is None else [*cls, f"{name} = {name}.{value.name}"]  # the class, then its member
     attr = getattr(value, "__name__", None)
     if not isinstance(attr, str) or not attr.isidentifier():
         return None
     # The public module that has it when one of the generated code's does (`jnp.maximum`, not jax._src...).
     module = getattr(value, "__module__", None)
     homes = [m.__name__ for m in MODULES.values()] + ["jax.nn", "math"]
-    for home in [*homes, *([module] if isinstance(module, str) and module != "__main__" else [])]:
+    importable = isinstance(module, str) and module != "__main__" and all(p.isidentifier() for p in module.split("."))
+    for home in [*homes, *([module] if importable else [])]:
         try:
             found = getattr(importlib.import_module(home), attr, None)
         except ImportError:
             continue
         if found is value:
-            return f"from {home} import {attr}" + (f" as {name}" if attr != name else "")
+            return [f"from {home} import {attr}" + (f" as {name}" if attr != name else "")]
     return None
 
 
-def _function_source(name: str, value: Any) -> tuple[str, dict[str, Any]] | None:
-    """A Python function with source of its own and no closure, as source; with the globals it reads."""
+@dataclass(frozen=True)
+class _Function:
+    """A user function the kernel calls, as source: `fn` is `value` unwrapped, `source` its definition and
+    `reads` the names (and values) it reads from its module."""
+
+    value: Any
+    fn: types.FunctionType
+    source: str
+    reads: dict[str, Any]
+
+
+def _function_source(value: Any) -> _Function | None:
+    """A Python function with source of its own, no closure and no `global` statements, as source."""
     fn = inspect.unwrap(value)
     if not isinstance(fn, types.FunctionType) or fn.__code__.co_freevars or fn.__name__ == "<lambda>":
         return None
-    try:
-        src = textwrap.dedent(inspect.getsource(value))
-    except (OSError, TypeError):
+    # Its definition binds its name (in its module, if defined there) to `value` (decorated as the source
+    # says), or to the undecorated function `value` wraps (`g = jax.jit(f)`), which runs the same code.
+    bound = fn.__globals__.get(fn.__name__, value)
+    if bound is not value and bound is not fn:
         return None
-    tree = ast.parse(src)
+    try:
+        src = textwrap.dedent(inspect.getsource(fn))
+        tree = ast.parse(src)
+    except (OSError, TypeError, SyntaxError):
+        return None
     if len(tree.body) != 1 or not isinstance(tree.body[0], ast.FunctionDef) or tree.body[0].name != fn.__name__:
         return None
+    fdef = tree.body[0]
+    if any(isinstance(n, (ast.Global, ast.Nonlocal)) for n in ast.walk(fdef)):
+        return None
+    changed = False
+    if bound is fn and fdef.decorator_list:  # decorators that returned the function itself (registries, ...)
+        fdef.decorator_list, changed = [], True
+    # Annotations do nothing when it runs: dropped, so what they name needn't have a source.
+    args = fdef.args
+    for arg in [*args.posonlyargs, *args.args, *args.kwonlyargs, args.vararg, args.kwarg]:
+        if arg is not None and arg.annotation is not None:
+            arg.annotation, changed = None, True
+    if fdef.returns is not None:
+        fdef.returns, changed = None, True
+    src = ast.unparse(fdef) if changed else src.rstrip()
+    # What it reads from its module: the names its definition (decorators, defaults, body) loads and doesn't
+    # bind itself, scope by scope (an attribute's name isn't a read).
+    reads = {n: fn.__globals__[n] for n in sorted(_globals_read(src)) if n in fn.__globals__ and not n.startswith("__")}
+    return _Function(value, fn, src, reads)
 
-    def names(code: types.CodeType) -> set[str]:
-        out = set(code.co_names)
-        for c in code.co_consts:
-            if isinstance(c, types.CodeType):
-                out |= names(c)
-        return out
 
-    deps = {n: fn.__globals__[n] for n in sorted(names(fn.__code__)) if n in fn.__globals__ and not n.startswith("__")}
-    alias = [f"{name} = {fn.__name__}"] if name != fn.__name__ else []
-    return "\n".join([src.rstrip(), *alias]), deps
+class _Rename(ast.NodeTransformer):
+    """Renames names (and lambdas' parameters) of user code: `names[old]` is the new name."""
+
+    def __init__(self, names: dict[str, str]):
+        self.names = names
+
+    def visit_Name(self, n: ast.Name) -> ast.AST:
+        return ast.copy_location(ast.Name(self.names[n.id], n.ctx), n) if n.id in self.names else n
+
+    def visit_arg(self, n: ast.arg) -> ast.AST:
+        n.arg = self.names.get(n.arg, n.arg)
+        return n
 
 
 class Emitter:
@@ -361,8 +441,34 @@ class Emitter:
         self._tables_local: str | None = None
         self._fresh: dict[str, str] = {}  # generated identifiers, by what they'd be called without the user's
         self.arrays: dict[str, np.ndarray] = {}  # constant arrays the runtime tables are built from
+        self.exported: dict[str, Any] = {}  # a fused part's user functions, by their module-level names
+        self.module_defs: list[str] = []  # a fused part's source for module level: its user functions
+        self._fn_exports: dict[int, str] = {}  # id(user function) -> the module-level name defined for it
+        self.renamed = self._renames()
         self._names(fills, aliased)
         self._tables()
+
+    def _renames(self) -> dict[str, str]:
+        """The user's names that would hide a name the generated code uses (`np` meaning jax.numpy, a local
+        `max`, ...), and the fresh names the generated code gives them (bound to the user's values)."""
+        fdef = self.nest.fdef
+        seen = {n.id for n in ast.walk(fdef) if isinstance(n, ast.Name)}
+        seen |= {a.arg for a in ast.walk(fdef) if isinstance(a, ast.arg)}
+        bound = {n.id for n in ast.walk(fdef) if isinstance(n, ast.Name) and not isinstance(n.ctx, ast.Load)}
+        bound |= {a.arg for a in ast.walk(fdef) if isinstance(a, ast.arg)}
+        renamed = {}
+        for name in sorted(seen & _RESERVED.keys()):
+            if name in bound or self.spec.consts.get(name, _RESERVED[name]) is not _RESERVED[name]:
+                renamed[name] = self.names.fresh(name)
+        return renamed
+
+    def _user(self, name: str) -> str:
+        """What the generated code calls the user's name `name`."""
+        return self.renamed.get(name, name)
+
+    def _user_code(self, node: ast.AST) -> ast.AST:
+        """A copy of the user's code `node` with the names it uses as the generated code calls them."""
+        return _Rename(self.renamed).visit(copy.deepcopy(node))
 
     def _n(self, base: str) -> str:
         """The identifier generated code uses for `base`: `base`, unless that is one of the user's names."""
@@ -523,7 +629,7 @@ class Emitter:
         for var in sorted(self.used_names & set(self.spec.loops)):
             step = self.spec.loops[var].step
             value = f"{self.blk[var]} * {step}" if step != 1 else self.blk[var]
-            lines.append(f"{var} = {self._weak()}({value})")
+            lines.append(f"{self._user(var)} = {self._weak()}({value})")
         return lines
 
     def _weak(self) -> str:
@@ -670,8 +776,9 @@ class Emitter:
         phase = unit.phase if unit is not None else None
         weak = self._weak
         calls = {call: self._n(name) for name, call in mxu.CALLS.items()}  # `@` -> this kernel's MXU helpers
+        renamed = self.renamed
 
-        class Rewriter(ast.NodeTransformer):
+        class Rewriter(_Rename):
             def visit_Subscript(self, n: ast.Subscript) -> ast.AST:
                 if isinstance(n.value, ast.Name) and n.value.id in params:
                     ref = spec.operand(n, phase).ref
@@ -682,7 +789,7 @@ class Emitter:
                 if n.id in calls:
                     return ast.copy_location(ast.Name(calls[n.id], n.ctx), n)
                 if n.id not in state:
-                    return n
+                    return super().visit_Name(n)
                 sv = state[n.id]
                 index = ast.Constant(0) if sv.smem else ast.Constant(...)
                 ref = ast.copy_location(ast.Subscript(ast.Name(sv.ref, ast.Load()), index, n.ctx), n)
@@ -694,9 +801,9 @@ class Emitter:
                     ref = ast.Call(ast.Name(weak(), ast.Load()), [ref], [])
                 return ast.copy_location(ref, n)
 
-        out = Rewriter().visit(spec.unit_code(node, unit))
-        self.used_names |= {n.id for n in ast.walk(out) if isinstance(n, ast.Name)}
-        return out
+        code = spec.unit_code(node, unit)
+        self.used_names |= {n.id for n in ast.walk(code) if isinstance(n, ast.Name)}
+        return Rewriter(renamed).visit(code)
 
     def _statements(self, unit: Unit) -> list[str]:
         lines = []
@@ -736,7 +843,8 @@ class Emitter:
         # weakly typed when both are (`acc = 0.0; acc += 0.1 * i` holds a Python float).
         value = f"jnp.asarray({ast.unparse(self._rewrite(acc.expr, unit))}, {_dtype_src(aval.dtype)})"
         value = f"jnp.broadcast_to({value}, {tuple(aval.shape)})"
-        return [f"{acc.var} = {self._weak()}({value})" if aval.weak_type else f"{acc.var} = {value}"]
+        var = self._user(acc.var)
+        return [f"{var} = {self._weak()}({value})" if aval.weak_type else f"{var} = {value}"]
 
     def _stores(self) -> list[str]:
         v, lines = self.v, []
@@ -882,18 +990,18 @@ class Emitter:
 
     def _scalar_reads(self) -> list[str]:
         """Bind the runtime scalars (as the user's names) and the runtime indices computed from them."""
-        lines, narrow = [], []
-        for n, p in enumerate(self.int_scalars):  # a weak int32, or a narrower integer as itself (`scalar_aval`)
-            dtype, value = np.dtype(self.spec.specs[self.nest.params.index(p)].dtype), f"{self.scalars_ref}[{n}]"
-            lines.append(f"{p} = {self._weak()}({value})")
-            if dtype != np.int32:
-                narrow.append(f"{p} = {value}.astype(jnp.{dtype})")
-        for n, (p, weak) in enumerate(self.float_scalars):
+        # Integers as weak int32s, whatever their type: a narrow one holds its 32-bit value (`analysis` rejects
+        # arithmetic that would wrap in its own type; comparisons, min and max are exact in int32).
+        weak, lines = self._weak, []
+        for n, p in enumerate(self.int_scalars):
+            lines.append(f"{self._user(p)} = {weak()}({self.scalars_ref}[{n}])")
+        for n, (p, is_weak) in enumerate(self.float_scalars):
             value = f"{self.fscalars_ref}[{n}]"
-            lines.append(f"{p} = {self._weak()}({value})" if weak else f"{p} = {value}")
-        # Indices from the 32-bit values (the scalar unit only does 32-bit arithmetic), then the narrow types.
-        lines += [f"{name} = {self._n('_index')}({expr}, {size})" for (expr, size), name in self.indices.items()]
-        return lines + narrow
+            lines.append(f"{self._user(p)} = {weak()}({value})" if is_weak else f"{self._user(p)} = {value}")
+        for (expr, size), name in self.indices.items():
+            expr = ast.unparse(self._user_code(ast.parse(expr, mode="eval"))) if self.renamed else expr
+            lines.append(f"{name} = {self._n('_index')}({expr}, {size})")
+        return lines
 
     def _setup(self) -> list[str]:
         """The kernel's definitions: this core's bounds, the runtime scalars, step decoding and copies."""
@@ -986,7 +1094,6 @@ class Emitter:
         inner.append(f"return {p['late']}, {p['run']}, {p['drain']}")
         body += _fn(p["with_scratch"], ", ".join(late_scratch), inner)
         body.append(f"return {p['early']}, {p['with_scratch']}")
-        self._check_modules()
         return self._contained(name, ", ".join(args), [*self._kernel_helpers(), "", *body])
 
     def scratch_groups(self) -> tuple[tuple[list[str], list[str]], tuple[list[str], list[str]]]:
@@ -1043,8 +1150,10 @@ class Emitter:
     def _params(self) -> dict[str, str]:
         """The wrapper's parameters: the kernel's, renamed where they would hide a name the wrapper uses."""
         if self._param_names is None:  # (every other name the wrapper uses is fresh)
-            reserved = {"interpret", *MODULES}
-            self._param_names = {p: self.names.fresh(f"{p}_arg") if p in reserved else p for p in self.nest.params}
+            names = {p: self.renamed.get(p) for p in self.nest.params}  # `np` & co. as everywhere else
+            self._param_names = {
+                p: n or (self.names.fresh(f"{p}_arg") if p == "interpret" else p) for p, n in names.items()
+            }
         return self._param_names
 
     def _wrapper_inputs(self) -> tuple[list[str], list[str], list[str]]:
@@ -1056,7 +1165,7 @@ class Emitter:
                 self._tables_local = self.names.fresh("tables")
             tables = self._tables_local
             lines.append("# A mask reads inputs, so the steps are listed on device.")
-            inputs = ", ".join(f"{p}={a}" for p, a in param.items())
+            inputs = ", ".join(f"{self._user(p)}={a}" for p, a in param.items())
             lines.append(f"{tables} = {self._n('_runtime_tables')}({inputs})")
             smem += [f"{tables}[{k!r}]" for k in RUNTIME_TABLES]
         if self.scalars_ref:
@@ -1068,14 +1177,10 @@ class Emitter:
             lines.append(f"{self.fscalars_ref} = jnp.stack([{values}])  # float runtime scalars, read from SMEM")
             smem.append(self.fscalars_ref)
 
-        class Renamed(ast.NodeTransformer):
-            def visit_Name(self, n: ast.Name) -> ast.AST:
-                return ast.copy_location(ast.Name(param.get(n.id, n.id), n.ctx), n)
-
         for var, init in self.aliased.items():
             alloc = next(o.alloc for o in spec.outputs if o.var == var)
             self.used_names |= reads(alloc)
-            alloc = Renamed().visit(copy.deepcopy(alloc))
+            alloc = _Rename({**self.renamed, **param}).visit(copy.deepcopy(alloc))
             lines.append(f"{init} = {ast.unparse(alloc)}  # skipped tiles keep these values")
             inits.append(init)
         return lines, smem, inits
@@ -1171,11 +1276,6 @@ class Emitter:
             header += "\n# Tuned: " + ", ".join(f"{k}={v}" for k, v in sorted(spec.overrides.items()))
         return header
 
-    def weak_helper(self) -> str:
-        """Module-level helpers a fused part needs besides its own source: none, since `part` and `prepare`
-        define everything they use inside themselves."""
-        return ""
-
     def _kernel_helpers(self) -> list[str]:
         """The helpers the kernel's code calls (once that code is generated): index arithmetic, `@`, runtime
         indices and weak types."""
@@ -1243,7 +1343,7 @@ class Emitter:
                 body += self._mask(p, masks[-1], xp)
         shape = f"{list(sched.phase_steps)}, {len(spec.tiles)}, {self.cores}"  # steps per phase, tiles, cores
         body.append(f"return {self._n('_step_tables')}({tile_keep}, [{', '.join(masks)}], {shape})")
-        return _fn(self._n("_runtime_tables"), ", ".join(self.nest.params), body)
+        return _fn(self._n("_runtime_tables"), ", ".join(map(self._user, self.nest.params)), body)
 
     def _mask(self, phase: int | None, var: str, xp: str) -> list[str]:
         """`var = ...`: the tile mask (`phase` None) or a phase's mask, as `analysis.evaluate_mask` computes it."""
@@ -1254,13 +1354,12 @@ class Emitter:
         self.used_names |= used
         read = [lb for lb in loops if lb.var in used]
         done = spec.finished_loops(phase) if phase is not None else {}  # earlier phases' loops: their last values
-        args = [lb.var for lb in read] + [f"{k}={v}" for k, v in done.items() if k in used and k not in loops]
-
-        class Xp(ast.NodeTransformer):
-            def visit_Name(self, n: ast.Name) -> ast.AST:
-                return ast.copy_location(ast.Name(xp, n.ctx), n) if n.id == analysis.XP else n
-
-        value = f"jnp.asarray({ast.unparse(Xp().visit(analysis.vectorize(cond)))})"
+        user = self._user
+        args = [user(lb.var) for lb in read]
+        args += [f"{user(k)}={v}" for k, v in done.items() if k in used and k not in loops]
+        # Renamed first: a user's own `max` isn't the builtin `vectorize` makes elementwise.
+        value = _Rename({analysis.XP: xp}).visit(analysis.vectorize(self._user_code(cond)))
+        value = f"jnp.asarray({ast.unparse(value)})"
         tag = "tile" if phase is None else f"phase{phase}"
         steps = spec.phases[phase].steps if phase is not None else None
         shape = (len(spec.tiles),) if phase is None else (len(spec.tiles), steps)
@@ -1282,7 +1381,7 @@ class Emitter:
                 pos = np.unravel_index(np.arange(steps), counts)[k][None, :].astype(np.int32)
             positions.append(self._array(f"{tag}_{lb.var}_positions", pos))
         # The coordinates as weakly typed int32s: the Python ints they are in the loops.
-        names = [lb.var for lb in read]
+        names = [user(lb.var) for lb in read]
         weak = ", ".join(f"{self._weak()}({v})" for v in names)
         return [
             f"{var} = jax.vmap(lambda {', '.join(names)}: (lambda {', '.join(args)}: {value})({weak}))"
@@ -1291,61 +1390,144 @@ class Emitter:
             f"{var} = jnp.broadcast_to({var}[{', '.join(positions)}], {shape})",
         ]
 
-    def _check_modules(self) -> None:
-        """The generated code uses `jnp` & co. for its imports: the user's code can't mean something else."""
-        for name, module in MODULES.items():
-            if name in self.used_names and self.spec.consts.get(name, module) is not module:
-                raise AutoKernelError(
-                    f"{self.nest.fn_name}: the generated kernel uses `{name}` for {module.__name__}, but the loops "
-                    f"read a `{name}` of their own; rename it"
-                )
-
     def namespace(self) -> dict[str, Any]:
-        """What the generated code runs with: the user's constants, the imports, the cost estimate and tables."""
-        namespace: dict[str, Any] = dict(self.spec.consts)
+        """What the generated code runs with: the user's constants (the builtins it calls stay builtins, and
+        names it renamed are bound under their new names), the imports, the cost estimate and tables."""
+        consts = self.spec.consts
+        namespace: dict[str, Any] = {k: v for k, v in consts.items() if k not in _BUILTINS}
         namespace.update(MODULES)
+        namespace.update({new: consts[old] for old, new in self.renamed.items() if old in consts})
         if self.cost is not None:
             namespace[self._n("_COST")] = self.cost
         namespace.update({self.table_consts[name]: value for name, value in self.tables.items()})
         namespace.update(self.arrays)
+        namespace.update(self.exported)
         return namespace
 
-    def _constants(self, code: str, functions: bool) -> list[str]:
-        """Source binding the names `code` reads from the namespace: the user's constants (as literals, imports,
-        and with `functions` the source of the functions it calls), the cost estimate and the tables."""
+    def _constants(self, code: str, prefix: str | None = None) -> tuple[list[str], list[str]]:
+        """Source binding the names `code` reads from the namespace (the user's constants as literals and
+        imports, the user functions it calls, the cost estimate and the tables): (bindings, definitions).
+
+        The definitions are the user functions' (`_function_defs`), for module level. Without `prefix` they
+        bind the names `code` reads; with it (a fused part, whose code binds what it reads inside itself)
+        they bind names starting with `prefix`, which the bindings read.
+        """
         namespace = self.namespace()
         generated = {*self.table_consts.values(), *self.arrays, self._n("_COST")}
         wanted = sorted((n for n in _globals_read(code) if n in namespace), key=lambda n: (n in generated, n))
-        queue = [(n, namespace[n]) for n in wanted if not n.startswith("__")]
-        imports, values, defs, missing, done = [], [], [], [], {}
-        while queue:
-            name, value = queue.pop(0)
-            if name in done:
-                if done[name] is not value and _literal(done[name]) != _literal(value):
-                    missing.append(f"# `{name}`: two different values (the loops' and a function's they call)")
-                continue
-            done[name] = value
-            if MODULES.get(name) is value:
+        imports, values, missing, functions = [], [], [], {}
+        for name in wanted:
+            value = namespace[name]
+            if name.startswith("__") or MODULES.get(name) is value:
                 continue
             if (text := _literal(value)) is not None:
                 values.append(f"{name} = {text}")
-            elif (line := _import(name, value)) is not None:
-                imports.append(line)
-            elif functions and (fn := _function_source(name, value)) is not None:
-                defs += [fn[0], ""]
-                queue += list(fn[1].items())
+            elif (lines := _import(name, value)) is not None:
+                imports += lines
+            elif (fn := _function_source(value)) is not None:
+                functions[name] = fn
             else:
                 missing.append(f"# `{name}` (a {type(value).__name__}) has no source here: define it to run this alone")
-        lines = [*imports, *values, *([""] if defs else []), *defs[:-1], *missing]
-        if not lines:
-            return []
+        # A fused part's `_part` and `_prepare` share the definitions.
+        known = {name: self._fn_exports[id(f.fn)] for name, f in functions.items() if id(f.fn) in self._fn_exports}
+        defs, exports = self._function_defs({n: f for n, f in functions.items() if n not in known}, prefix)
+        exports.update(known)
+        self._fn_exports.update({id(functions[name].fn): export for name, export in exports.items()})
+        binds = [f"{name} = {exports[name]}" for name in functions if exports[name] != name]
+        if prefix is not None:  # the fused kernel runs with the user's functions under those names
+            self.exported.update({exports[name]: functions[name].value for name in functions})
+        lines = [*imports, *values, *binds, *missing]
         what = f"# What the kernel reads from `{self.nest.fn_name}`'s module, and the values it was planned with."
-        return [what, *lines]
+        return ([what, *lines] if lines or defs else []), defs
+
+    def _function_defs(self, functions: dict[str, _Function], prefix: str | None) -> tuple[list[str], dict[str, str]]:
+        """Definitions of the user functions the kernel reads (by name) and of the ones they call, and the
+        module-level name each kernel name is bound to.
+
+        A function reads its own module's globals, which needn't be the kernel's (a tuned `T`, a helper
+        from another module), so each module's functions are defined inside a function binding what they
+        read there (literals as its arguments, imports, other modules' functions as arguments too):
+
+            def _mod_functions(T):
+                def scaled(t):
+                    return t / T
+                return scaled
+            scaled = _mod_functions(T=128)
+        """
+        groups: dict[int, dict[str, Any]] = {}  # id(module globals) -> what its definitions need
+        export: dict[int, str] = {}  # id(function) -> the module-level name bound to it
+        for name, f in functions.items():
+            export.setdefault(id(f.fn), name if prefix is None else self._n(f"{prefix}_{name}"))
+        queue = list(functions.values())
+        while queue:
+            f = queue.pop(0)
+            g = groups.setdefault(
+                id(f.fn.__globals__),
+                {"module": f.fn.__module__, "functions": {}, "bound": set(), "args": {}, "body": [], "aliases": []},
+            )
+            if id(f.fn) in g["functions"]:
+                continue
+            g["functions"][id(f.fn)] = f
+            for n, v in f.reads.items():  # one value per name in a module
+                if n in g["bound"]:
+                    continue
+                g["bound"].add(n)
+                if (text := _literal(v)) is not None:
+                    g["args"][n] = text
+                elif (lines := _import(n, v)) is not None:
+                    g["body"] += lines
+                elif (dep := _function_source(v)) is not None:
+                    queue.append(dep)
+                    if dep.fn.__globals__ is f.fn.__globals__:  # defined next to it
+                        if n != dep.fn.__name__:
+                            g["aliases"].append(f"{n} = {dep.fn.__name__}")
+                    else:
+                        g["args"][n] = dep
+                        export.setdefault(id(dep.fn), self._n(f"{prefix or ''}_{dep.fn.__name__}"))
+                else:
+                    g["body"].append(f"# `{n}` (a {type(v).__name__}) has no source here: define it to run this alone")
+
+        lines: list[str] = []
+        done: set[int] = set()
+
+        def define(key: int, within: frozenset[int]) -> None:
+            """The definitions of module `key`'s functions, after those of the modules they call."""
+            g, kwargs, params = groups[key], [], []
+            for n, arg in g["args"].items():
+                if isinstance(arg, _Function):
+                    other = id(arg.fn.__globals__)
+                    if other in within:  # modules calling each other's functions: no order works
+                        g["body"].append(f"# `{n}`: its module calls back into this one: define it to run this alone")
+                        continue
+                    if other not in done:
+                        define(other, within | {key})
+                    arg = export[id(arg.fn)]
+                params.append(n)
+                kwargs.append(f"{n}={arg}")
+            fns = list(g["functions"].values())
+            names = ", ".join(f"`{f.fn.__name__}`" for f in fns)
+            module = "".join(c if c.isalnum() else "_" for c in g["module"].rsplit(".", 1)[-1]).strip("_")
+            factory = self._n(f"{prefix or ''}_{module or 'user'}_functions")
+            out = [f.fn.__name__ for f in fns if id(f.fn) in export]
+            body = [f"# From `{g['module']}`: {names}, with the values they read there.", *g["body"]]
+            for f in fns:
+                body += [*f.source.splitlines(), ""]
+            body += [*g["aliases"], f"return {', '.join(out)}"]
+            targets = ", ".join(export[id(f.fn)] for f in fns if id(f.fn) in export)
+            lines.extend([*_fn(factory, ", ".join(params), body), f"{targets} = {factory}({', '.join(kwargs)})", ""])
+            done.add(key)
+
+        for key in groups:
+            if key not in done:
+                define(key, frozenset())
+        return lines[:-1], {name: export[id(f.fn)] for name, f in functions.items()}
 
     def _contained(self, name: str, args: str, body: list[str]) -> list[str]:
         """`def name(args): body` with the values it reads bound first, so a fused kernel's source runs alone.
-        Only literals and imports: running the function again (as the fused kernel does) changes nothing."""
-        constants = self._constants("\n".join(_fn(name, args, body)), functions=False)
+        Only literals, imports and names of functions: running it again (as the fused kernel does) changes
+        nothing. The user functions it calls are defined at module level (`module_defs`)."""
+        constants, defs = self._constants("\n".join(_fn(name, args, body)), prefix=name)
+        self.module_defs += [*defs, ""] if defs else []
         return _fn(name, args, [*constants, *([""] if constants else []), *body])
 
     def emit(self) -> Generated:
@@ -1353,11 +1535,11 @@ class Emitter:
         kernel_name = self._n(f"{nest.fn_name}_kernel")
         kernel = self._kernel(kernel_name)
         wrapper = self._wrapper(kernel_name)
-        self._check_modules()
         wrapper_helpers = self._wrapper_helpers()  # first: they may need the weak-type helper too
         helpers = [*self._kernel_helpers(), *(["", "", *wrapper_helpers] if wrapper_helpers else [])]
         code = "\n".join([*helpers, "", "", *kernel, "", "", *wrapper, ""])
-        constants = self._constants(code, functions=True)
+        constants, defs = self._constants(code)
+        constants += ["", *defs] if defs else []
         head = "\n".join([self.header(), "", _IMPORTS, *constants, *([""] if constants else []), ""])
         # Run the code after the imports and constants: the namespace holds those, as the user's module does.
         namespace = self.namespace()
@@ -1370,8 +1552,7 @@ def assignments(values: dict[str, Any]) -> list[str]:
     return [f"{name} = {_literal(value)}" for name, value in values.items()]
 
 
-def prelude(precision: str, scalars: bool) -> str:
+def prelude() -> str:
     """What the source of a fused kernel starts with: the imports (each part defines its own helpers, see
-    `Emitter.part`). `precision` and `scalars` no longer matter."""
-    del precision, scalars
+    `Emitter.part`)."""
     return _IMPORTS
