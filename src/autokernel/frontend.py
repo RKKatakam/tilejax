@@ -72,6 +72,8 @@ class LoopNest:
     carried: list[str] = field(default_factory=list)  # accumulators carried across the reduction
     guard: ast.expr | None = None  # tile mask: the tile is computed only where this is true
     guard_node: ast.stmt | None = None
+    red_guard: ast.expr | None = None  # reduction mask: the reduction step runs only where this is true
+    red_guard_node: ast.stmt | None = None
 
     def error(self, node: ast.AST | None, msg: str) -> AutoKernelError:
         return _err(node, msg, self.fn_name, self.first_line)
@@ -89,6 +91,21 @@ def _assigned_names(stmts: list[ast.stmt]) -> set[str]:
         elif isinstance(s, ast.AugAssign):
             names.add(s.target.id)
     return names
+
+
+def _split_guard(body: list[ast.stmt], what: str, err) -> tuple[ast.expr | None, ast.stmt | None, list[ast.stmt]]:
+    """Peel a mask off a loop body: `if cond: <body>` or a leading `if cond: continue`.
+
+    Returns (condition under which the body runs, the `if` node, the remaining body).
+    """
+    if not body or not isinstance(body[0], ast.If) or body[0].orelse:
+        return None, None, body
+    node = body[0]
+    if len(node.body) == 1 and isinstance(node.body[0], ast.Continue):
+        return ast.copy_location(ast.UnaryOp(ast.Not(), node.test), node.test), node, body[1:]
+    if len(body) == 1:
+        return node.test, node, node.body
+    raise err(node, f"a {what} must be `if cond:` around the whole loop body, or a leading `if cond: continue`")
 
 
 def parse(fn: Callable) -> LoopNest:
@@ -166,24 +183,16 @@ def parse(fn: Callable) -> LoopNest:
         parallel.append(as_loop(inner[0]))
         inner = inner[0].body
 
-    guard, guard_node = None, None
-    if inner and isinstance(inner[0], ast.If) and not inner[0].orelse:
-        guard_node = inner[0]
-        if len(guard_node.body) == 1 and isinstance(guard_node.body[0], ast.Continue):
-            guard = ast.copy_location(ast.UnaryOp(ast.Not(), guard_node.test), guard_node.test)
-            inner = inner[1:]
-        elif len(inner) == 1:
-            guard, inner = guard_node.test, guard_node.body
-        else:
-            raise err(
-                guard_node,
-                "a tile mask must be `if cond:` around the whole tile body, or a leading `if cond: continue`",
-            )
-        for n in ast.walk(guard):
+    def check_mask(cond, node, what, body):
+        for n in ast.walk(cond):
             if isinstance(n, ast.Name) and n.id in [*params, out_var]:
-                raise err(guard_node, f"the tile mask can only depend on loop variables and constants, not `{n.id}`")
-        if not inner:
-            raise err(guard_node, "the tile body is empty")
+                raise err(node, f"the {what} can only depend on loop variables and constants, not `{n.id}`")
+        if not body:
+            raise err(node, f"the body under the {what} is empty")
+
+    guard, guard_node, inner = _split_guard(inner, "tile mask", err)
+    if guard is not None:
+        check_mask(guard, guard_node, "tile mask", inner)
 
     last = inner[-1]
     store_ok = (
@@ -211,10 +220,14 @@ def parse(fn: Callable) -> LoopNest:
     red_idx = [n for n, s in enumerate(inner) if isinstance(s, ast.For)]
     if len(red_idx) > 1:
         raise err(inner[red_idx[1]], "only one reduction loop is supported")
+    red_guard, red_guard_node = None, None
     if red_idx:
         n = red_idx[0]
         pre, red_node, post = inner[:n], inner[n], inner[n + 1 :]
-        reduction, red_body = as_loop(red_node), red_node.body
+        reduction = as_loop(red_node)
+        red_guard, red_guard_node, red_body = _split_guard(red_node.body, "reduction mask", err)
+        if red_guard is not None:
+            check_mask(red_guard, red_guard_node, "reduction mask", red_body)
     else:
         pre, reduction, red_body, post = inner, None, [], []
 
@@ -257,4 +270,6 @@ def parse(fn: Callable) -> LoopNest:
         carried=carried,
         guard=guard,
         guard_node=guard_node,
+        red_guard=red_guard,
+        red_guard_node=red_guard_node,
     )

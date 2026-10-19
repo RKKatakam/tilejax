@@ -24,6 +24,11 @@ import numpy as np
 
 from .analysis import Block, Operand, Specialization
 from .emit import Emitter, Options, dtype_src, indent
+from .errors import AutoKernelError
+
+# A step-table entry packs (tile << _TILE_SHIFT) | (reduction block << 2) | (first << 1) | last.
+_TILE_SHIFT = 12
+_MAX_RED_BLOCKS = 1 << (_TILE_SHIFT - 2)
 
 __all__ = ["ManualEmitter"]
 
@@ -36,7 +41,10 @@ class ManualEmitter(Emitter):
         names = spec.names
         self.K = self.red.grid if self.red else 1
         self.n_tiles = len(self.tiles())
-        self.n_steps = self.n_tiles * self.K
+        # With a reduction mask, the loop walks a table of only the steps that run; otherwise every tile
+        # runs all K reduction steps and the loop carries tile/reduction counters.
+        self.step_table = spec.red_blocks is not None
+        self.n_steps = sum(map(len, spec.red_blocks)) if spec.red_blocks is not None else self.n_tiles * self.K
 
         # SMEM tables: the absolute block index of each parallel loop, per computed tile.
         parallel = [lp.var for lp in self.nest.parallel]
@@ -46,6 +54,9 @@ class ManualEmitter(Emitter):
             self.block_tables = {v: names.fresh(f"{v}_blocks") for v in parallel}
         for n, v in enumerate(parallel):
             self.tables[self.block_tables[v]] = np.array([blocks[n] for blocks in self.tiles()], np.int32)
+        if self.step_table:
+            self.steps_name = names.fresh("steps")
+            self.tables[self.steps_name] = self._pack_steps()
         self.tables.update(self._fill_tables())
 
         # Kernel-local names that can't collide with the user's.
@@ -63,6 +74,9 @@ class ManualEmitter(Emitter):
                 "has_next",
                 "safe_tile",
                 "out_slot",
+                "first",
+                "entry",
+                "next_entry",
             )
         }
         self.hbm = {}  # input param -> its HBM ref in the kernel
@@ -89,24 +103,49 @@ class ManualEmitter(Emitter):
     def steps(self) -> int:
         return self.n_steps
 
+    def _pack_steps(self) -> np.ndarray:
+        assert self.spec.red_blocks is not None and self.red is not None
+        if self.n_tiles >= 1 << (31 - _TILE_SHIFT) or self.K > _MAX_RED_BLOCKS:
+            raise AutoKernelError(
+                f"{self.nest.fn_name}: too many tiles ({self.n_tiles}) or reduction blocks ({self.K}) for the step "
+                "table; use bigger tiles"
+            )
+        base = self.red.start // self.red.step
+        entries = []
+        for t, blocks in enumerate(self.spec.red_blocks):
+            for n, kb in enumerate(blocks):
+                first, last = n == 0, n == len(blocks) - 1
+                entries.append((t << _TILE_SHIFT) | ((kb - base) << 2) | (first << 1) | last)
+        return np.array(entries, np.int32)
+
+    def _first_depth(self) -> int:
+        """The reduction counter of the very first step."""
+        if self.spec.red_blocks is None or self.red is None:
+            return 0
+        return self.spec.red_blocks[0][0] - self.red.start // self.red.step
+
     def _streamed(self, op: Operand) -> bool:
-        """Does the operand's block change on every step? (It's tiled by a reduction loop of > 1 step.)"""
-        return self.red is not None and self.K > 1 and self.red.var in op.block.loops
+        """Does the operand's block change on every step? (It's tiled by the reduction loop.)"""
+        if self.red is None or self.red.var not in op.block.loops:
+            return False
+        return self.step_table or self.K > 1
 
     # ------------------------------------------------------------------ DMA helpers
 
     def _slices(self, block: Block, tile: str, depth: str) -> str:
+        """The HBM window of a block: `pl.ds` per tiled dim, a plain index per squeezed dim."""
         parts = []
-        for var, size, index in zip(block.loops, block.shape, block.index, strict=True):
+        for d, (var, size, index) in enumerate(zip(block.loops, block.shape, block.index, strict=True)):
             if var is None:
-                parts.append(f"pl.ds({int(index) * size}, {size})")
+                start = str(int(index) * size)
             elif self.red is not None and var == self.red.var:
                 base = self.red.start // self.red.step
-                parts.append(
-                    f"pl.ds(({depth} + {base}) * {size}, {size})" if base else f"pl.ds({depth} * {size}, {size})"
-                )
+                start = f"({depth} + {base}) * {size}" if base else f"{depth} * {size}"
             else:
-                parts.append(f"pl.ds({self.block_tables[var]}[{tile}] * {size}, {size})")
+                start = (
+                    f"{self.block_tables[var]}[{tile}] * {size}" if size != 1 else f"{self.block_tables[var]}[{tile}]"
+                )
+            parts.append(start if block.is_squeezed(d) else f"pl.ds({start}, {size})")
         return ", ".join(parts)
 
     def _copy_fn(self, op: Operand) -> str:
@@ -141,7 +180,7 @@ class ManualEmitter(Emitter):
         if not parts:
             return "jnp.bool_(False)"
         cond = " | ".join(parts)
-        return f"{v['last']} & ({cond})" if self.K > 1 else cond
+        return f"{v['last']} & ({cond})" if self.step_table or self.K > 1 else cond
 
     # ------------------------------------------------------------------ kernel
 
@@ -179,7 +218,20 @@ class ManualEmitter(Emitter):
         used = self.names_used(temps + inits + step + epilogue)
 
         lines = []
-        if K > 1:
+        if self.step_table:
+            # Decode this step and the next from the step table: tile, reduction block, first/last flags.
+            sh, mask = _TILE_SHIFT, _MAX_RED_BLOCKS - 1
+            lines += [
+                f"{v['entry']} = {self.steps_name}[{v['step']}]",
+                f"{v['tile']} = {v['entry']} >> {sh}",
+                f"{v['depth']} = ({v['entry']} >> 2) & {mask}",
+                f"{v['first']} = (({v['entry']} >> 1) & 1) == 1",
+                f"{v['last']} = ({v['entry']} & 1) == 1",
+                f"{v['next_entry']} = {self.steps_name}[jnp.minimum({v['step']} + 1, {self.n_steps - 1})]",
+                f"{v['next_tile']} = {v['next_entry']} >> {sh}",
+                f"{v['next_depth']} = ({v['next_entry']} >> 2) & {mask}",
+            ]
+        elif K > 1:
             lines += [
                 f"{v['last']} = {v['depth']} == {K - 1}",
                 f"{v['next_tile']} = jnp.where({v['last']}, {v['tile']} + 1, {v['tile']})",
@@ -228,22 +280,25 @@ class ManualEmitter(Emitter):
 
         # 3. The user's tile body.
         lines += self._loop_values(used) + temps
+        starts_tile = v["first"] if self.step_table else f"{v['depth']} == 0"
         if fill:
             issue = self.fill_issue(v["tile"])
-            lines += ["", f"@pl.when({v['depth']} == 0)", "def _fill():", *indent(issue)] if K > 1 else ["", *issue]
-        if K > 1:
-            lines += ["", f"@pl.when({v['depth']} == 0)", "def _init():", *indent(inits), "", *step, ""]
+            many = self.step_table or K > 1
+            lines += ["", f"@pl.when({starts_tile})", "def _fill():", *indent(issue)] if many else ["", *issue]
+        if self.step_table or K > 1:
+            lines += ["", f"@pl.when({starts_tile})", "def _init():", *indent(inits), "", *step, ""]
             lines += [f"@pl.when({v['last']})", "def _store():", *indent(self._store(epilogue))]
         else:
             lines += [*inits, *step, *self._store(epilogue)]
 
-        carry = [v["next_tile"], v["next_depth"]]
+        carry = [] if self.step_table else [v["next_tile"], v["next_depth"]]
         for op in self.per_tile:
             carry += [
                 f"{self.version[op.ref]} + {self.changed[op.ref]}.astype(jnp.int32)",
                 f"{self.changed[op.ref]}.astype(jnp.int32)",
             ]
-        lines += ["", f"return ({', '.join(carry)},)"]
+        if carry:
+            lines += ["", f"return ({', '.join(carry)},)"]
         return lines
 
     def kernel(self, name: str) -> list[str]:
@@ -258,11 +313,19 @@ class ManualEmitter(Emitter):
             + [acc.ref for acc in spec.accumulators]
             + ([fill.ref, fill.sem] if fill else [])
         )
-        carry_names = [v["tile"], v["depth"]]
-        init = ["jnp.int32(0)", "jnp.int32(0)"]
+        carry_names = [] if self.step_table else [v["tile"], v["depth"]]
+        init = [] if self.step_table else ["jnp.int32(0)", "jnp.int32(0)"]
         for op in self.per_tile:
             carry_names += [self.version[op.ref], self.pending[op.ref]]
             init += ["jnp.int32(0)", "jnp.int32(1)"]
+        if carry_names:
+            loop = [
+                f"@pl.loop(0, {self.n_steps}, init_carry=({', '.join(init)},))",
+                f"def _steps({v['step']}, {v['carry']}):",
+                f"    {', '.join(carry_names)}, = {v['carry']}",
+            ]
+        else:
+            loop = [f"@pl.loop(0, {self.n_steps})", f"def _steps({v['step']}):"]
 
         lines = [f"def {name}({', '.join(args)}):"]
         lines += indent(self._helpers())
@@ -271,11 +334,9 @@ class ManualEmitter(Emitter):
         lines += indent(
             [
                 "# Fetch the first step's blocks.",
-                *[f"{self._copy_fn(op)}(0, 0, 0).start()" for op in spec.operands],
+                *[f"{self._copy_fn(op)}(0, {self._first_depth()}, 0).start()" for op in spec.operands],
                 "",
-                f"@pl.loop(0, {self.n_steps}, init_carry=({', '.join(init)},))",
-                f"def _steps({v['step']}, {v['carry']}):",
-                f"    {', '.join(carry_names)}, = {v['carry']}",
+                *loop,
                 *indent(self._step_body()),
                 "",
                 "# Wait for the output copies still in flight.",
@@ -294,15 +355,18 @@ class ManualEmitter(Emitter):
         in_specs += ["pl.BlockSpec(memory_space=pl.ANY)"] * (len(self.hbm) + (1 if self.out_init else 0))
         scratch = []
         for op in spec.operands:
-            scratch += [f"pltpu.VMEM({(2, *op.block.shape)}, {dtype_src(op.dtype)})", "pltpu.SemaphoreType.DMA((2,))"]
+            scratch += [
+                f"pltpu.VMEM({(2, *op.block.kernel_shape)}, {dtype_src(op.dtype)})",
+                "pltpu.SemaphoreType.DMA((2,))",
+            ]
         scratch += [
-            f"pltpu.VMEM({(2, *spec.out_block.shape)}, {dtype_src(spec.out.dtype)})",
+            f"pltpu.VMEM({(2, *spec.out_block.kernel_shape)}, {dtype_src(spec.out.dtype)})",
             "pltpu.SemaphoreType.DMA((2,))",
         ]
         scratch += [f"pltpu.VMEM({acc.scratch.shape}, {dtype_src(acc.scratch.dtype)})" for acc in spec.accumulators]
         if self.fill:
             scratch += [
-                f"pltpu.VMEM({spec.out_block.shape}, {dtype_src(spec.out.dtype)})",
+                f"pltpu.VMEM({spec.out_block.kernel_shape}, {dtype_src(spec.out.dtype)})",
                 "pltpu.SemaphoreType.DMA(())",
             ]
 
@@ -310,7 +374,14 @@ class ManualEmitter(Emitter):
         tiles = f"{self.n_tiles} output tiles" + (
             f" ({mask.total} without the tile mask `{ast.unparse(nest.guard)}`)" if mask else ""
         )
-        lines.append(f"    # No grid: one loop over {tiles} x {self.K} reduction steps, double-buffered by hand.")
+        if self.step_table:
+            red_mask = ast.unparse(nest.red_guard)
+            lines.append(
+                f"    # No grid: one loop over the {self.n_steps} steps of {tiles} that the reduction mask "
+                f"`{red_mask}` keeps (of {self.n_tiles * self.K}), double-buffered by hand."
+            )
+        else:
+            lines.append(f"    # No grid: one loop over {tiles} x {self.K} reduction steps, double-buffered by hand.")
         args = [t.upper() for t in self.tables] + list(self.hbm)
         if self.out_init:
             lines += [

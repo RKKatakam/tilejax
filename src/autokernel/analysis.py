@@ -12,7 +12,7 @@ import copy
 import inspect
 import itertools
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import jax
@@ -82,6 +82,15 @@ class Block:
     index: tuple[str, ...]  # per-dim block-index expression, in terms of index-map arguments
     loops: tuple[str | None, ...]  # loop variable tiling each dim (None for full / constant dims)
     text: str  # the original slice source, for comments and error messages
+    squeezed: tuple[bool, ...] = ()  # dims indexed by an integer (`x[b, ...]`): size 1, dropped in the kernel
+
+    def is_squeezed(self, d: int) -> bool:
+        return bool(self.squeezed) and self.squeezed[d]
+
+    @property
+    def kernel_shape(self) -> tuple[int, ...]:
+        """The tile's shape as the kernel sees it, without squeezed dims."""
+        return tuple(n for d, n in enumerate(self.shape) if not self.is_squeezed(d))
 
 
 @dataclass(frozen=True)
@@ -137,6 +146,10 @@ class Specialization:
     mask: TileMask | None
     names: Namer
     code: UserCode
+    # Absolute block indices of the parallel loops for every output tile computed, in loop order.
+    tiles: list[tuple[int, ...]] = field(default_factory=list)
+    # With a reduction mask: for each tile, the absolute block indices of the reduction steps that run.
+    red_blocks: list[tuple[int, ...]] | None = None
 
     @property
     def reduction(self) -> LoopBounds | None:
@@ -247,6 +260,13 @@ def specialize(nest: LoopNest, fn: Callable, specs: Sequence[jax.ShapeDtypeStruc
     )
     if masked:
         spec.mask = _tile_mask(spec)  # before any Block is resolved: index maps read its tables
+    spec.tiles = (
+        list(spec.mask.active)
+        if spec.mask
+        else list(itertools.product(*(spec.loops[lp.var].blocks for lp in nest.parallel)))
+    )
+    if nest.red_guard is not None:
+        spec.red_blocks = _reduction_mask(spec)
     spec.out = _output_shape(spec)
     spec.out_block = _output_block(spec)
     spec.operands = _collect_operands(spec)
@@ -285,13 +305,39 @@ def _resolve_block(spec: Specialization, index: ast.expr, full: tuple[int, ...],
     shape: list[int] = []
     idx: list[str] = []
     loops: list[str | None] = []
+    squeezed: list[bool] = []
     for d, (sl, size) in enumerate(zip(dims, full, strict=True)):
-        if not isinstance(sl, ast.Slice) or sl.step is not None:
-            raise nest.error(
-                index,
-                f"{what}: dim {d} must be a tile slice `v:v+T`, `c:c+T` or `:` "
-                "(integer indexing and strided slices aren't supported)",
-            )
+        squeezed.append(not isinstance(sl, ast.Slice))
+        if not isinstance(sl, ast.Slice):
+            # An integer index: a loop variable stepping by 1 (`x[b, ...]`) or a constant (`x[0, ...]`).
+            if isinstance(sl, ast.Name) and sl.id in spec.loops:
+                var, lb = sl.id, spec.loops[sl.id]
+                if var not in allowed:
+                    raise nest.error(index, f"{what}: can't be indexed by loop `{var}` here")
+                if lb.step != 1:
+                    raise nest.error(
+                        index,
+                        f"{what}: dim {d} is indexed by loop `{var}`, which steps by {lb.step}; "
+                        f"only loops stepping by 1 can index a dim (use a slice `{var}:{var} + {lb.step}`)",
+                    )
+                if lb.stop > size:
+                    raise nest.error(index, f"{what}: loop `{var}` runs to {lb.stop} but dim {d} only has size {size}")
+                shape.append(1)
+                loops.append(var)
+                if spec.mask is not None and var in spec.mask.tables:
+                    idx.append(f"{spec.mask.tables[var]}[{spec.mask.grid_var}]")
+                else:
+                    idx.append(_block_index_src(var, lb.start))
+                continue
+            c = spec.code.eval_int(sl, "index", env)
+            if not 0 <= c < size:
+                raise nest.error(index, f"{what}: index {c} in dim {d} is outside the array (size {size})")
+            shape.append(1)
+            idx.append(str(c))
+            loops.append(None)
+            continue
+        if sl.step is not None:
+            raise nest.error(index, f"{what}: dim {d} must be a tile slice, not a strided one")
         if sl.lower is None and sl.upper is None:
             shape.append(size)
             idx.append("0")
@@ -330,7 +376,7 @@ def _resolve_block(spec: Specialization, index: ast.expr, full: tuple[int, ...],
         idx.append(str(lo // t))
         loops.append(None)
     text = ", ".join(map(ast.unparse, index.elts)) if isinstance(index, ast.Tuple) else ast.unparse(index)
-    return Block(tuple(shape), tuple(idx), tuple(loops), text)
+    return Block(tuple(shape), tuple(idx), tuple(loops), text, tuple(squeezed))
 
 
 def _tile_size(upper: ast.expr | None, var: str) -> ast.expr | None:
@@ -492,6 +538,39 @@ def _tile_mask(spec: Specialization) -> TileMask:
     grid_var = spec.names.fresh("tile")
     tables = {lp.var: spec.names.fresh(f"{lp.var}_blocks") for lp in nest.parallel}
     return TileMask(tuple(active), tuple(constant), None, tables, grid_var)
+
+
+def _reduction_mask(spec: Specialization) -> list[tuple[int, ...]]:
+    """For every computed tile, the reduction steps the mask keeps (absolute block indices, in order)."""
+    nest, red = spec.nest, spec.reduction
+    assert nest.red_guard is not None and nest.red_guard_node is not None and red is not None
+    guard = spec.code.compile(nest.red_guard, "eval")
+    bounds = [spec.loops[lp.var] for lp in nest.parallel]
+    kept = []
+    for blocks in spec.tiles:
+        env = dict(spec.consts)
+        env.update({lb.var: b * lb.step for lb, b in zip(bounds, blocks, strict=True)})
+        steps = []
+        for kb in red.blocks:
+            env[red.var] = kb * red.step
+            try:
+                if eval(guard, env):
+                    steps.append(kb)
+            except Exception as e:
+                raise nest.error(
+                    nest.red_guard_node,
+                    f"can't evaluate the reduction mask `{ast.unparse(nest.red_guard)}` at trace time "
+                    f"({type(e).__name__}: {e})",
+                ) from None
+        if not steps:
+            where = ", ".join(f"{lb.var}={b * lb.step}" for lb, b in zip(bounds, blocks, strict=True))
+            raise nest.error(
+                nest.red_guard_node,
+                f"the reduction mask skips every step of the tile at {where}; mask that tile with a tile mask "
+                "instead so its output value is well defined",
+            )
+        kept.append(tuple(steps))
+    return kept
 
 
 def _constant_fill(spec: Specialization) -> Scalar | None:

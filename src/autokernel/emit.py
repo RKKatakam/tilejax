@@ -44,6 +44,13 @@ def _mxu_dot(x, y):
     # bf16/int8 operands are already exact on the MXU; only f32 operands take a precision.
     precision = {precision} if x.dtype == jnp.float32 or y.dtype == jnp.float32 else None
     return jnp.dot(x, y, preferred_element_type=acc, precision=precision)
+
+
+def _mxu_dot_t(x, y):
+    # `x @ y.T`: contract the last dims of both, so the MXU reads y transposed instead of us transposing it.
+    acc = jnp.int32 if jnp.issubdtype(x.dtype, jnp.integer) else jnp.float32
+    precision = {precision} if x.dtype == jnp.float32 or y.dtype == jnp.float32 else None
+    return jax.lax.dot_general(x, y, (((1,), (1,)), ((), ())), preferred_element_type=acc, precision=precision)
 """
 
 
@@ -140,10 +147,7 @@ class Emitter:
 
     def tiles(self) -> list[tuple[int, ...]]:
         """Absolute block indices of the parallel loops for every output tile computed, in loop order."""
-        if self.mask is not None:
-            return list(self.mask.active)
-        bounds = [self.spec.loops[lp.var] for lp in self.nest.parallel]
-        return [tuple(b) for b in np.ndindex(*(lb.grid for lb in bounds))] if bounds else [()]
+        return self.spec.tiles
 
     def _fill_tables(self) -> dict[str, np.ndarray]:
         tables: dict[str, np.ndarray] = {}
@@ -180,10 +184,14 @@ class Emitter:
         """`_fill_copy(c)`: the DMA writing constant tile c of the output (ref `dst`) from the fill tile."""
         fill, block = self.fill, self.spec.out_block
         assert fill is not None and self.mask is not None
-        dst_slices = [
-            f"pl.ds({fill.tables[var]}[c] * {size}, {size})" if var else f"pl.ds({int(i) * size}, {size})"
-            for var, size, i in zip(block.loops, block.shape, block.index, strict=True)
-        ]
+        dst_slices = []
+        for d, (var, size, i) in enumerate(zip(block.loops, block.shape, block.index, strict=True)):
+            if block.is_squeezed(d):  # an integer index: the fill tile has no such dim
+                dst_slices.append(f"{fill.tables[var]}[c]" if var else str(int(i)))
+            else:
+                dst_slices.append(
+                    f"pl.ds({fill.tables[var]}[c] * {size}, {size})" if var else f"pl.ds({int(i) * size}, {size})"
+                )
         return [
             f"# {len(self.mask.constant)} masked-out tiles are the constant {fill.value}: write them from one VMEM",
             f"# tile with async DMAs spread across the tiles ({FILL_DMA_DEPTH} in flight at most), behind the matmuls.",
@@ -236,7 +244,10 @@ class Emitter:
             def visit_BinOp(self, n: ast.BinOp) -> ast.AST:
                 self.generic_visit(n)
                 if isinstance(n.op, ast.MatMult):
-                    return ast.copy_location(ast.Call(ast.Name("_mxu_dot", ast.Load()), [n.left, n.right], []), n)
+                    right, fn = n.right, "_mxu_dot"
+                    if isinstance(right, ast.Attribute) and right.attr == "T":  # x @ y.T
+                        right, fn = right.value, "_mxu_dot_t"
+                    return ast.copy_location(ast.Call(ast.Name(fn, ast.Load()), [n.left, right], []), n)
                 return n
 
         return Rewriter().visit(copy.deepcopy(node))
@@ -282,15 +293,21 @@ class Emitter:
 
     def check_hardware(self) -> int:
         spec, fill = self.spec, self.fill
+
+        def kept(block: Block, full: tuple[int, ...]) -> tuple[int, ...]:
+            return tuple(n for d, n in enumerate(full) if not block.is_squeezed(d))
+
         problems = []
         for op in spec.operands:
+            shape = op.block.kernel_shape
             problems += hardware.check_block(
-                f"input `{op.param}[{op.block.text}]` block {op.block.shape}", op.block.shape, op.full_shape, op.dtype
+                f"input `{op.param}[{op.block.text}]` block {shape}", shape, kept(op.block, op.full_shape), op.dtype
             )
+        out_shape = spec.out_block.kernel_shape
         problems += hardware.check_block(
-            f"output `{self.nest.out_var}[{spec.out_block.text}]` block {spec.out_block.shape}",
-            spec.out_block.shape,
-            tuple(spec.out.shape),
+            f"output `{self.nest.out_var}[{spec.out_block.text}]` block {out_shape}",
+            out_shape,
+            kept(spec.out_block, tuple(spec.out.shape)),
             spec.out.dtype,
         )
         if problems and self.options.check_tiling:

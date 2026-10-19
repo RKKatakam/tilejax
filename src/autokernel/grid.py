@@ -12,10 +12,16 @@ import ast
 
 import numpy as np
 
-from .analysis import Specialization
+from .analysis import Block, Specialization
 from .emit import Emitter, Options, dtype_src, indent, tuple_src
+from .errors import AutoKernelError
 
 __all__ = ["GridEmitter"]
+
+
+def _block_shape_src(block: Block) -> str:
+    """BlockSpec block shape: squeezed (integer-indexed) dims are `None`."""
+    return tuple_src(["None" if block.is_squeezed(d) else str(n) for d, n in enumerate(block.shape)])
 
 
 class GridEmitter(Emitter):
@@ -23,6 +29,11 @@ class GridEmitter(Emitter):
 
     def __init__(self, spec: Specialization, options: Options):
         super().__init__(spec, options)
+        if spec.red_blocks is not None:
+            raise AutoKernelError(
+                f"{self.nest.fn_name}: masks on the reduction loop need pipeline='manual' (the default); a Pallas "
+                "grid can't skip individual reduction steps"
+            )
         self.out_in = spec.names.fresh(f"{self.nest.out_var}_in") if self.mask else None  # aliased HBM output
         if self.mask is not None:
             for n, table in enumerate(self.mask.tables.values()):
@@ -107,20 +118,21 @@ class GridEmitter(Emitter):
         lam = f"lambda {', '.join(self._index_map_args())}:"
         specs = ["in_specs=["]
         specs += [
-            f"    pl.BlockSpec({op.block.shape}, {lam} {tuple_src(op.block.index)}),  # {op.param}[{op.block.text}]"
+            f"    pl.BlockSpec({_block_shape_src(op.block)}, {lam} {tuple_src(op.block.index)}),"
+            f"  # {op.param}[{op.block.text}]"
             for op in spec.operands
         ]
         if mask:
             specs.append(f"    pl.BlockSpec(memory_space=pl.ANY),  # {self.out_in}: aliased to the output")
         specs += [
             "],",
-            f"out_specs=pl.BlockSpec({spec.out_block.shape}, {lam} {tuple_src(spec.out_block.index)}),"
+            f"out_specs=pl.BlockSpec({_block_shape_src(spec.out_block)}, {lam} {tuple_src(spec.out_block.index)}),"
             f"  # {nest.out_var}[{spec.out_block.text}]",
         ]
         scratch = [f"pltpu.VMEM({acc.scratch.shape}, {dtype_src(acc.scratch.dtype)})" for acc in spec.accumulators]
         if fill:
             scratch += [
-                f"pltpu.VMEM({spec.out_block.shape}, {dtype_src(spec.out.dtype)})",
+                f"pltpu.VMEM({spec.out_block.kernel_shape}, {dtype_src(spec.out.dtype)})",
                 "pltpu.SemaphoreType.DMA(())",
             ]
         if scratch:

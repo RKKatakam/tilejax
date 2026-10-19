@@ -80,3 +80,11 @@ def test_prefill_keeps_the_output_fill(pipeline):
     )
     hlo = lower_for_v5e(kernel, f32(512, 256), f32(256, 512)).as_text()
     assert "AllocateBuffer" not in hlo and "broadcast_in_dim" in _before_kernel(hlo)
+
+
+def test_splash_attention_lowers_to_mosaic():
+    from test_attention import make_attention
+
+    spec = bf16(2, 2, 512, 128)
+    hlo = lower_for_v5e(make_attention(2, 2, 512, 128, 128, 128), spec, spec, spec).as_text()
+    assert "tpu_custom_call" in hlo

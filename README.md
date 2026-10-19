@@ -68,6 +68,18 @@ kernel written by hand for the same tiles.
 | dense `x @ y`, bf16 | 1024×1024×512 | 5.90 | 5.92 | **5.89** | 5.92 |
 | dense `x @ y`, f32 | 512×512×1024 | 35.08 | 34.06 | **34.00** | 34.04 |
 
+Causal multi-head attention, bf16, D=128, milliseconds. "JAX Splash" is
+`jax.experimental.pallas.ops.tpu.splash_attention` with a causal mask and the same block sizes; XLA is
+`jax.nn.dot_product_attention(is_causal=True)`, which runs out of HBM at S=8192.
+
+| B, H, S | Blocks (q × kv) | XLA | JAX Splash | autokernel |
+| --- | --- | --- | --- | --- |
+| 4, 16, 4096 | 256 × 256 | 32.33 | 8.31 | **5.28** |
+| 4, 16, 4096 | 512 × 512 | 32.33 | 3.38 | **2.45** (112 TFLOP/s) |
+| 4, 16, 4096 | 1024 × 512 | 32.33 | 3.16 | **2.56** |
+| 2, 16, 8192 | 512 × 512 | out of memory | 6.19 | **4.46** (123 TFLOP/s) |
+| 2, 16, 8192 | 1024 × 512 | out of memory | 5.53 | **4.46** |
+
 The gridless backend matches or beats the hand-written kernel at every tile size measured (by up to 4%
 with small tiles, where per-step overhead dominates). A causal matmul with the tile mask is about 1.75×
 faster than XLA in bf16 and 1.9× in f32, because XLA computes the whole matrix.
@@ -93,7 +105,10 @@ def f(x, y):  # positional array parameters only
 
 - Loops are `range(start, stop, step)` with values known at trace time (constants, closures, `x.shape`).
 - Inputs are only read through tile slices: each dimension is `v:v + T` (T equal to loop `v`'s step),
-  a constant aligned block `c:c + T`, or `:`.
+  a constant aligned block `c:c + T`, `:`, or an integer index: a loop variable stepping by 1
+  (`q[b, h, i:i + T, :]` for batch and head loops) or a constant. Integer-indexed dims are dropped from
+  the tile the kernel sees, as in NumPy.
+- `x @ y.T` is lowered to one MXU matmul that reads `y` transposed, without materialising `y.T`.
 - Loop variables may also be used as values, e.g. `jax.lax.broadcasted_iota(...) + i`.
 - Every output element must be produced: the loops must cover the output.
 
@@ -128,6 +143,43 @@ Skipped tiles keep the output allocation's value. When that value is a known con
 matmuls, so the output never needs a separate fill pass.
 
 On a TPU v5e at 8192³ this runs 1.65–1.9× faster than the same loops without the mask.
+
+### Reduction masks: splash attention
+
+A mask at the top of the reduction loop skips individual reduction steps. The kernel then walks a
+table of only the (tile, reduction block) steps that run, so skipped blocks are never fetched or
+computed. That is exactly what splash (sparse flash) attention needs: with a causal mask, a query block
+skips every key/value block that lies entirely in its future.
+
+```python
+@autokernel.tpu
+def causal_attention(q, k, v):  # (batch, heads, seq, head_dim)
+    dtype = q.dtype
+    out = jnp.zeros((B, H, S, D), dtype)
+    for b in range(0, B, 1):
+        for h in range(0, H, 1):
+            for i in range(0, S, TQ):
+                row_max = jnp.full((TQ, LANES), MASK_VALUE)
+                row_sum = jnp.zeros((TQ, LANES))
+                acc = jnp.zeros((TQ, D))
+                for j in range(0, S, TK):
+                    if j > i + TQ - 1:  # the whole key/value block is in the future: skip it
+                        continue
+                    s = (q[b, h, i : i + TQ, :] @ k[b, h, j : j + TK, :].T) * SCALE
+                    ...  # causal mask on the diagonal block, online-softmax update of row_max / row_sum / acc
+                out = out.at[b, h, i : i + TQ, :].set((acc / jnp.tile(row_sum, (1, D // LANES))).astype(dtype))
+    return out
+```
+
+The full kernel is in [examples/splash_attention.py](examples/splash_attention.py). Masks on the reduction
+loop need the default `pipeline="manual"`.
+
+### Writing fast kernels
+
+Keep per-row statistics lane-wide: shape `(rows, 128)` with the value repeated across the 128 lanes of
+a TPU vector register, widened with `jnp.tile` where they meet a wider block. A `(rows, 1)` column
+needs a cross-lane broadcast every time it meets a `(rows, n)` block; in the attention kernel above,
+switching the running max and sum to the lane-wide form made it about 1.7× faster on a v5e.
 
 ## Options
 
@@ -194,8 +246,8 @@ tests/
 ## Limitations
 
 - One reduction loop per kernel, perfectly nested parallel loops, one output.
-- Tile masks depend only on tile coordinates known at trace time: no runtime mask arrays, and no
-  masks on the reduction loop.
+- Tile and reduction masks depend only on loop coordinates known at trace time: no runtime mask
+  arrays. A reduction mask may not skip every step of a tile (mask the tile instead).
 - `@` on 3-D or higher tiles is lowered as `jnp.dot`, which isn't batched matmul semantics; only
   use it on 2-D tiles.
 - Gridless kernels run on one TensorCore. On chips with two per device (v4, v5p), use
