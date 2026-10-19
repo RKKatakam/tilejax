@@ -27,12 +27,25 @@ import itertools
 from dataclasses import dataclass, field
 from typing import Any
 
+import jax.numpy as jnp
 import numpy as np
 
 from .analysis import Specialization, evaluate_mask
 from .errors import AutoKernelError
 
-__all__ = ["RUNTIME_TABLES", "Column", "Schedule", "build_tables", "plan", "runtime_tables"]
+__all__ = [
+    "RUNTIME_TABLES",
+    "Column",
+    "Schedule",
+    "build_tables",
+    "check_smem",
+    "column_mask",
+    "core_bounds",
+    "plan",
+    "runtime_tables",
+    "smem_tables",
+    "step_tables",
+]
 
 # A table entry's column code: (column << 2) | (first step of its phase << 1) | (last step of its phase).
 FIRST, LAST, COLUMN_SHIFT = 2, 1, 2
@@ -85,8 +98,9 @@ def plan(spec: Specialization, cores: int, smem_budget: int) -> Schedule:
     if spec.runtime_masks:
         candidates = len(spec.tiles)
         steps = candidates * max(1, len(columns))
-        _check_smem(spec, 2 * steps * 4 + 4 * (2 * cores + 2), smem_budget)
-        return Schedule("runtime", phase_steps, columns, candidates, steps, cores)
+        sched = Schedule("runtime", phase_steps, columns, candidates, steps, cores)
+        check_smem(spec, sched, False, smem_budget)
+        return sched
 
     if all(m is None for m in spec.phase_masks):
         per = max(1, sum(phase_steps))
@@ -95,36 +109,57 @@ def plan(spec: Specialization, cores: int, smem_budget: int) -> Schedule:
     else:
         # Static reduction masks: list the steps of one repeating pattern of tiles.
         inner = _pattern_tiles(spec)
-        keep = _column_mask(spec, [m[:inner] if m is not None else None for m in spec.phase_masks], inner, np)
-        step_tile, step_code, _ = build_tables(keep, columns, np)
+        keep = column_mask([m[:inner] if m is not None else None for m in spec.phase_masks], phase_steps, inner, np)
+        step_tile, step_code, _ = build_tables(keep, phase_steps, np)
         reps = len(spec.tiles) // inner
         sched = Schedule("table", phase_steps, columns, len(spec.tiles), reps * len(step_tile), cores)
         sched.pattern_tiles, sched.pattern_steps = inner, len(step_tile)
         sched.tables = {"step_tile": step_tile, "step_code": step_code}
-        _check_smem(spec, sum(t.nbytes for t in sched.tables.values()), smem_budget)
         starts = np.searchsorted(step_tile, np.arange(inner))  # first step of each pattern tile
         tile_starts = (np.arange(reps)[:, None] * len(step_tile) + starts[None, :]).reshape(-1)
         tile_starts = np.append(tile_starts, sched.steps)
     bounds = core_bounds(tile_starts, cores, np)
     sched.core_tiles = list(itertools.pairwise(bounds.tolist()))
     sched.core_steps = list(itertools.pairwise(tile_starts[bounds].tolist()))
+    check_smem(spec, sched, False, smem_budget)
     return sched
 
 
-def core_bounds(tile_starts: Any, cores: int, xp: Any) -> Any:
-    """Cut tile ordinals into `cores` contiguous runs with step counts as even as possible.
+def core_bounds(tile_starts, cores, xp):
+    """Cut tile ordinals into `cores` contiguous runs, making the most steps any core runs as few as possible.
 
     `tile_starts[t]` is the first step of tile `t`, and `tile_starts[-1]` the total step count; the result
     has `cores + 1` ordinals, starting at 0 and ending at the tile count. Works with numpy and jax.numpy.
     """
     n_tiles = tile_starts.shape[0] - 1
-    targets = xp.arange(cores + 1) * tile_starts[-1] // cores
-    after = xp.clip(xp.searchsorted(tile_starts, targets), 0, n_tiles)  # first tile starting at/after the target
-    before = xp.maximum(after - 1, 0)
-    nearest = xp.where(targets - tile_starts[before] < tile_starts[after] - targets, before, after)
-    nearest = xp.maximum.accumulate(nearest)  # keep the runs in order
-    ends = xp.asarray([0, n_tiles])
-    return xp.where(xp.arange(cores + 1) == 0, ends[0], xp.where(xp.arange(cores + 1) == cores, ends[1], nearest))
+    if cores <= 2:  # one cut, as near the middle as the tiles allow: no other cut runs fewer steps on a core
+        targets = xp.arange(cores + 1) * tile_starts[-1] // cores
+        after = xp.clip(xp.searchsorted(tile_starts, targets), 0, n_tiles)  # first tile starting at/after it
+        before = xp.maximum(after - 1, 0)
+        nearest = xp.where(targets - tile_starts[before] < tile_starts[after] - targets, before, after)
+        ends = xp.asarray([0, n_tiles])
+        cut = xp.arange(cores + 1)
+        return xp.where(cut == 0, ends[0], xp.where(cut == cores, ends[1], nearest))
+
+    def greedy(limit):
+        # Each core takes tiles while its steps stay within `limit`: the runs' ends, and whether the last
+        # core's run fits too.
+        at, ends = 0, []
+        for _ in range(cores - 1):
+            at = xp.searchsorted(tile_starts, tile_starts[at] + limit, side="right") - 1
+            ends.append(at)
+        return ends, tile_starts[-1] - tile_starts[at] <= limit
+
+    # Binary search for the least per-core step count the greedy runs can keep to (a fixed number of rounds
+    # with jax.numpy, where the total is traced).
+    lo, hi = xp.asarray(0), xp.asarray(tile_starts[-1])
+    rounds = int(tile_starts[-1]).bit_length() + 1 if xp is np else 32
+    for _ in range(rounds):
+        mid = (lo + hi) // 2
+        _, fits = greedy(mid)
+        lo, hi = xp.where(fits, lo, mid + 1), xp.where(fits, mid, hi)
+    ends, _ = greedy(hi)
+    return xp.stack([xp.asarray(0), *[xp.asarray(e) for e in ends], xp.asarray(n_tiles)])
 
 
 def _pattern_tiles(spec: Specialization) -> int:
@@ -143,30 +178,55 @@ def _pattern_tiles(spec: Specialization) -> int:
     return int(np.prod([lb.count for lb in spec.parallel[first_used:]], dtype=np.int64))
 
 
-def _check_smem(spec: Specialization, used: int, budget: int) -> None:
-    if used > budget:
+def smem_tables(spec: Specialization, sched: Schedule, fills: bool) -> dict[str, int]:
+    """Bytes of SMEM the kernel's tables and scalars take, by what they hold (see `codegen.Emitter`)."""
+    word, tiles = 4, len(spec.tiles)
+    used = {}
+    if sched.mode == "table":
+        used["step tables"] = sum(t.nbytes for t in sched.tables.values())
+    elif sched.mode == "runtime":
+        used["step tables"] = word * (2 * sched.steps + tiles)  # step_tile, step_code, tile_ids
+    if sched.cores > 1 or sched.mode == "runtime":
+        used["core bounds"] = word * 2 * (sched.cores + 1)
+    if spec.nest.guard is not None and not spec.tile_mask_runtime:
+        used["tile tables"] = word * len(spec.parallel) * tiles
+    if fills:
+        used["fill tables"] = word * (len(spec.parallel) * len(spec.constant_tiles) + tiles + 1)
+    used["scalars"] = word * (len(spec.scalars) + sum(sv.smem for sv in spec.state.values()))
+    return used
+
+
+def check_smem(spec: Specialization, sched: Schedule, fills: bool, budget: int) -> None:
+    """Raise AutoKernelError if the kernel's SMEM tables and scalars (`fills`: with the masked-out tiles'
+    fill tables) don't fit in `budget` bytes."""
+    used = smem_tables(spec, sched, fills)
+    total = sum(used.values())
+    if total > budget:
+        parts = ", ".join(f"{what} {n / 1024:.0f} KiB" for what, n in used.items() if n)
         raise AutoKernelError(
-            f"{spec.nest.fn_name}: the step tables need {used / 1024:.0f} KiB of SMEM (budget {budget // 1024} KiB); "
-            "use bigger blocks"
+            f"{spec.nest.fn_name}: its tables need {total / 1024:.0f} KiB of SMEM ({parts}; budget "
+            f"{budget // 1024} KiB); use bigger blocks"
         )
 
 
 # --------------------------------------------------------------------------- tables (numpy or jax.numpy)
+#
+# Generated kernels with runtime masks carry the source of `step_tables` and the functions it calls, so
+# these take numpy or jax.numpy as `xp`, read no module globals but `np` and `jnp`, and have no annotations.
 
 
-def _column_mask(spec: Specialization, phase_masks: list[Any], tiles: int, xp: Any) -> Any:
+def column_mask(phase_masks, phase_steps, tiles, xp):
     """keep[t, c]: tile t runs column c. A phase's empty column is kept when none of its positions are."""
     parts = []
-    for p, phase in enumerate(spec.phases):
-        m = phase_masks[p]
-        real = xp.ones((tiles, phase.steps), bool) if m is None else xp.asarray(m, bool).reshape(tiles, phase.steps)
+    for m, steps in zip(phase_masks, phase_steps, strict=True):
+        real = xp.ones((tiles, steps), bool) if m is None else xp.asarray(m, bool).reshape(tiles, steps)
         parts += [real, ~real.any(axis=1, keepdims=True)]
     if not parts:
         return xp.ones((tiles, 1), bool)
     return xp.concatenate(parts, axis=1)
 
 
-def build_tables(keep: Any, columns: list[Column], xp: Any, tile_keep: Any = None) -> tuple[Any, Any, Any]:
+def build_tables(keep, phase_steps, xp, tile_keep=None):
     """The steps a column mask keeps, tile-major: (step_tile ordinal, step_code, number of steps).
 
     With jax.numpy (runtime masks) the tables are padded to every possible step and the count is dynamic.
@@ -179,7 +239,7 @@ def build_tables(keep: Any, columns: list[Column], xp: Any, tile_keep: Any = Non
         ordinal = xp.arange(tiles)
     # First / last kept column of each tile within each phase (each phase's columns are contiguous).
     firsts, lasts, at = [], [], 0
-    for width in _phase_widths(columns):
+    for width in [steps + 1 for steps in phase_steps]:  # a phase's reduction positions and its empty column
         seg = keep[:, at : at + width]
         count = xp.cumsum(seg.astype(np.int32), axis=1)
         firsts.append(seg & (count == 1))
@@ -201,18 +261,8 @@ def build_tables(keep: Any, columns: list[Column], xp: Any, tile_keep: Any = Non
     return step_tile.astype(np.int32), step_code.astype(np.int32), count
 
 
-def _phase_widths(columns: list[Column]) -> list[int]:
-    widths: dict[int, int] = {}
-    for c in columns:
-        widths[c.phase] = widths.get(c.phase, 0) + 1
-    return [widths[p] for p in sorted(widths)]
-
-
 def runtime_tables(spec: Specialization, schedule: Schedule, inputs: dict[str, Any]) -> dict[str, Any]:
-    """Build the step tables on device for masks that read inputs (called from the kernel's wrapper)."""
-    import jax.numpy as jnp
-
-    tiles = len(spec.tiles)
+    """Build the step tables on device for masks that read inputs (as the kernel's wrapper does)."""
     tile_keep = evaluate_mask(spec, None, inputs) if spec.tile_mask_runtime else None
     phase_masks = []
     for p, phase in enumerate(spec.phases):
@@ -222,15 +272,22 @@ def runtime_tables(spec: Specialization, schedule: Schedule, inputs: dict[str, A
             phase_masks.append(jnp.asarray(spec.phase_masks[p]))
         else:
             phase_masks.append(evaluate_mask(spec, p, inputs))
-    keep = _column_mask(spec, phase_masks, tiles, jnp)
-    step_tile, step_code, count = build_tables(keep, schedule.columns, jnp, tile_keep)
+    return step_tables(tile_keep, phase_masks, schedule.phase_steps, len(spec.tiles), schedule.cores)
+
+
+def step_tables(tile_keep, phase_masks, phase_steps, tiles, cores):
+    """The tables of a runtime schedule (`RUNTIME_TABLES`), with jax.numpy, from the tile mask (None: every
+    candidate tile runs) and each phase's (tiles, steps) mask (None: unmasked). Generated kernels carry this
+    function's source (with `column_mask`, `build_tables` and `core_bounds`) to build their tables."""
+    keep = column_mask(phase_masks, phase_steps, tiles, jnp)
+    step_tile, step_code, count = build_tables(keep, phase_steps, jnp, tile_keep)
     n_tiles = tiles if tile_keep is None else tile_keep.sum()
     tile_ids = jnp.arange(tiles) if tile_keep is None else jnp.nonzero(tile_keep, size=tiles, fill_value=0)[0]
     # Each core takes a contiguous run of tile ordinals; cut the runs where the step counts come out even.
     valid_tile = jnp.where(jnp.arange(step_tile.shape[0]) < count, step_tile, n_tiles)  # padding sorts last
     tile_starts = jnp.searchsorted(valid_tile, jnp.arange(tiles + 1))  # tiles >= n_tiles start at `count`
     tile_starts = jnp.minimum(tile_starts, count)
-    tile_bounds = jnp.minimum(core_bounds(tile_starts, schedule.cores, jnp), n_tiles)
+    tile_bounds = jnp.minimum(core_bounds(tile_starts, cores, jnp), n_tiles)
     bounds = jnp.concatenate([tile_starts[tile_bounds], tile_bounds]).astype(jnp.int32)
     return {
         "step_tile": step_tile,

@@ -45,6 +45,12 @@ DEFAULT_VPU_INT_BITS = (16, 32)
 # Vector-ALU slots per VLIW bundle: whole-vreg elementwise ops the VPU issues per cycle. Fitted to the
 # attention timings measured on a v5e (see cost.py); the EUP (transcendentals) issues one more per cycle.
 VALU_SLOTS = 4
+# TensorCore clocks, Hz. JAX's tables don't list clocks; bf16 rate / (MXUs x MXU size^2 x 2) gives them for the
+# chips with 128x128 MXUs (published: v4 1050 MHz; v5e 1.5 GHz; v5p 1.75 GHz), but JAX lists two 256x256
+# MXUs for v6e (918 TFLOP/s), which would mean a 3.5 GHz clock: Trillium has four, at about 1.75 GHz.
+# Chips not listed here use the formula.
+# TODO: newer chips (v7, ...) once their clocks and MXU counts are published.
+_CLOCK_HZ = {"v4": 1.05e9, "v5e": 1.5e9, "v5p": 1.75e9, "v6e": 1.75e9}
 
 
 @dataclass(frozen=True)
@@ -107,7 +113,7 @@ def target(name: str | None = None) -> Hardware:
             known = ", ".join(c.value for c in _tpu_info.ChipVersion)
             raise AutoKernelError(f"unknown TPU target {name!r}; known: {known}") from None
         info = pltpu.get_tpu_info_for_chip(chip, _MEGACORE.get(name, 1))
-    clock = info.bf16_ops_per_second / (info.num_mxus * info.mxu_column_size**2 * 2)
+    clock = _CLOCK_HZ.get(name) or info.bf16_ops_per_second / (info.num_mxus * info.mxu_column_size**2 * 2)
     return Hardware(
         name=name,
         cores=info.num_cores,

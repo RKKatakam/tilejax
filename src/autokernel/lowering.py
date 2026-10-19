@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import jax
+import jax.numpy as jnp
 
 from . import codegen, hardware, mxu
 from . import cost as cost_lib
@@ -121,9 +122,11 @@ class Lowered:
     def check_indices(self, values: Mapping[str, Any]) -> None:
         """Raise AutoKernelError if known values of the runtime scalars index outside an input (traced ones are
         clamped by the kernel, and checked under `jax.experimental.checkify`)."""
-        if self.plan is not None:
-            known = {k: v if isinstance(v, jax.core.Tracer) else int(v) for k, v in values.items()}
-            check_indices(self.plan.spec, known)  # traced values: a checkify check
+        if self.plan is not None:  # only integers index: a float scalar (inf, NaN, ...) is just a value
+            spec = self.plan.spec
+            ints = {p for p in spec.scalars if jnp.issubdtype(spec.input_dtype(p), jnp.integer)}
+            known = {k: v if isinstance(v, jax.core.Tracer) else int(v) for k, v in values.items() if k in ints}
+            check_indices(spec, known)  # traced values: a checkify check
 
 
 @dataclass(frozen=True)
@@ -173,19 +176,28 @@ def plan(
     cores = options.cores or hw.cores
     sched = schedule_lib.plan(spec, cores, hw.smem_budget)
     fills, aliased = codegen.plan_fills(spec, options.background_fill)
+    if fills:  # the fill tables live in SMEM too
+        schedule_lib.check_smem(spec, sched, True, hw.smem_budget)
     highest = options.matmul_precision == "highest"
+    # What the kernel may plan to use: the chip's budget, or the VMEM limit the user set (Mosaic can't give
+    # the kernel more than its limit).
+    budget = min(options.vmem_limit_bytes, hw.vmem_bytes) if options.vmem_limit_bytes else hw.vmem_budget
     if buffers or options.buffers:
         buffers = buffers or options.buffers
         est = cost_lib.estimate(spec, sched, hw, buffers, highest, fills, cost_cache)
     else:
         for buffers in DEFAULT_BUFFERS:  # the deepest default that fits
             est = cost_lib.estimate(spec, sched, hw, buffers, highest, fills, cost_cache)
-            if est.vmem_bytes <= hw.vmem_budget:
+            if est.vmem_bytes <= budget:
                 break
-    if est.vmem_bytes > hw.vmem_budget:
+    if est.vmem_bytes > budget:
+        if options.vmem_limit_bytes:
+            room = f"its vmem_limit_bytes ({budget / 2**20:.1f} MiB)"
+        else:
+            room = f"the {budget / 2**20:.0f} MiB a {hw.name} kernel can use"
         raise VmemError(
-            f"{nest.fn_name}: needs about {est.vmem_bytes / 2**20:.0f} MiB of VMEM, more than the "
-            f"{hw.vmem_budget / 2**20:.0f} MiB a {hw.name} kernel can use; use smaller tiles or fewer buffers"
+            f"{nest.fn_name}: needs about {est.vmem_bytes / 2**20:.0f} MiB of VMEM, more than {room}; use smaller "
+            "tiles or fewer buffers"
         )
     return Plan(spec, sched, hw, cores, buffers, fills, aliased, est, dict(overrides or {}))
 

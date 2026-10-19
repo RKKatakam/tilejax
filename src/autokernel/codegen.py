@@ -15,12 +15,22 @@ async copies. One step:
 Kernels with one unmasked reduction (or none) have no phase or empty-step tests at all: every step runs
 the body. On chips with two TensorCores per device the kernel gets a one-axis "parallel" grid, one
 point per TensorCore, and each core runs a contiguous run of tiles.
+
+The source is self-contained: it imports what it uses and binds the values it reads from the user's module
+(constants, functions the tile code calls), its cost estimate and its SMEM tables, so it runs on its own.
+Every name it defines where the user's code can see it comes from the nest's `Namer`, so it can't hide a
+name of the user's.
 """
 
 from __future__ import annotations
 
 import ast
 import copy
+import importlib
+import inspect
+import symtable
+import textwrap
+import types
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -31,17 +41,20 @@ import numpy as np
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from . import hardware, mxu
+from . import analysis, hardware, mxu
 from . import schedule as schedule_lib
 from .analysis import Block, LoopBounds, Operand, Specialization, StateVar, Unit
 from .errors import AutoKernelError
-from .frontend import assigned_name
+from .frontend import assigned_name, reads
 from .schedule import COLUMN_SHIFT, FIRST, LAST, RUNTIME_TABLES, Schedule
+from .views import div_src, rem_src
 
 __all__ = [
     "FILL_DMA_DEPTH",
+    "MODULES",
     "Emitter",
     "Generated",
+    "assignments",
     "check_layout",
     "generate",
     "layout_error",
@@ -52,25 +65,35 @@ __all__ = [
 # Constant (masked-out) tiles are written with at most this many fill DMAs in flight.
 FILL_DMA_DEPTH = 4
 
+# What generated code imports, by the names it uses them under.
+_IMPORTS = """\
+import jax
+import jax.numpy as jnp
+import numpy as np
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
+"""
+MODULES = {"jax": jax, "jnp": jnp, "np": np, "pl": pl, "pltpu": pltpu}
+
 _PRELUDE = """\
-def _div(a, b):
+def {_div}(a, b):
     # a // b for the non-negative step and tile indices: one integer division, no floor-sign fix-ups.
     return jax.lax.div(a, b)
 
 
-def _rem(a, b):
+def {_rem}(a, b):
     return jax.lax.rem(a, b)
 """
 
 _SCALAR_PRELUDE = """\
-def _index(i, n):
+def {_index}(i, n):
     # A runtime index into a dim of size n: Python's rules, so a negative index counts from the end. One
     # outside the dim is clamped into it, so a copy never reads outside the array (that would halt the TPU
     # core); the caller reports it (`analysis.check_indices`).
     return jnp.minimum(jnp.maximum(jnp.where(i < 0, i + n, i), 0), n - 1)
 """
 
-
+# JAX has no public way to make a traced value weakly typed; this is what `jax.lax` itself uses.
 _WEAK = """\
 def {name}(x):
     # A Python scalar's weak type, so it takes the other operand's type: `bf16_tile * i` stays bf16.
@@ -190,33 +213,133 @@ def _is_pow2(n: int) -> bool:
     return n > 0 and n & (n - 1) == 0
 
 
-def _div_src(x: str, n: int) -> str:
-    """`x // n` for a non-negative x: a shift for powers of two, one integer division otherwise."""
-    if n == 1:
-        return x
-    return f"({x} >> {n.bit_length() - 1})" if _is_pow2(n) else f"_div({x}, {n})"
-
-
-def _rem_src(x: str, n: int) -> str:
-    """`x % n` for a non-negative x: a mask for powers of two, one integer remainder otherwise."""
-    return f"({x} & {n - 1})" if _is_pow2(n) else f"_rem({x}, {n})"
-
-
-def _split_src(name: str, x: str, quotient: str, n: int) -> str:
+def _split_src(name: str, x: str, quotient: str, n: int, rem: str) -> str:
     """`name = x % n` given `quotient = x // n`: a mask for powers of two, else one multiply and subtract."""
     if n == 1:
         return f"{name} = 0"
-    return f"{name} = {_rem_src(x, n)}" if _is_pow2(n) else f"{name} = {x} - {quotient} * {n}"
+    return f"{name} = {rem_src(x, n, rem)}" if _is_pow2(n) else f"{name} = {x} - {quotient} * {n}"
 
 
-def _radix(index: str, loops: Sequence[LoopBounds], k: int) -> str:
+def _radix(index: str, loops: Sequence[LoopBounds], k: int, div: str, rem: str) -> str:
     """Absolute block index of `loops[k]` when `index` counts the loops' blocks row-major."""
     stride = int(np.prod([lb.count for lb in loops[k + 1 :]], dtype=np.int64))
-    idx = _div_src(index, stride)
+    idx = div_src(index, stride, div)
     if k:
-        idx = _rem_src(idx, loops[k].count)
+        idx = rem_src(idx, loops[k].count, rem)
     base = loops[k].start // loops[k].step
     return f"({idx} + {base})" if base else idx
+
+
+# --------------------------------------------------------------------------- values as source
+
+
+def _globals_read(src: str) -> set[str]:
+    """The module-level names the code `src` reads and doesn't define itself."""
+    top = symtable.symtable(src, "<autokernel>", "exec")
+    defined = {s.get_name() for s in top.get_symbols() if s.is_assigned() or s.is_imported() or s.is_namespace()}
+    found: set[str] = set()
+
+    def visit(table: symtable.SymbolTable) -> None:
+        for sym in table.get_symbols():
+            if sym.is_referenced() and (table is top or sym.is_global()):
+                found.add(sym.get_name())
+        for child in table.get_children():
+            visit(child)
+
+    visit(top)
+    return found - defined
+
+
+def _array_src(value: np.ndarray) -> str:
+    items = repr(value.tolist())
+    if np.issubdtype(value.dtype, np.floating) and not np.isfinite(value).all():
+        items = items.replace("nan", "float('nan')").replace("inf", "float('inf')")
+    out = f"np.array({items}, {_dtype_src(value.dtype)})"
+    return out if value.size else f"{out}.reshape({value.shape})"
+
+
+def _literal(value: Any) -> str | None:
+    """`value` as a Python expression over the generated code's imports, or None if it has none."""
+    if value is None or isinstance(value, (bool, int, str, bytes)):
+        return repr(value)
+    if isinstance(value, float):
+        return _scalar_src(value)
+    if isinstance(value, (tuple, list, set, frozenset)):
+        items = [_literal(v) for v in value]
+        if None in items:
+            return None
+        if isinstance(value, tuple):
+            return f"({items[0]},)" if len(items) == 1 else f"({', '.join(items)})"
+        text = ", ".join(items)
+        return f"[{text}]" if isinstance(value, list) else f"{type(value).__name__}([{text}])"
+    if isinstance(value, dict):
+        pairs = [(_literal(k), _literal(v)) for k, v in value.items()]
+        if any(k is None or v is None for k, v in pairs):
+            return None
+        return "{" + ", ".join(f"{k}: {v}" for k, v in pairs) + "}"
+    if isinstance(value, slice):
+        return f"slice({_literal(value.start)}, {_literal(value.stop)}, {_literal(value.step)})"
+    if isinstance(value, np.dtype):
+        return f"np.dtype({_dtype_src(value)})"
+    if isinstance(value, np.generic):
+        return f"{_dtype_src(value.dtype)}({_literal(value.item())})"
+    if isinstance(value, np.ndarray):
+        return _array_src(value)
+    if isinstance(value, jax.Array) and not isinstance(value, jax.core.Tracer):
+        return f"jnp.asarray({_array_src(np.asarray(value))})"
+    if isinstance(value, pl.CostEstimate):
+        fields = ["flops", "transcendentals", "bytes_accessed"]
+        fields += ["remote_bytes_transferred"] if value.remote_bytes_transferred else []
+        return f"pl.CostEstimate({', '.join(f'{f}={getattr(value, f)!r}' for f in fields)})"
+    return None
+
+
+def _import(name: str, value: Any) -> str | None:
+    """An import binding `name` to `value` (a module, or something a module defines by that name), if any."""
+    if isinstance(value, types.ModuleType):
+        if "." in value.__name__:
+            parent, attr = value.__name__.rsplit(".", 1)
+            return f"from {parent} import {attr}" + (f" as {name}" if attr != name else "")
+        return f"import {value.__name__}" + (f" as {name}" if value.__name__ != name else "")
+    attr = getattr(value, "__name__", None)
+    if not isinstance(attr, str) or not attr.isidentifier():
+        return None
+    # The public module that has it when one of the generated code's does (`jnp.maximum`, not jax._src...).
+    module = getattr(value, "__module__", None)
+    homes = [m.__name__ for m in MODULES.values()] + ["jax.nn", "math"]
+    for home in [*homes, *([module] if isinstance(module, str) and module != "__main__" else [])]:
+        try:
+            found = getattr(importlib.import_module(home), attr, None)
+        except ImportError:
+            continue
+        if found is value:
+            return f"from {home} import {attr}" + (f" as {name}" if attr != name else "")
+    return None
+
+
+def _function_source(name: str, value: Any) -> tuple[str, dict[str, Any]] | None:
+    """A Python function with source of its own and no closure, as source; with the globals it reads."""
+    fn = inspect.unwrap(value)
+    if not isinstance(fn, types.FunctionType) or fn.__code__.co_freevars or fn.__name__ == "<lambda>":
+        return None
+    try:
+        src = textwrap.dedent(inspect.getsource(value))
+    except (OSError, TypeError):
+        return None
+    tree = ast.parse(src)
+    if len(tree.body) != 1 or not isinstance(tree.body[0], ast.FunctionDef) or tree.body[0].name != fn.__name__:
+        return None
+
+    def names(code: types.CodeType) -> set[str]:
+        out = set(code.co_names)
+        for c in code.co_consts:
+            if isinstance(c, types.CodeType):
+                out |= names(c)
+        return out
+
+    deps = {n: fn.__globals__[n] for n in sorted(names(fn.__code__)) if n in fn.__globals__ and not n.startswith("__")}
+    alias = [f"{name} = {fn.__name__}"] if name != fn.__name__ else []
+    return "\n".join([src.rstrip(), *alias]), deps
 
 
 class Emitter:
@@ -232,12 +355,26 @@ class Emitter:
         self.cores = sched.cores
         # One unmasked reduction (or none): every step belongs to phase 0 and none is empty.
         self.trivial = sched.mode == "uniform" and self.P <= 1
-        self.used_names: set[str] = set()  # names the rewritten user code reads
+        self.used_names: set[str] = set()  # names the user's code (tile code, masks, allocations) reads
         self.weak: str | None = None  # the weak-type helper's name, once something needs it
         self._param_names: dict[str, str] | None = None
         self._tables_local: str | None = None
+        self._fresh: dict[str, str] = {}  # generated identifiers, by what they'd be called without the user's
+        self.arrays: dict[str, np.ndarray] = {}  # constant arrays the runtime tables are built from
         self._names(fills, aliased)
         self._tables()
+
+    def _n(self, base: str) -> str:
+        """The identifier generated code uses for `base`: `base`, unless that is one of the user's names."""
+        if base not in self._fresh:
+            self._fresh[base] = self.names.fresh(base)
+        return self._fresh[base]
+
+    def _div_src(self, x: str, n: int) -> str:
+        return div_src(x, n, self._n("_div"))
+
+    def _rem_src(self, x: str, n: int) -> str:
+        return rem_src(x, n, self._n("_rem"))
 
     def _names(self, fills: Sequence[str], aliased: Sequence[str]) -> None:
         """Identifiers the generated code binds where the user's code can see them."""
@@ -331,12 +468,14 @@ class Emitter:
         if var in self.tile_tables:
             return f"{self.tile_tables[var]}[{o}]"
         t = f"{self.step_tables['tile_ids']}[{o}]" if self.spec.tile_mask_runtime else o
-        return _radix(t, self.spec.parallel, [lb.var for lb in self.spec.parallel].index(var))
+        k = [lb.var for lb in self.spec.parallel].index(var)
+        return _radix(t, self.spec.parallel, k, self._n("_div"), self._n("_rem"))
 
     def _reduction_block(self, var: str, d: str) -> str:
         """Absolute block index of reduction loop `var` at flattened phase position `d`."""
         phase = next(p for p in self.spec.phases if any(lb.var == var for lb in p.loops))
-        return _radix(d, phase.loops, [lb.var for lb in phase.loops].index(var))
+        k = [lb.var for lb in phase.loops].index(var)
+        return _radix(d, phase.loops, k, self._n("_div"), self._n("_rem"))
 
     def _blocks(self) -> list[str]:
         """`_blocks(o, d)`: the block index of every tile loop, for the copies and the loop values."""
@@ -347,7 +486,7 @@ class Emitter:
             for lb in phase.loops:
                 body.append(f"{self.blk[lb.var]} = {self._reduction_block(lb.var, 'd')}")
         body.append(f"return {self._blocks_tuple(self.blk)}")
-        return _fn("_blocks", "o, d", body)
+        return _fn(self._n("_blocks"), "o, d", body)
 
     def _blocks_tuple(self, names: dict[str, str]) -> str:
         items = [names.get(var, "_") for var in self.spec.loops]
@@ -390,7 +529,7 @@ class Emitter:
     def _weak(self) -> str:
         """The prelude helper giving a value a Python scalar's weak type (`bf16_tile * i` stays bf16)."""
         if self.weak is None:
-            self.weak = self.names.fresh("_weak")
+            self.weak = self._n("_weak")
         return self.weak
 
     # ------------------------------------------------------------------ step decoding
@@ -400,7 +539,7 @@ class Emitter:
         sched = self.sched
         if sched.mode == "uniform":
             per = sched.steps_per_tile
-            body = [f"o = {_div_src('s', per)}", _split_src("d", "s", "o", per)]
+            body = [f"o = {self._div_src('s', per)}", _split_src("d", "s", "o", per, self._n("_rem"))]
             if self.P <= 1:
                 body += ["first = d == 0", f"last = d == {per - 1}", "return o, 0, d, first, last, False"]
             else:
@@ -409,12 +548,12 @@ class Emitter:
                 body += [f"d = d - {_by_phase(offsets[:-1])}", "first = d == 0"]
                 body.append(f"last = d == {_by_phase([k - 1 for k in sched.phase_steps])}")
                 body.append("return o, ph, d, first, last, False")
-            return _fn("_decode", "s", body)
+            return _fn(self._n("_decode"), "s", body)
         t = self.step_tables
         if sched.mode == "table":
             ps, pt = sched.pattern_steps, sched.pattern_tiles
             if sched.steps != ps:
-                body = [f"rep = {_div_src('s', ps)}", _split_src("r", "s", "rep", ps)]
+                body = [f"rep = {self._div_src('s', ps)}", _split_src("r", "s", "rep", ps, self._n("_rem"))]
                 body.append(f"o = rep * {pt} + {t['step_tile']}[r]")
             else:
                 body = ["r = s", f"o = {t['step_tile']}[r]"]
@@ -431,7 +570,7 @@ class Emitter:
             body.append(f"d = c - {_by_phase(offsets)}")
             body.append(f"empty = d == {_by_phase(sched.phase_steps)}")
             body.append("return o, ph, d, first, last, empty")
-        return _fn("_decode", "s", body)
+        return _fn(self._n("_decode"), "s", body)
 
     def _bounds(self) -> list[str]:
         """This core's [begin, end) steps and tile ordinals."""
@@ -470,7 +609,13 @@ class Emitter:
     # ------------------------------------------------------------------ copies
 
     def _copy_fn(self, op: Operand) -> str:
-        return f"_{op.ref}_copy"
+        return self._n(f"_{op.ref}_copy")
+
+    def _out_copy_fn(self, out: Any) -> str:
+        return self._n(f"_{out.ref}_copy")
+
+    def _fill_copy_fn(self, var: str) -> str:
+        return self._n(f"_{var}_fill_copy")
 
     def _window(self, op: Operand) -> str:
         """The window of a view's base array that the view's tile `op` is (see `views`)."""
@@ -483,7 +628,7 @@ class Emitter:
                 starts.append((None, 0, c * size))
             else:
                 starts.append((self.blk[var], size, 0))
-        return ", ".join(op.window.render(starts))
+        return ", ".join(op.window.render(starts, self._n("_div"), self._n("_rem")))
 
     def _copies(self, ops: Sequence[Operand] | None = None, outputs: bool = True) -> list[str]:
         """The copy functions of `ops` (default: every input) and, with `outputs`, of the outputs and fills."""
@@ -508,12 +653,12 @@ class Emitter:
                 f"dst = {dst}  # {out.var}[{out.block.text}]",
                 f"return pltpu.make_async_copy({src})",
             ]
-            lines += [*_fn(f"_{out.ref}_copy", "blocks, slot", body), ""]
+            lines += [*_fn(self._out_copy_fn(out), "blocks, slot", body), ""]
             if out.var in self.fills:
                 fill = self.fills[out.var]
                 dst = f"{self.out_hbm[out.var]}.at[{self._slices(out.block, {}, fill='c')}]"
-                body = [f"dst = {dst}", f"return pltpu.make_async_copy({fill}, dst, {fill}_sem)"]
-                lines += [*_fn(f"_{out.var}_fill_copy", "c", body), ""]
+                body = [f"dst = {dst}", f"return pltpu.make_async_copy({fill}, dst, {self._n(f'{fill}_sem')})"]
+                lines += [*_fn(self._fill_copy_fn(out.var), "c", body), ""]
         return lines
 
     # ------------------------------------------------------------------ user code -> kernel code
@@ -524,6 +669,7 @@ class Emitter:
         spec, params, state = self.spec, self.nest.params, self.spec.state
         phase = unit.phase if unit is not None else None
         weak = self._weak
+        calls = {call: self._n(name) for name, call in mxu.CALLS.items()}  # `@` -> this kernel's MXU helpers
 
         class Rewriter(ast.NodeTransformer):
             def visit_Subscript(self, n: ast.Subscript) -> ast.AST:
@@ -533,6 +679,8 @@ class Emitter:
                 return self.generic_visit(n)
 
             def visit_Name(self, n: ast.Name) -> ast.AST:
+                if n.id in calls:
+                    return ast.copy_location(ast.Name(calls[n.id], n.ctx), n)
                 if n.id not in state:
                     return n
                 sv = state[n.id]
@@ -584,9 +732,11 @@ class Emitter:
     def _accumulate(self, acc: Any, original: ast.stmt, unit: Unit) -> list[str]:
         """`var += expr` on a zero-initialised accumulator in a tile of one step: just `var = expr`."""
         aval = self.spec.avals[id(original)]
-        # `zeros + expr` has the sum's type and shape (`expr` may broadcast, like a (rows, 1) column).
+        # `zeros + expr` has the sum's type and shape (`expr` may broadcast, like a (rows, 1) column), and is
+        # weakly typed when both are (`acc = 0.0; acc += 0.1 * i` holds a Python float).
         value = f"jnp.asarray({ast.unparse(self._rewrite(acc.expr, unit))}, {_dtype_src(aval.dtype)})"
-        return [f"{acc.var} = jnp.broadcast_to({value}, {tuple(aval.shape)})"]
+        value = f"jnp.broadcast_to({value}, {tuple(aval.shape)})"
+        return [f"{acc.var} = {self._weak()}({value})" if aval.weak_type else f"{acc.var} = {value}"]
 
     def _stores(self) -> list[str]:
         v, lines = self.v, []
@@ -595,7 +745,7 @@ class Emitter:
             value = f"jnp.asarray({ast.unparse(self._rewrite(store.value, None))}).astype({out.ref}.dtype)"
             if out.var in self.spec.broadcast_stores:  # `.at[...].set(v)` broadcasts v to the tile
                 value = f"jnp.broadcast_to({value}, {out.ref}.shape)"
-            copy_fn = f"_{out.ref}_copy"
+            copy_fn = self._out_copy_fn(out)
             lines += [
                 f"{out.ref} = {self.out_slots[out.var]}.at[{v['o']} & 1]",
                 f"{out.ref}[...] = {value}",
@@ -610,9 +760,11 @@ class Emitter:
         nothing across, so a value computed before it and stored after it (the tile's matmul) would be parked
         in VMEM and read back (on a v5e, 2% of a matmul).
         """
-        v = self.v
-        waits = [f"_{out.ref}_copy(_blocks({v['o']} - 2, 0), {v['o']} & 1).wait()" for out in self.spec.outputs]
-        return _fn("_free_output_slots", "", waits, when=f"{v['o']} - 2 >= {v['o_begin']}")
+        v, blocks = self.v, self._n("_blocks")
+        waits = [
+            f"{self._out_copy_fn(out)}({blocks}({v['o']} - 2, 0), {v['o']} & 1).wait()" for out in self.spec.outputs
+        ]
+        return _fn(self._n("_free_output_slots"), "", waits, when=f"{v['o']} - 2 >= {v['o_begin']}")
 
     def _units(self) -> list[str]:
         """The user's code for one step, guarded by the step's phase and flags."""
@@ -626,14 +778,14 @@ class Emitter:
             return free + fill_issue + final
         if self.spec.single_step:  # the tile's one step: its code in order, values as plain locals
             return free + fill_issue + self._statements(segments[0]) + self._statements(bodies[0]) + final
-        lines = _block("_last_step", free, self._flag_test(P - 1, v["ph"], v["last"]))
+        lines = _block(self._n("_last_step"), free, self._flag_test(P - 1, v["ph"], v["last"]))
         for p in range(P):
             lead = (fill_issue if p == 0 else []) + self._statements(segments[p])
             if lead:
-                lines += _fn(f"_segment_{p}", "", lead, when=self._flag_test(p, v["ph"], v["first"]))
+                lines += _fn(self._n(f"_segment_{p}"), "", lead, when=self._flag_test(p, v["ph"], v["first"]))
             body = self._statements(bodies[p])
-            lines += _block(f"_body_{p}", body, self._phase_test(p, v["ph"], v["empty"]))
-        return lines + _fn("_finish_tile", "", final, when=self._flag_test(P - 1, v["ph"], v["last"]))
+            lines += _block(self._n(f"_body_{p}"), body, self._phase_test(p, v["ph"], v["empty"]))
+        return lines + _fn(self._n("_finish_tile"), "", final, when=self._flag_test(P - 1, v["ph"], v["last"]))
 
     # ------------------------------------------------------------------ masked-out tiles
 
@@ -641,15 +793,15 @@ class Emitter:
         v, lines = self.v, []
         for var in self.fills:
             limit = _fn(
-                "_limit_in_flight",
+                self._n("_limit_in_flight"),
                 "",
-                [f"_{var}_fill_copy(0).wait()"],
+                [f"{self._fill_copy_fn(var)}(0).wait()"],
                 when=f"c - {self.fill_start}[{v['o_begin']}] >= {FILL_DMA_DEPTH}",
             )
             lines += _fn(
-                f"_start_{var}_fills",
+                self._n(f"_start_{var}_fills"),
                 "c",
-                [*limit, f"_{var}_fill_copy(c).start()"],
+                [*limit, f"{self._fill_copy_fn(var)}(c).start()"],
                 loop=f"{self.fill_start}[{v['o']}], {self.fill_start}[{v['o']} + 1]",
             )
         return lines
@@ -659,9 +811,9 @@ class Emitter:
         for var in self.fills:
             issued = f"{self.fill_start}[{v['o_end']}] - {self.fill_start}[{v['o_begin']}]"
             lines += _fn(
-                f"_drain_{var}_fills",
+                self._n(f"_drain_{var}_fills"),
                 "_",
-                [f"_{var}_fill_copy(0).wait()"],
+                [f"{self._fill_copy_fn(var)}(0).wait()"],
                 loop=f"0, jnp.minimum({issued}, {FILL_DMA_DEPTH})",
             )
         return lines
@@ -673,39 +825,39 @@ class Emitter:
 
     def _fetch_ahead(self, step: str, name: str, ops: Sequence[Operand] | None = None) -> list[str]:
         """Start copying step `step`'s streamed inputs (or just `ops`) into their ring slots."""
-        slot = _rem_src(f"({step})", self.buffers)
-        body = [f"o2, ph2, d2, _, _, empty2 = _decode({step})", "blocks2 = _blocks(o2, d2)"]
+        slot = self._rem_src(f"({step})", self.buffers)
+        body = [f"o2, ph2, d2, _, _, empty2 = {self._n('_decode')}({step})", f"blocks2 = {self._n('_blocks')}(o2, d2)"]
         for p, phase_ops in self._by_phase_ops(self.streamed if ops is None else ops):
             starts = [f"{self._copy_fn(op)}(blocks2, {slot}).start()" for op in phase_ops]
-            body += _block(f"_fetch_phase_{p}", starts, self._phase_test(p, "ph2", "empty2"))
-        return _fn(name, "", body, when=f"{step} < {self.v['s_end']}")
+            body += _block(self._n(f"_fetch_phase_{p}"), starts, self._phase_test(p, "ph2", "empty2"))
+        return _fn(self._n(name), "", body, when=f"{step} < {self.v['s_end']}")
 
     def _step(self, hook: bool = False) -> list[str]:
-        v, N = self.v, self.buffers
-        slot = _rem_src(v["s"], N)
+        v, N, blocks = self.v, self.buffers, self._n("_blocks")
+        slot = self._rem_src(v["s"], N)
         lines = [
-            f"{v['o']}, {v['ph']}, {v['d']}, {v['first']}, {v['last']}, {v['empty']} = _decode({v['s']})",
-            f"{v['blocks']} = _blocks({v['o']}, {v['d']})",
+            f"{v['o']}, {v['ph']}, {v['d']}, {v['first']}, {v['last']}, {v['empty']} = {self._n('_decode')}({v['s']})",
+            f"{v['blocks']} = {blocks}({v['o']}, {v['d']})",
         ]
         if hook:  # once this nest's own copies are all issued: start the next nest's first copies
             hook_at, call = self.pieces["hook_at"], f"{self.pieces['hook']}()"
-            lines += _fn("_start_next_nest", "", [call], when=f"{v['s']} == {hook_at}")
+            lines += _fn(self._n("_start_next_nest"), "", [call], when=f"{v['s']} == {hook_at}")
         if self.streamed:  # 1. prefetch the step N - 1 ahead
             lines += self._fetch_ahead(f"{v['s']} + {N - 1}", "_prefetch")
         if self.per_tile:  # 2. per-tile inputs, at a tile's first step
             next_tile = [
-                f"{self._copy_fn(op)}(_blocks({v['o']} + 1, 0), ({v['o']} + 1) & 1).start()" for op in self.per_tile
+                f"{self._copy_fn(op)}({blocks}({v['o']} + 1, 0), ({v['o']} + 1) & 1).start()" for op in self.per_tile
             ]
             body = [
-                *_fn("_next_tile_inputs", "", next_tile, when=f"{v['o']} + 1 < {v['o_end']}"),
+                *_fn(self._n("_next_tile_inputs"), "", next_tile, when=f"{v['o']} + 1 < {v['o_end']}"),
                 *[f"{self._copy_fn(op)}({v['blocks']}, {v['o']} & 1).wait()" for op in self.per_tile],
             ]
             # A tile of one step is always at its first step: no test (Mosaic schedules unguarded waits better).
             guard = self._flag_test(0, v["ph"], v["first"]) if self.P and not self.spec.single_step else None
-            lines += _block("_tile_inputs", body, guard)
+            lines += _block(self._n("_tile_inputs"), body, guard)
         for p, ops in self._by_phase_ops(self.streamed):  # 3. this step's inputs
             waits = [f"{self._copy_fn(op)}({v['blocks']}, {slot}).wait()" for op in ops]
-            lines += _block(f"_wait_phase_{p}", waits, self._phase_test(p, v["ph"], v["empty"]))
+            lines += _block(self._n(f"_wait_phase_{p}"), waits, self._phase_test(p, v["ph"], v["empty"]))
         lines += [f"{op.ref} = {self.slots[op.ref]}.at[{slot}]" for op in self.streamed]
         lines += [f"{op.ref} = {self.slots[op.ref]}.at[{v['o']} & 1]" for op in self.per_tile]
         units = self._units()  # 4. the user's code
@@ -738,13 +890,13 @@ class Emitter:
         for n, (p, weak) in enumerate(self.float_scalars):
             value = f"{self.fscalars_ref}[{n}]"
             lines.append(f"{p} = {self._weak()}({value})" if weak else f"{p} = {value}")
-        lines += [f"{name} = _index({expr}, {size})" for (expr, size), name in self.indices.items()]
+        lines += [f"{name} = {self._n('_index')}({expr}, {size})" for (expr, size), name in self.indices.items()]
         return lines
 
     def _setup(self) -> list[str]:
         """The kernel's definitions: this core's bounds, the runtime scalars, step decoding and copies."""
-        reads = self._scalar_reads()
-        lines = [*self._bounds(), *(["", *reads] if reads else []), ""]
+        scalar_reads = self._scalar_reads()
+        lines = [*self._bounds(), *(["", *scalar_reads] if scalar_reads else []), ""]
         return [*lines, *self._decode(), "", *self._blocks(), "", *self._copies()]
 
     def _fill_init(self) -> list[str]:
@@ -766,8 +918,9 @@ class Emitter:
         per_tile = [op for op in self.per_tile if wanted(op)]
         streamed = [op for op in self.streamed if wanted(op)]
         if per_tile:
-            first = [f"{self._copy_fn(op)}(_blocks({v['o_begin']}, 0), {v['o_begin']} & 1).start()" for op in per_tile]
-            lines += _fn("_first_tile_inputs", "", first, when=f"{v['o_begin']} < {v['o_end']}")
+            blocks = self._n("_blocks")
+            first = [f"{self._copy_fn(op)}({blocks}({v['o_begin']}, 0), {v['o_begin']} & 1).start()" for op in per_tile]
+            lines += _fn(self._n("_first_tile_inputs"), "", first, when=f"{v['o_begin']} < {v['o_end']}")
         if streamed:
             for k in range(N - 1):
                 lines += self._fetch_ahead(f"{v['s_begin']} + {k}", f"_prefetch_{k}", streamed)
@@ -783,17 +936,19 @@ class Emitter:
             at = f"{v['s_end']} - {N - 1}, {v['s_begin']}"
             at = f"jnp.maximum({at})" if traced else f"max({at})"
             lines.append(f"{self.pieces['hook_at']} = {at}")
-        lines += _fn("_steps", v["s"], self._step(hook), loop=f"{v['s_begin']}, {v['s_end']}")
+        lines += _fn(self._n("_steps"), v["s"], self._step(hook), loop=f"{v['s_begin']}, {v['s_end']}")
         if hook and traced:  # no steps at all (on this core): the loop never started the next nest
-            lines += _fn("_no_steps", "", [f"{self.pieces['hook']}()"], when=f"{v['s_end']} <= {v['s_begin']}")
+            no_steps = [f"{self.pieces['hook']}()"]
+            lines += _fn(self._n("_no_steps"), "", no_steps, when=f"{v['s_end']} <= {v['s_begin']}")
         return lines
 
     def _drain(self) -> list[str]:
-        v, lines = self.v, []
+        v, lines, blocks = self.v, [], self._n("_blocks")
         for out in self.spec.outputs:
             for back in (2, 1):
-                wait = [f"_{out.ref}_copy(_blocks({v['o_end']} - {back}, 0), ({v['o_end']} - {back}) & 1).wait()"]
-                lines += _fn(f"_drain_{out.ref}_{back}", "", wait, when=f"{v['o_end']} - {back} >= {v['o_begin']}")
+                at = f"{v['o_end']} - {back}"
+                wait = [f"{self._out_copy_fn(out)}({blocks}({at}, 0), ({at}) & 1).wait()"]
+                lines += _fn(self._n(f"_drain_{out.ref}_{back}"), "", wait, when=f"{at} >= {v['o_begin']}")
         return lines + self._fill_drain()
 
     def _kernel(self, name: str) -> list[str]:
@@ -819,9 +974,9 @@ class Emitter:
         groups = self._arg_groups()
         early_scratch, late_scratch = (names for names, _ in self.scratch_groups())
         args = [*groups["smem"], *groups["hbm"], *groups["aliased"], *groups["outputs"], *early_scratch]
-        reads = self._scalar_reads()
-        body = [*self._bounds(), *(["", *reads] if reads else []), "", *self._decode(), "", *self._blocks(), ""]
-        body += self._copies(early_ops, outputs=False)
+        scalar_reads = self._scalar_reads()
+        body = [*self._bounds(), *(["", *scalar_reads] if scalar_reads else []), ""]
+        body += [*self._decode(), "", *self._blocks(), "", *self._copies(early_ops, outputs=False)]
         body += _fn(p["early"], "", [*self._fill_init(), *self._first_fetches(False)])
         inner = [*self._copies(late_ops, outputs=True)]
         inner += _fn(p["late"], "", self._first_fetches(True))
@@ -829,7 +984,8 @@ class Emitter:
         inner.append(f"return {p['late']}, {p['run']}, {p['drain']}")
         body += _fn(p["with_scratch"], ", ".join(late_scratch), inner)
         body.append(f"return {p['early']}, {p['with_scratch']}")
-        return [f"def {name}({', '.join(args)}):", *_indent(body)]
+        self._check_modules()
+        return self._contained(name, ", ".join(args), [*self._kernel_helpers(), "", *body])
 
     def scratch_groups(self) -> tuple[tuple[list[str], list[str]], tuple[list[str], list[str]]]:
         """A fused part's scratch as ((names, shapes) early, (names, shapes) late): the early scratch is what
@@ -876,7 +1032,7 @@ class Emitter:
                     f"pltpu.VMEM({o.block.kernel_shape}, {_dtype_src(o.out.dtype)}),  # {o.var}'s skipped tiles",
                     "pltpu.SemaphoreType.DMA(()),",
                 ]
-                out.append(([fill, f"{fill}_sem"], lines, True))
+                out.append(([fill, self._n(f"{fill}_sem")], lines, True))
         return out
 
     def _scratch(self) -> list[str]:
@@ -884,8 +1040,8 @@ class Emitter:
 
     def _params(self) -> dict[str, str]:
         """The wrapper's parameters: the kernel's, renamed where they would hide a name the wrapper uses."""
-        if self._param_names is None:
-            reserved = {"interpret", "jax", "jnp", "np", "pl", "pltpu", "_COST", "_runtime_tables", "_index"}
+        if self._param_names is None:  # (every other name the wrapper uses is fresh)
+            reserved = {"interpret", *MODULES}
             self._param_names = {p: self.names.fresh(f"{p}_arg") if p in reserved else p for p in self.nest.params}
         return self._param_names
 
@@ -898,7 +1054,8 @@ class Emitter:
                 self._tables_local = self.names.fresh("tables")
             tables = self._tables_local
             lines.append("# A mask reads inputs, so the steps are listed on device.")
-            lines.append(f"{tables} = _runtime_tables({', '.join(f'{p}={a}' for p, a in param.items())})")
+            inputs = ", ".join(f"{p}={a}" for p, a in param.items())
+            lines.append(f"{tables} = {self._n('_runtime_tables')}({inputs})")
             smem += [f"{tables}[{k!r}]" for k in RUNTIME_TABLES]
         if self.scalars_ref:
             values = ", ".join(f"jnp.asarray({param[p]}, jnp.int32)" for p in self.int_scalars)
@@ -914,7 +1071,9 @@ class Emitter:
                 return ast.copy_location(ast.Name(param.get(n.id, n.id), n.ctx), n)
 
         for var, init in self.aliased.items():
-            alloc = Renamed().visit(copy.deepcopy(next(o.alloc for o in spec.outputs if o.var == var)))
+            alloc = next(o.alloc for o in spec.outputs if o.var == var)
+            self.used_names |= reads(alloc)
+            alloc = Renamed().visit(copy.deepcopy(alloc))
             lines.append(f"{init} = {ast.unparse(alloc)}  # skipped tiles keep these values")
             inits.append(init)
         return lines, smem, inits
@@ -930,7 +1089,7 @@ class Emitter:
 
         param = self._params()
         lines = [f"def {nest.fn_name}_pallas({', '.join(param.values())}, *, interpret=False):"]
-        lines.append(f"    # No grid: one loop over {self._describe()}; inputs {self.buffers}-buffered by hand.")
+        lines.append(f"    # No grid: one loop over {self._describe()}{self._buffering()}.")
         lines += _indent(prep)
         args = [*smem_args, *[param[p] for p in self.hbm], *inits]
         aliases = {len(args) - len(inits) + n: nest.out_vars.index(var) for n, var in enumerate(self.aliased)}
@@ -949,7 +1108,7 @@ class Emitter:
             "        ],",
             *([f"        input_output_aliases={aliases},"] if aliases else []),
             f"        compiler_params=pltpu.CompilerParams({', '.join(params)}),",
-            *(["        cost_estimate=_COST,"] if self.cost is not None else []),
+            *([f"        cost_estimate={self._n('_COST')},"] if self.cost is not None else []),
             "        interpret=interpret,",
             f"        name={nest.fn_name!r},",
             f"    )({', '.join(args)})",
@@ -963,8 +1122,8 @@ class Emitter:
         aliased allocations don't read them.
         """
         prep, smem, inits = self._wrapper_inputs()
-        body = [*prep, f"return [{', '.join(smem)}], [{', '.join(inits)}]"]
-        return _fn(name, ", ".join(self._params().values()), body)
+        body = [*self._wrapper_helpers(), *prep, f"return [{', '.join(smem)}], [{', '.join(inits)}]"]
+        return self._contained(name, ", ".join(self._params().values()), body)
 
     def scratch(self) -> list[str]:
         return self._scratch()
@@ -974,6 +1133,15 @@ class Emitter:
 
     def describe(self) -> str:
         return self._describe()
+
+    def _buffering(self) -> str:
+        """How the wrapper comment describes the inputs' VMEM slots."""
+        streamed, per_tile = f"{self.buffers}-buffered", "fetched once per tile, 2-buffered"
+        if self.streamed and self.per_tile:
+            return f"; streamed inputs {streamed}, others {per_tile}, by hand"
+        if self.streamed or self.per_tile:
+            return f"; inputs {streamed if self.streamed else per_tile} by hand"
+        return ""
 
     def _describe(self) -> str:
         sched, spec = self.sched, self.spec
@@ -997,31 +1165,201 @@ class Emitter:
         return header
 
     def weak_helper(self) -> str:
-        """The weak-type helper's source, when the generated code uses it (after it is generated)."""
-        return _WEAK.format(name=self.weak) if self.weak is not None else ""
+        """Module-level helpers a fused part needs besides its own source: none, since `part` and `prepare`
+        define everything they use inside themselves."""
+        return ""
+
+    def _kernel_helpers(self) -> list[str]:
+        """The helpers the kernel's code calls (once that code is generated): index arithmetic, `@`, runtime
+        indices and weak types."""
+        names = {k: self._n(k) for k in ("_div", "_rem", "_index", *mxu.HELPERS)}
+        parts = [_PRELUDE.format(**names), mxu.prelude(self.precision, names)]
+        parts += [_SCALAR_PRELUDE.format(**names)] if self.indices else []
+        parts += [_WEAK.format(name=self.weak)] if self.weak is not None else []
+        return "\n\n".join(parts).splitlines()
+
+    def _wrapper_helpers(self) -> list[str]:
+        """The functions the wrapper calls to build runtime step tables, if it has any."""
+        if self.sched.mode != "runtime":
+            return []
+        return [*self._step_table_functions(), "", "", *self._runtime_tables()]
+
+    def _step_table_functions(self) -> list[str]:
+        """`schedule.step_tables` and the functions it calls, as source (under fresh names)."""
+        fns = (schedule_lib.step_tables, schedule_lib.column_mask, schedule_lib.build_tables, schedule_lib.core_bounds)
+        renamed = {f.__name__: self._n(f"_{f.__name__}") for f in fns}
+        consts = {"FIRST": FIRST, "LAST": LAST, "COLUMN_SHIFT": COLUMN_SHIFT}
+
+        class Rename(ast.NodeTransformer):
+            def visit_FunctionDef(self, n: ast.FunctionDef) -> ast.AST:
+                self.generic_visit(n)
+                n.name = renamed.get(n.name, n.name)
+                return n
+
+            def visit_Name(self, n: ast.Name) -> ast.AST:
+                if n.id in consts:
+                    return ast.copy_location(ast.Constant(consts[n.id]), n)
+                return ast.copy_location(ast.Name(renamed.get(n.id, n.id), n.ctx), n)
+
+        lines = ["# The step tables of masks that read inputs, built on device (from autokernel.schedule)."]
+        for f in fns:
+            tree = Rename().visit(ast.parse(textwrap.dedent(inspect.getsource(f))))
+            lines += [*ast.unparse(tree).splitlines(), "", ""]
+        return lines[:-2]
+
+    def _array(self, base: str, value: Any) -> str:
+        """A constant array the generated code reads, by name."""
+        name = self._n(base)
+        self.arrays[name] = np.asarray(value)
+        return name
+
+    def _runtime_tables(self) -> list[str]:
+        """`_runtime_tables(*inputs)`: the step tables of masks that read inputs (`schedule.runtime_tables`)."""
+        spec, sched, xp = self.spec, self.sched, self._n("xp")
+        body = [
+            "# Each mask that reads inputs runs on device, once per combination of the loop values it reads (as",
+            "# jax.numpy: its Python operators in their array forms), and is spread over the tiles and steps.",
+            f"{xp} = jnp",
+        ]
+        tile_keep = "None"
+        if spec.tile_mask_runtime:
+            tile_keep = self._n("tile_keep")
+            body += self._mask(None, tile_keep, xp)
+        masks = []
+        for p, phase in enumerate(spec.phases):
+            if phase.reduction.guard is None:
+                masks.append("None")
+            elif not spec.phase_runtime[p]:  # a static mask: its value
+                masks.append(f"jnp.asarray({self._array(f'phase{p}_mask', spec.phase_masks[p])})")
+            else:
+                masks.append(self._n(f"keep{p}"))
+                body += self._mask(p, masks[-1], xp)
+        shape = f"{list(sched.phase_steps)}, {len(spec.tiles)}, {self.cores}"  # steps per phase, tiles, cores
+        body.append(f"return {self._n('_step_tables')}({tile_keep}, [{', '.join(masks)}], {shape})")
+        return _fn(self._n("_runtime_tables"), ", ".join(self.nest.params), body)
+
+    def _mask(self, phase: int | None, var: str, xp: str) -> list[str]:
+        """`var = ...`: the tile mask (`phase` None) or a phase's mask, as `analysis.evaluate_mask` computes it."""
+        spec = self.spec
+        cond = spec.nest.guard if phase is None else spec.phases[phase].reduction.guard
+        loops = list(spec.parallel) + (list(spec.phases[phase].loops) if phase is not None else [])
+        used = reads(cond)
+        self.used_names |= used
+        read = [lb for lb in loops if lb.var in used]
+        done = spec.finished_loops(phase) if phase is not None else {}  # earlier phases' loops: their last values
+        args = [lb.var for lb in read] + [f"{k}={v}" for k, v in done.items() if k in used and k not in loops]
+
+        class Xp(ast.NodeTransformer):
+            def visit_Name(self, n: ast.Name) -> ast.AST:
+                return ast.copy_location(ast.Name(xp, n.ctx), n) if n.id == "xp" else n
+
+        value = f"jnp.asarray({ast.unparse(Xp().visit(analysis._vectorize(cond)))})"
+        tag = "tile" if phase is None else f"phase{phase}"
+        steps = spec.phases[phase].steps if phase is not None else None
+        shape = (len(spec.tiles),) if phase is None else (len(spec.tiles), steps)
+        if not read:
+            value = f"(lambda {', '.join(args)}: {value})()" if args else value
+            return [f"{var} = jnp.broadcast_to({value}.astype(bool), {shape})"]
+        grids = [np.arange(lb.start, lb.stop, lb.step, dtype=np.int32) for lb in read]
+        mesh = np.meshgrid(*grids, indexing="ij")
+        coords = [self._array(f"{tag}_{lb.var}_values", m.reshape(-1)) for lb, m in zip(read, mesh, strict=True)]
+        positions = []  # the position of each tile's (and step's) value in each loop the mask reads
+        parallel = [lb.var for lb in spec.parallel]
+        for lb in read:
+            if lb.var in parallel:
+                pos = np.array([t[parallel.index(lb.var)] for t in spec.tiles], np.int32) - lb.start // lb.step
+                pos = pos if phase is None else pos[:, None]
+            else:
+                counts = [b.count for b in spec.phases[phase].loops]
+                k = [b.var for b in spec.phases[phase].loops].index(lb.var)
+                pos = np.unravel_index(np.arange(steps), counts)[k][None, :].astype(np.int32)
+            positions.append(self._array(f"{tag}_{lb.var}_positions", pos))
+        return [
+            f"{var} = jax.vmap(lambda {', '.join(args)}: {value})({', '.join(coords)})",
+            f"{var} = {var}.astype(bool).reshape({tuple(len(g) for g in grids)})",
+            f"{var} = jnp.broadcast_to({var}[{', '.join(positions)}], {shape})",
+        ]
+
+    def _check_modules(self) -> None:
+        """The generated code uses `jnp` & co. for its imports: the user's code can't mean something else."""
+        for name, module in MODULES.items():
+            if name in self.used_names and self.spec.consts.get(name, module) is not module:
+                raise AutoKernelError(
+                    f"{self.nest.fn_name}: the generated kernel uses `{name}` for {module.__name__}, but the loops "
+                    f"read a `{name}` of their own; rename it"
+                )
 
     def namespace(self) -> dict[str, Any]:
-        """What the generated code runs with: the user's constants, the prelude's imports and the tables."""
-        spec = self.spec
-        namespace: dict[str, Any] = dict(spec.consts)
-        namespace.update(jax=jax, jnp=jnp, np=np, pl=pl, pltpu=pltpu, _COST=self.cost)
+        """What the generated code runs with: the user's constants, the imports, the cost estimate and tables."""
+        namespace: dict[str, Any] = dict(self.spec.consts)
+        namespace.update(MODULES)
+        if self.cost is not None:
+            namespace[self._n("_COST")] = self.cost
         namespace.update({self.table_consts[name]: value for name, value in self.tables.items()})
-        if self.sched.mode == "runtime":
-            namespace["_runtime_tables"] = lambda **inputs: schedule_lib.runtime_tables(spec, self.sched, inputs)
+        namespace.update(self.arrays)
         return namespace
+
+    def _constants(self, code: str, functions: bool) -> list[str]:
+        """Source binding the names `code` reads from the namespace: the user's constants (as literals, imports,
+        and with `functions` the source of the functions it calls), the cost estimate and the tables."""
+        namespace = self.namespace()
+        generated = {*self.table_consts.values(), *self.arrays, self._n("_COST")}
+        wanted = sorted((n for n in _globals_read(code) if n in namespace), key=lambda n: (n in generated, n))
+        queue = [(n, namespace[n]) for n in wanted if not n.startswith("__")]
+        imports, values, defs, missing, done = [], [], [], [], {}
+        while queue:
+            name, value = queue.pop(0)
+            if name in done:
+                if done[name] is not value and _literal(done[name]) != _literal(value):
+                    missing.append(f"# `{name}`: two different values (the loops' and a function's they call)")
+                continue
+            done[name] = value
+            if MODULES.get(name) is value:
+                continue
+            if (text := _literal(value)) is not None:
+                values.append(f"{name} = {text}")
+            elif (line := _import(name, value)) is not None:
+                imports.append(line)
+            elif functions and (fn := _function_source(name, value)) is not None:
+                defs += [fn[0], ""]
+                queue += list(fn[1].items())
+            else:
+                missing.append(f"# `{name}` (a {type(value).__name__}) has no source here: define it to run this alone")
+        lines = [*imports, *values, *([""] if defs else []), *defs[:-1], *missing]
+        if not lines:
+            return []
+        what = f"# What the kernel reads from `{self.nest.fn_name}`'s module, and the values it was planned with."
+        return [what, *lines]
+
+    def _contained(self, name: str, args: str, body: list[str]) -> list[str]:
+        """`def name(args): body` with the values it reads bound first, so a fused kernel's source runs alone.
+        Only literals and imports: running the function again (as the fused kernel does) changes nothing."""
+        constants = self._constants("\n".join(_fn(name, args, body)), functions=False)
+        return _fn(name, args, [*constants, *([""] if constants else []), *body])
 
     def emit(self) -> Generated:
         nest = self.nest
-        kernel_name = self.names.fresh(f"{nest.fn_name}_kernel")
+        kernel_name = self._n(f"{nest.fn_name}_kernel")
         kernel = self._kernel(kernel_name)
         wrapper = self._wrapper(kernel_name)
-        helpers = [prelude(self.precision, bool(self.spec.scalars)), self.weak_helper()]
-        source = "\n".join([self.header(), "", "\n\n".join(filter(None, helpers)), "", *kernel, "", "", *wrapper, ""])
+        self._check_modules()
+        helpers = [*self._kernel_helpers(), *(["", "", *w] if (w := self._wrapper_helpers()) else [])]
+        code = "\n".join([*helpers, "", "", *kernel, "", "", *wrapper, ""])
+        constants = self._constants(code, functions=True)
+        head = "\n".join([self.header(), "", _IMPORTS, *constants, *([""] if constants else []), ""])
+        # Run the code after the imports and constants: the namespace holds those, as the user's module does.
         namespace = self.namespace()
-        exec(compile(source, f"<autokernel:{nest.fn_name}>", "exec"), namespace)
-        return Generated(source, namespace[f"{nest.fn_name}_pallas"])
+        exec(compile("\n" * head.count("\n") + code, f"<autokernel:{nest.fn_name}>", "exec"), namespace)
+        return Generated(head + code, namespace[f"{nest.fn_name}_pallas"])
+
+
+def assignments(values: dict[str, Any]) -> list[str]:
+    """`name = <value as source>` for each value (literals, arrays, cost estimates; see `_literal`)."""
+    return [f"{name} = {_literal(value)}" for name, value in values.items()]
 
 
 def prelude(precision: str, scalars: bool) -> str:
-    """The helpers generated kernels use: index arithmetic, runtime scalars (when there are any), `@`."""
-    return "\n\n".join([_PRELUDE, *([_SCALAR_PRELUDE] if scalars else []), mxu.prelude(precision)])
+    """What the source of a fused kernel starts with: the imports (each part defines its own helpers, see
+    `Emitter.part`). `precision` and `scalars` no longer matter."""
+    del precision, scalars
+    return _IMPORTS

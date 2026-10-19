@@ -370,7 +370,7 @@ class TpuKernel:
         ast.increment_lineno(module, ctx.nest.first_line - 1)
         namespace = dict(ctx.env.names)
         namespace.update(overrides)
-        namespace.update(mxu.helpers(self.options.matmul_precision))
+        namespace.update(mxu.reference_helpers())  # `@` as jnp.matmul, independent of the kernel's helpers
         namespace.update(reference_lib.helpers())
         exec(compile(module, ctx.env.filename, "exec"), namespace)
         return namespace[ctx.nest.fn_name]
