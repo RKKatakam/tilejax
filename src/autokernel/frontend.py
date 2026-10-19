@@ -26,6 +26,7 @@ then the elements no tile writes keep the input's values, as they would in Pytho
 from __future__ import annotations
 
 import ast
+import copy
 import inspect
 import textwrap
 from collections.abc import Callable, Iterator
@@ -131,6 +132,9 @@ class LoopNest:
     segments: list[list[ast.stmt]]
     reductions: list[Reduction]
     stores: list[Store]
+    # Reads of a value only masked reduction loops assign: (its name, the statement reading it, the indices of
+    # those reductions). Analysis checks that every tile runs a step of one of them, as Python needs.
+    masked_reads: list[tuple[str, ast.AST, tuple[int, ...]]] = field(default_factory=list)
     # Compiled fragments of the nest, by what they depend on: specialising it for many tile sizes (tuning)
     # reuses them.
     cache: dict[Any, Any] = field(default_factory=dict, repr=False, compare=False)
@@ -198,12 +202,26 @@ def _local_names(fdef: ast.FunctionDef) -> set[str]:
     return stored | {a.arg for a in fdef.args.args}
 
 
+def _inline(value: ast.expr, allocs: dict[str, ast.expr]) -> ast.expr:
+    """An output allocation reading outputs allocated before it (`allocs`), with their allocations in their place:
+    the value they have there, in Python."""
+    value = copy.deepcopy(value)
+    earlier = {id(n) for n in free_loads(value) if n.id in allocs}
+
+    class Inline(ast.NodeTransformer):
+        def visit_Name(self, n: ast.Name) -> ast.AST:
+            return copy.deepcopy(allocs[n.id]) if id(n) in earlier else n
+
+    return Inline().visit(value) if earlier else value
+
+
 class _Parser:
     def __init__(self, fn_name: str, first_line: int, fdef: ast.FunctionDef):
         self.fn_name, self.first_line, self.fdef = fn_name, first_line, fdef
         self.params = [p.arg for p in fdef.args.args]
         self.out_vars: list[str] = []
         self.hoisted_depth: dict[int, int] = {}  # id of a statement between parallel loops -> its loop's depth
+        self.rebinds: dict[str, ast.stmt] = {}  # outputs named like a parameter -> their allocation
 
     def err(self, node: ast.AST | None, msg: str) -> AutoKernelError:
         return _error(self.fn_name, self.first_line, node, msg)
@@ -272,7 +290,8 @@ class _Parser:
         """Split the statements before the loop nest into shape-level constants and output allocations.
 
         Each runs, as in Python, with the names assigned before it; but the kernel evaluates the allocations
-        after the whole prologue, so a name an allocation reads must not change after it.
+        after the whole prologue, each on its own, so a name an allocation reads must not change after it, an
+        output an allocation reads stands for its own allocation, and the rest of the prologue can't read one.
         """
         prologue, allocs = [], {}
         local = _local_names(self.fdef)
@@ -288,17 +307,19 @@ class _Parser:
             if self._is_assign_to(s, self.out_vars):
                 var, value = s.targets[0].id, s.value
                 if var in self.params and not (isinstance(value, ast.Name) and value.id == var):
-                    raise self.err(
-                        s,
-                        f"output `{var}` rebinds parameter `{var}`, which the loop nest would still read as the "
-                        "input; rename the output",
-                    )
-                allocs[var] = value
+                    self.rebinds[var] = s  # fine unless the loop nest reads `var` (`_check_rebinds`)
+                allocs[var] = _inline(value, allocs)
                 read_by.update((name, s) for name in reads(s) if name not in read_by)
                 assigned.add(var)
                 continue
             if not isinstance(s, (ast.Assign, ast.AnnAssign, ast.Assert, ast.Pass)):
                 raise self.err(s, "only simple constant assignments / asserts may precede the loop nest")
+            for name in sorted(reads(s) & set(allocs)):
+                raise self.err(
+                    s,
+                    f"the prologue reads output `{name}` after its allocation; the kernel runs the prologue before "
+                    "the allocations, so compute this from the inputs and constants instead",
+                )
             stored = {t.id for t in ast.walk(s) if isinstance(t, ast.Name) and isinstance(t.ctx, ast.Store)}
             for name in sorted(stored & set(self.params)):
                 raise self.err(s, f"the prologue may not rebind input `{name}`")
@@ -474,13 +495,11 @@ class _Parser:
             for n in ast.walk(node):
                 if isinstance(n, ast.NamedExpr):
                     raise self.err(n, "`:=` isn't supported inside the loop nest; assign in a statement of its own")
-        for node in code:  # the kernel's code renames these names (masks run as the user's Python)
-            for name in sorted(scope_bound(node) & {*self.params, *nest.out_vars, *temporaries}):
-                raise self.err(
-                    node,
-                    f"a comprehension or lambda binds `{name}`, which is also an input, output or value of the "
-                    "loop nest; rename it",
-                )
+        # The kernel reads an input tile wherever the code subscripts the input's name, whatever scope binds it
+        # (analysis checks the same for state variables, which the kernel renames; masks run as Python).
+        for node in code:
+            for name in sorted(scope_bound(node) & set(self.params)):
+                raise self.err(node, f"a comprehension or lambda binds `{name}`, an input of the loop nest; rename it")
         masks = [(nest.guard, nest.guard_node, "tile mask")]
         masks += [(r.guard, r.guard_node, "reduction mask") for r in nest.reductions]
         for cond, node, what in masks:
@@ -491,8 +510,26 @@ class _Parser:
                     raise self.err(
                         node, f"the {what} can only depend on loop variables, constants and inputs, not `{n.id}`"
                     )
+        self._check_rebinds(nest)
         self._check_hoisted(nest)
         self._check_order(nest, temporaries | set(loop_vars))
+
+    def _check_rebinds(self, nest: LoopNest) -> None:
+        """An output named like a parameter (`x = jnp.zeros(...)`) is the output wherever the loop nest names
+        it, in Python; but the kernel would read the input there, so the nest must not read it at all."""
+        if not self.rebinds:
+            return
+        ranges = [e for lp in nest.loops for e in (lp.start, lp.stop, lp.step)]
+        masks = [c for c in [nest.guard, *(r.guard for r in nest.reductions)] if c is not None]
+        stores = [e for st in nest.stores for e in (st.index, st.value)]
+        for node in [*ranges, *masks, *nest.tile_statements(), *stores]:
+            for name in sorted(reads(node) & set(self.rebinds)):
+                line = self.first_line + self.rebinds[name].lineno - 1
+                raise self.err(
+                    node,
+                    f"output `{name}` rebinds parameter `{name}` (line {line}), so `{name}` here is the output in "
+                    "Python, but the kernel would read the input; rename the output",
+                )
 
     def _check_hoisted(self, nest: LoopNest) -> None:
         """Values assigned between parallel loops must not be reassigned further in.
@@ -518,22 +555,20 @@ class _Parser:
         """Every loop variable and temporary the tile reads must be bound earlier in the tile, as in Python.
 
         The kernel can't carry a value in from before the loop nest or from one tile to the next. A
-        reduction loop's variable keeps its last value after the loop, as in Python.
+        reduction loop's variable keeps its last value after the loop, as in Python. A value only masked
+        reduction loops assign is recorded in `nest.masked_reads`: whether a tile may skip all their steps
+        is known once the masks are evaluated.
         """
         defined: set[str] = set()
-        masked: dict[str, ast.stmt] = {}  # a name only a masked reduction loop assigns -> that loop's mask
+        masked: dict[str, list[int]] = {}  # a name only masked reduction loops assign -> their indices
 
         def check(node: ast.AST, names: set[str]) -> None:
             for name in sorted(names & tile_names - defined):
                 if name in {lp.var for lp in nest.loops}:
                     raise self.err(node, f"loop variable `{name}` is read before its loop starts")
                 if name in masked:
-                    line = self.first_line + masked[name].lineno - 1
-                    raise self.err(
-                        node,
-                        f"`{name}` is only assigned under the reduction mask (line {line}), which may skip every "
-                        "step of a tile and leave it unassigned; assign it before that reduction loop too",
-                    )
+                    nest.masked_reads.append((name, node, tuple(masked[name])))
+                    continue
                 raise self.err(
                     node,
                     f"`{name}` is read before it is assigned in the tile; assign it inside the loop nest first "
@@ -549,14 +584,15 @@ class _Parser:
 
         run(nest.segments[0])
         defined.update(lp.var for lp in nest.parallel)
-        for r, seg in zip(nest.reductions, nest.segments[1:], strict=True):
+        for p, (r, seg) in enumerate(zip(nest.reductions, nest.segments[1:], strict=True)):
             defined.update(lp.var for lp in r.loops)
             if r.guard is not None:
                 check(r.guard_node, reads(r.guard))
             before = set(defined)
             run(r.body)
             if r.guard is not None:  # the mask may skip the whole loop: only what was assigned before is sure
-                masked.update((name, r.guard_node) for name in defined - before)
+                for name in defined - before:
+                    masked.setdefault(name, []).append(p)
                 defined.intersection_update(before)
             run(seg)
         for st in nest.stores:

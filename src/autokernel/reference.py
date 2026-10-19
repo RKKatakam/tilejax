@@ -27,8 +27,9 @@ _MISSING = "_autokernel_missing"
 class _Missing:
     """A variable a masked step assigns that had no value before (it stays as the step computes it).
 
-    Only a value the reduction body itself uses can be missing: the frontend rejects reading one after its
-    loop unless it was assigned before the loop too, so a skipped step's value is never observed."""
+    Only a value the reduction body itself uses can be missing: reading one after its loop is rejected
+    unless it was assigned before the loop too (or a static mask runs a step of every tile, which stays a
+    Python `if`), so a skipped step's value is never observed."""
 
 
 def _where(keep: Any, new: Any, old: Any) -> Any:

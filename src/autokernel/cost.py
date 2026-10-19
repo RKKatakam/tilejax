@@ -48,7 +48,7 @@ from jax._src import source_info_util
 from jax.experimental import pallas as pl
 
 from . import mxu
-from .analysis import Specialization, Unit
+from .analysis import Specialization, Unit, kernel_scalar_aval
 from .frontend import assigned_name
 from .hardware import Hardware, nbytes, sublanes, vmem_nbytes
 from .schedule import COLUMN_SHIFT, Schedule
@@ -348,7 +348,7 @@ def _unit_cost(
     avals += [sv.aval for sv in state.values()]
     avals += list(carried.values())
     avals += [jax.ShapeDtypeStruct((), jnp.int32, weak_type=True)] * len(loop_vars)  # as Python ints trace
-    avals += [spec.specs[nest.params.index(p)] for p in spec.scalars]  # as the kernel reads them
+    avals += [kernel_scalar_aval(spec.specs[nest.params.index(p)]) for p in spec.scalars]  # as the kernel holds them
     try:
         jaxpr = jax.make_jaxpr(fn)(*avals).jaxpr
     except Exception:  # can't trace on tile shapes: count nothing rather than fail planning
@@ -425,12 +425,14 @@ class _Counts:
             return
         avals = [a for v in [*eqn.invars, *eqn.outvars] if hasattr(a := getattr(v, "aval", None), "dtype")]
         # An op on vectors runs on the VPU, at its widths (a 0-d operand is broadcast); one on scalars only runs
-        # on the scalar unit, which only does 32-bit integer arithmetic.
+        # on the scalar unit, which computes in 32 bits. The kernel holds narrow integer runtime scalars as their
+        # 32-bit values (analysis checks that's exact), so a narrow scalar here is one the tile code makes, like
+        # `jnp.int16(3)`; a 64-bit one is a Python int under x64, which the kernel's trace has too.
         vector = any(getattr(a, "shape", ()) for a in avals)
-        bits = self.int_bits if vector else (32,)
         for aval in avals:
             dtype = np.dtype(aval.dtype)
-            if np.issubdtype(dtype, np.integer) and dtype.itemsize * 8 not in bits:
+            narrow = dtype.itemsize * 8 not in self.int_bits if vector else dtype.itemsize < 4
+            if np.issubdtype(dtype, np.integer) and narrow:
                 frames = list(source_info_util.user_frames(eqn.source_info.traceback))
                 lines = [f.start_line for f in frames if f.file_name.startswith("<autokernel cost:")]
                 self.narrow.append((eqn.primitive.name, dtype, lines[0] if lines else None, vector))

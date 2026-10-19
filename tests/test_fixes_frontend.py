@@ -80,9 +80,10 @@ def f(x, keep):
             out = out.at[i:i + T, j:j + T].set(t)
     return out
 """
-    match = r"\(line 15\): `t` is only assigned under the reduction mask \(line 12\)"
+    # The static mask skips every step of the tiles with i = 0; the runtime one may skip any tile's steps.
+    match = r"\(line 15\): `t` is only assigned under the reduction mask \(line 12\), which (skips|may skip)"
     with pytest.raises(AutoKernelError, match=match):
-        _kernel(tmp_path, src)
+        _kernel(tmp_path, src)(rand((M, K)), jnp.zeros((2, 2), jnp.int32))
 
 
 def test_a_value_a_masked_reduction_updates_after_assigning_it_before_works(tmp_path):
@@ -177,7 +178,7 @@ def test_reads_sees_a_name_read_outside_the_comprehension_binding_it():
 @pytest.mark.parametrize(
     "stmt, match",
     [
-        ("acc += t + sum([t for t in range(2)])", "a comprehension or lambda binds `t`"),
+        ("acc += t + sum([t for t in range(2)])", "a comprehension or lambda binds `t`, which the kernel keeps"),
         ("acc += (lambda x: x)(t)", "a comprehension or lambda binds `x`"),
         ("acc += (b := t * 2)", "`:=` isn't supported"),
     ],
@@ -195,8 +196,8 @@ def f(x):
             out = out.at[i:i + T, j:j + T].set(acc)
     return out
 """
-    with pytest.raises(AutoKernelError, match=match):
-        _kernel(tmp_path, src)
+    with pytest.raises(AutoKernelError, match=match):  # `t` is a state variable: known once specialised
+        _kernel(tmp_path, src)(rand((M, K)))
 
 
 def test_a_mask_comprehension_variable_named_like_an_input_is_no_input_read(tmp_path):
@@ -249,8 +250,8 @@ def f(x, y, keep):
 
 @pytest.mark.parametrize("n", [jnp.int8(100), jnp.uint8(200), jnp.int16(20000)])
 def test_narrow_integer_scalar_arithmetic_is_rejected(tmp_path, n):
-    # A narrow scalar keeps its type, so `n * 2` would wrap as in Python, but the TPU's scalar unit only
-    # does 32-bit integer arithmetic: Mosaic rejects it, so autokernel does first.
+    # `n * 2` wraps in Python's narrow type, but the TPU's scalar unit only computes in 32 bits, so the kernel
+    # holds `n` as its 32-bit value and wouldn't wrap: rejected.
     src = """
 def f(x, n):
     out = jnp.zeros((M, N))
@@ -260,7 +261,8 @@ def f(x, n):
     return out
 """
     kernel = _kernel(tmp_path, src)
-    with pytest.raises(AutoKernelError, match=r"scalar unit has no (8|16)-bit integer arithmetic"):
+    match = r"does `mul` on `n` \(an? u?int(8|16) runtime scalar\).*computes in 32 bits.*`n.astype\(jnp.int32\)`"
+    with pytest.raises(AutoKernelError, match=match):
         kernel(rand((M, N)), n)
 
 

@@ -30,7 +30,7 @@ from jax.extend.core import Literal
 
 from . import hardware, mxu
 from .errors import AutoKernelError
-from .frontend import Loop, LoopNest, Reduction, assigned_name, free_loads, reads
+from .frontend import Loop, LoopNest, Reduction, assigned_name, free_loads, reads, scope_bound
 from .views import ViewError, ViewMap, Window
 
 __all__ = [
@@ -49,6 +49,7 @@ __all__ = [
     "environment",
     "evaluate_mask",
     "is_scalar_spec",
+    "kernel_scalar_aval",
     "reads_inputs",
     "specialize",
     "user_globals",
@@ -470,6 +471,7 @@ def specialize(
     )
     spec.tiles, spec.constant_tiles, spec.tile_mask_runtime = _tile_mask(spec)
     spec.phase_masks, spec.phase_runtime = _phase_masks(spec)
+    _check_masked_reads(spec)
     spec.outputs = _outputs(spec)
     spec.single_step = _single_step(spec)
     spec.operands = _collect_operands(spec)
@@ -478,6 +480,8 @@ def specialize(
         last = {assigned_name(s): spec.avals[id(s)] for u in spec.units for s in u.statements}
         spec.carried = {name: last[name] for name in sorted(_crossing(spec))}
     spec.broadcast_stores = _check_stores(spec, store_avals)
+    _check_scopes(spec)
+    _check_narrow_scalars(spec)
     spec.accumulators = _accumulators(spec)
     return spec
 
@@ -549,16 +553,35 @@ def is_scalar_spec(s: Any) -> bool:
 
 
 def scalar_aval(s: Any) -> jax.ShapeDtypeStruct:
-    """How the kernel reads a runtime scalar of this type: a weakly typed int32 for a 32-bit integer (as a
-    Python int); a narrower integer (int8, uint16, ...) as itself, strongly typed, so its arithmetic wraps as
-    in Python; an f32 for an f32, weakly typed if it is; and a weakly typed f32 for narrower floats (a bf16 is
-    read as f32, then mixes with tiles like a Python float, which is also what a bf16 does with float tiles)."""
+    """The type analysis gives a runtime scalar of this type (`Specialization.specs`): a weakly typed int32 for
+    a 32-bit integer (as a Python int); a narrower integer (int8, uint16, ...) as itself, strongly typed, as
+    Python has it; an f32 for an f32, weakly typed if it is; and a weakly typed f32 for narrower floats (a bf16
+    is read as f32, then mixes with tiles like a Python float, which is also what a bf16 does with float tiles).
+
+    The kernel holds a narrow integer as its 32-bit value instead (`kernel_scalar_aval`): the TPU's scalar
+    unit only computes in 32 bits. That is exact for comparisons, `max`/`min`, bitwise ops, selects and
+    conversions, but not for arithmetic that would wrap in the narrow type, or for mixing with integer arrays
+    in a type other than theirs; `_check_narrow_scalars` rejects those."""
     if jnp.issubdtype(s.dtype, jnp.integer):
         if np.dtype(s.dtype).itemsize < 4 and not getattr(s, "weak_type", False):
             return jax.ShapeDtypeStruct((), s.dtype)
         return jax.ShapeDtypeStruct((), jnp.int32, weak_type=True)
     weak = bool(getattr(s, "weak_type", False)) or np.dtype(s.dtype) != np.float32
     return jax.ShapeDtypeStruct((), jnp.float32, weak_type=weak)
+
+
+def kernel_scalar_aval(s: jax.ShapeDtypeStruct) -> jax.ShapeDtypeStruct:
+    """How the kernel holds a runtime scalar that analysis types as `s` (`scalar_aval`): an integer as a weakly
+    typed int32 (a narrow one is its 32-bit value), anything else as `s`."""
+    if jnp.issubdtype(s.dtype, jnp.integer):
+        return jax.ShapeDtypeStruct((), jnp.int32, weak_type=True)
+    return s
+
+
+def _narrow_int(dtype: Any) -> bool:
+    """Is `dtype` an integer type narrower than the kernel's 32-bit scalars?"""
+    dtype = np.dtype(dtype)
+    return np.issubdtype(dtype, np.integer) and dtype.itemsize < 4
 
 
 def _bounds(lp: Loop, code: UserCode, env: dict[str, Any], nest: LoopNest) -> LoopBounds:
@@ -697,6 +720,7 @@ def _check_runtime_index(spec: Specialization, index: ast.expr, what: str, sl: a
         ) from None
     if not (hasattr(out, "shape") and out.shape == () and jnp.issubdtype(out.dtype, jnp.integer)):
         raise spec.nest.error(index, f"{what}: the runtime index `{ast.unparse(sl)}` must be one integer, got {out}")
+    _check_narrow_index(spec, index, what, sl)
 
 
 def check_indices(spec: Specialization, values: dict[str, Any]) -> None:
@@ -758,6 +782,7 @@ def _input_reads(nest: LoopNest, nodes: Sequence[ast.AST], scalars: Sequence[str
 
     `scalars` (runtime scalar inputs) are read as plain values."""
     found: list[ast.Subscript] = []
+    free = {id(n) for node in nodes for n in free_loads(node)}  # not a comprehension's or lambda's own `out`
 
     class Visitor(ast.NodeVisitor):
         def visit_Subscript(self, node: ast.Subscript) -> None:
@@ -778,7 +803,7 @@ def _input_reads(nest: LoopNest, nodes: Sequence[ast.AST], scalars: Sequence[str
                     f"input `{node.id}` may only be read through a tile slice like `{node.id}[i:i+T, ...]` "
                     "inside the loop nest",
                 )
-            if node.id in nest.out_vars:
+            if node.id in nest.out_vars and id(node) in free:
                 raise nest.error(node, f"the output `{node.id}` can't be read inside the loop nest")
 
     visitor = Visitor()
@@ -1183,20 +1208,12 @@ def _as_stored(value: Any, aval: jax.ShapeDtypeStruct) -> Any:
     return _convert_element_type(value, np.dtype(aval.dtype), weak_type=aval.weak_type)
 
 
-def _trace_tile(
-    spec: Specialization, state: dict[str, jax.ShapeDtypeStruct]
-) -> tuple[list[tuple[ast.stmt, jax.ShapeDtypeStruct]], list[jax.ShapeDtypeStruct]]:
-    """One pass through a tile (one step of every reduction): the type of each assignment and store value.
-
-    The types are the kernel's: loop variables are weakly typed int32 scalars (Python ints, in the loops),
-    a state variable reads back as it is stored (`state`, for those known so far), and `@` is an MXU dot
-    accumulating in f32 / i32.
-    """
+def _tile_code(spec: Specialization) -> tuple[list[Any], list[Any]]:
+    """The tile's statements (in unit order) and store values compiled as `unit_code`, with each input tile
+    read as a value of the tile's shape (named by its operand), as in the kernel."""
     nest = spec.nest
 
     def tiled(node: ast.AST, unit: Unit | None) -> ast.AST:
-        """`unit_code`, with each input tile read as a value of the tile's shape, as in the kernel."""
-
         class Tiles(ast.NodeTransformer):
             def visit_Subscript(self, n: ast.Subscript) -> ast.AST:
                 if isinstance(n.value, ast.Name) and n.value.id in nest.params:
@@ -1205,15 +1222,28 @@ def _trace_tile(
 
         return Tiles().visit(spec.unit_code(node, unit))
 
-    statements = [(u, s) for u in spec.units for s in u.statements]
     reads_ = tuple((key, op.ref) for key, op in spec._reads.items())
     key = ("trace", spec.code.filename, tuple(spec.finished_loops(len(spec.phases)).items()), reads_)
     if key not in nest.cache:
         nest.cache[key] = (
-            [spec.code.compile([tiled(s, u)], "exec") for u, s in statements],
+            [spec.code.compile([tiled(s, u)], "exec") for u in spec.units for s in u.statements],
             [spec.code.compile(tiled(st.value, None), "eval") for st in nest.stores],
         )
-    compiled, stores = nest.cache[key]
+    return nest.cache[key]
+
+
+def _trace_tile(
+    spec: Specialization, state: dict[str, jax.ShapeDtypeStruct]
+) -> tuple[list[tuple[ast.stmt, jax.ShapeDtypeStruct]], list[jax.ShapeDtypeStruct]]:
+    """One pass through a tile (one step of every reduction): the type of each assignment and store value.
+
+    The types are the kernel's: loop variables and integer runtime scalars are weakly typed int32 scalars
+    (Python ints, in the loops; `kernel_scalar_aval`), a state variable reads back as it is stored (`state`,
+    for those known so far), and `@` is an MXU dot accumulating in f32 / i32.
+    """
+    nest = spec.nest
+    statements = [(u, s) for u in spec.units for s in u.statements]
+    compiled, stores = _tile_code(spec)
     helpers = mxu.helpers("highest")
     loop_vars = list(spec.loops)
     at: list[ast.AST | None] = [None]  # the statement being traced, for errors
@@ -1238,7 +1268,7 @@ def _trace_tile(
         return values, outs
 
     loop_avals = [jax.ShapeDtypeStruct((), jnp.int32, weak_type=True)] * len(loop_vars)
-    scalar_avals = [spec.specs[nest.params.index(p)] for p in spec.scalars]
+    scalar_avals = [kernel_scalar_aval(spec.specs[nest.params.index(p)]) for p in spec.scalars]
     try:
         tiles = [jax.ShapeDtypeStruct(op.block.kernel_shape, op.dtype) for op in spec.operands]
         traced, store_avals = jax.eval_shape(run, tiles, loop_avals, scalar_avals)
@@ -1329,3 +1359,268 @@ def _check_stores(spec: Specialization, store_avals: list[jax.ShapeDtypeStruct])
             )
         broadcast.add(st.out)
     return broadcast
+
+
+def _check_scopes(spec: Specialization) -> None:
+    """The kernel reads and writes a state variable as its scratch ref wherever the user's code names it, so a
+    comprehension or lambda in the tile can't bind that name for itself."""
+    nest = spec.nest
+    for node in [*nest.tile_statements(), *(st.node for st in nest.stores)]:
+        for name in sorted(scope_bound(node) & set(spec.state)):
+            raise nest.error(
+                node,
+                f"a comprehension or lambda binds `{name}`, which the kernel keeps in a scratch buffer between steps "
+                "(it rewrites every use of the name); rename it",
+            )
+
+
+def _check_masked_reads(spec: Specialization) -> None:
+    """A value only masked reduction loops assign (`LoopNest.masked_reads`) can be read after them only if
+    every tile runs a step of one of them: else Python would raise UnboundLocalError. Known for static masks;
+    a mask that reads inputs may skip every step of any tile."""
+    for name, node, phases in spec.nest.masked_reads:
+        runs = np.zeros(len(spec.tiles), bool)
+        for p in phases:
+            if not spec.phase_runtime[p]:
+                runs |= spec.phase_masks[p].any(axis=1)
+        if runs.all():
+            continue
+        guard = spec.phases[phases[-1]].reduction.guard_node
+        line = spec.nest.first_line + guard.lineno - 1
+        if any(spec.phase_runtime[p] for p in phases):
+            skips = "may skip every step of a tile"
+        else:
+            tile = spec.tiles[int(np.argmin(runs))]
+            at = ", ".join(f"{lb.var} = {b * lb.step}" for lb, b in zip(spec.parallel, tile, strict=True))
+            skips = f"skips every step of the tile at {at}"
+        raise spec.nest.error(
+            node,
+            f"`{name}` is only assigned under the reduction mask (line {line}), which {skips} and leaves it "
+            "unassigned (Python would raise UnboundLocalError); assign it before that reduction loop too",
+        )
+
+
+# --------------------------------------------------------------------------- narrow integer scalars
+
+
+@dataclass(frozen=True)
+class _Narrow:
+    """A value the kernel holds as a 32-bit integer where Python has a narrower one: the narrow runtime scalar
+    `origin`, or a value computed from it exactly. `dtype` is its type in Python."""
+
+    dtype: np.dtype
+    origin: str
+
+
+# Ops whose result is the same number on the kernel's 32-bit values as on Python's narrow ones (and stays
+# narrow in Python, so it is followed further).
+_EXACT_ON_32_BITS = frozenset(
+    {"max", "min", "clamp", "select_n", "and", "or", "xor", "sign", "concatenate", "shift_right_arithmetic",
+     "reduce_max", "reduce_min", "reduce_and", "reduce_or", "reduce_xor"}
+)  # fmt: skip
+_UNNARROWED = frozenset({"eq", "ne", "lt", "le", "gt", "ge", "argmax", "argmin"})  # bools and indices: exact
+_MOVES = frozenset(
+    {"broadcast_in_dim", "reshape", "squeeze", "expand_dims", "transpose", "copy", "copy_p", "slice", "pjit_identity",
+     "optimization_barrier"}
+)  # fmt: skip
+
+
+def _narrow_scalars(spec: Specialization) -> dict[str, _Narrow]:
+    """The runtime scalars that are integers narrower than 32 bits, which the kernel holds as 32-bit values."""
+    dtypes = {p: np.dtype(spec.specs[spec.nest.params.index(p)].dtype) for p in spec.scalars}
+    return {p: _Narrow(d, p) for p, d in dtypes.items() if _narrow_int(d)}
+
+
+def _python_type(v: Any, narrow: dict[Any, _Narrow]) -> Any:
+    """`v`'s type in Python, for `jax.dtypes.result_type`: a Python scalar type for a weakly typed value."""
+    if isinstance(v, jax.extend.core.Var) and v in narrow:
+        return narrow[v].dtype
+    dtype = np.dtype(v.aval.dtype)
+    if not v.aval.weak_type or dtype == np.bool_:
+        return dtype
+    if np.issubdtype(dtype, np.integer):
+        return int
+    return complex if np.issubdtype(dtype, np.complexfloating) else float
+
+
+def _sub_jaxprs(eqn: Any) -> list[Any]:
+    """The jaxprs nested in an equation's parameters (jit, custom_jvp/vjp, cond branches, loop bodies)."""
+    found = []
+    for value in eqn.params.values():
+        for v in value if isinstance(value, (tuple, list)) else (value,):
+            if isinstance(v, jax.extend.core.ClosedJaxpr):
+                found.append(v.jaxpr)
+            elif isinstance(v, jax.extend.core.Jaxpr):
+                found.append(v)
+    return found
+
+
+def _follow_narrow(
+    jaxpr: Any, narrow: dict[Any, _Narrow]
+) -> tuple[tuple[str, _Narrow, np.dtype | None] | None, list[_Narrow | None]]:
+    """Follow narrow values (`narrow`: of `jaxpr`'s inputs) through a jaxpr in the kernel's types.
+
+    Returns the first op whose result could differ from Python's, as (primitive, the narrow value it takes, the
+    type a conversion makes it, or None), or None; and the narrow value of each output.
+    """
+    narrow = dict(narrow)
+    for eqn in jaxpr.eqns:
+        ins = [narrow.get(v) if isinstance(v, jax.extend.core.Var) else None for v in eqn.invars]
+        first = next((n for n in ins if n is not None), None)
+        if first is None:
+            continue
+        name = eqn.primitive.name
+        out: _Narrow | None = None
+        if subs := _sub_jaxprs(eqn):
+            args = ins[1:] if name == "cond" else ins  # a cond's branches take its operands
+            outs: list[_Narrow | None] = [None] * len(eqn.outvars)
+            for sub in subs:
+                if len(sub.invars) != len(args) or len(sub.outvars) != len(eqn.outvars):
+                    return (name, first, None), []  # a loop: followed no further
+                given = {v: n for v, n in zip(sub.invars, args, strict=True) if n is not None}
+                problem, found = _follow_narrow(sub, given)
+                if problem is not None:
+                    return problem, []
+                outs = [a or b for a, b in zip(outs, found, strict=True)]
+            narrow.update((v, n) for v, n in zip(eqn.outvars, outs, strict=True) if n is not None)
+            continue
+        if name == "convert_element_type":
+            target = np.dtype(eqn.params["new_dtype"])
+            if not np.issubdtype(target, np.integer):  # to a float or a bool: the same number either way
+                out = None
+            elif eqn.params.get("weak_type"):  # a Python int widening (under x64): still the narrow value
+                out = first
+            elif jnp.promote_types(first.dtype, target) != target:  # Python would compute in a wider type
+                return (name, first, target), []
+        elif name == "not":
+            if not np.issubdtype(first.dtype, np.signedinteger):  # ~ of a zero-extended value is negative
+                return (name, first, None), []
+            out = first
+        elif name == "shift_right_logical":
+            if not np.issubdtype(first.dtype, np.unsignedinteger):  # shifts the 32-bit value's sign bits in
+                return (name, first, None), []
+            out = first
+        elif name in _MOVES:
+            out = ins[0]
+        elif name not in _UNNARROWED:
+            values = eqn.invars[1:] if name == "select_n" else eqn.invars
+            result = np.dtype(jax.dtypes.result_type(*(_python_type(v, narrow) for v in values)))
+            if _narrow_int(result):
+                if name not in _EXACT_ON_32_BITS:  # arithmetic that can wrap in Python's narrow type
+                    return (name, first, None), []
+                out = _Narrow(result, first.origin)
+        if out is not None:
+            narrow.update((v, out) for v in eqn.outvars)
+    return None, [narrow.get(v) if isinstance(v, jax.extend.core.Var) else None for v in jaxpr.outvars]
+
+
+def _narrow_error(spec: Specialization, node: ast.AST, what: str, problem: tuple) -> AutoKernelError:
+    op, n, target = problem
+    s, dtype = n.origin, n.dtype.name
+    scalar = f"`{s}` ({'an' if dtype.startswith('int') else 'a'} {dtype} runtime scalar) or a value computed from it"
+    if target is None:
+        action = f"does `{op}` on {scalar}, which Python computes in {dtype}, where it can wrap"
+    else:
+        wide = np.dtype(jnp.promote_types(n.dtype, target)).name
+        action = f"mixes {scalar} with {target.name} values: Python computes that in {wide}, the kernel in {target}"
+    return spec.nest.error(
+        node,
+        f"{what} {action}; the kernel holds `{s}` as its 32-bit value, since the TPU's scalar unit computes in 32 "
+        f"bits, so its result could differ: widen it first, e.g. `{s}.astype(jnp.int32)`",
+    )
+
+
+def _check_narrow_scalars(spec: Specialization) -> None:
+    """Reject tile code whose result depends on the kernel holding narrow integer runtime scalars as their 32-bit
+    values (`scalar_aval`).
+
+    Follows them, and the values computed from them exactly, through the tile's statements and stores in the
+    kernel's types, step after step (a reduction body until what it passes on to its next step settles).
+    """
+    origins = _narrow_scalars(spec)
+    if not origins:
+        return
+    nest = spec.nest
+    compiled, stores = _tile_code(spec)
+    helpers = mxu.helpers("highest")
+    weak_int = jax.ShapeDtypeStruct((), jnp.int32, weak_type=True)
+    env: dict[str, tuple[jax.ShapeDtypeStruct, _Narrow | None]] = {}  # name -> (kernel type, narrow value)
+    env.update((op.ref, (jax.ShapeDtypeStruct(op.block.kernel_shape, op.dtype), None)) for op in spec.operands)
+    env.update((var, (weak_int, None)) for var in spec.loops)
+    env.update((p, (kernel_scalar_aval(spec.specs[nest.params.index(p)]), origins.get(p))) for p in spec.scalars)
+
+    def trace(code: Any, node: ast.AST, target: str | None) -> tuple[jax.ShapeDtypeStruct, _Narrow | None]:
+        """The value a statement assigns to `target` (or a store's value), and whether it is narrow."""
+        names = list(env)
+
+        def run(*values: Any) -> Any:
+            ns = spec.namespace(None, **helpers)
+            ns.update(zip(names, values, strict=True))
+            if target is None:
+                return jnp.asarray(eval(code, ns))
+            exec(code, ns)
+            return jnp.asarray(ns[target])
+
+        try:
+            closed = jax.make_jaxpr(run)(*(aval for aval, _ in env.values()))
+        except Exception as e:
+            raise nest.error(node, f"couldn't trace the tile body ({type(e).__name__}: {e})") from None
+        given = {v: n for v, (_, n) in zip(closed.jaxpr.invars, env.values(), strict=True) if n is not None}
+        problem, outs = _follow_narrow(closed.jaxpr, given)
+        if problem is not None:
+            raise _narrow_error(spec, node, f"`{ast.unparse(node)}`", problem)
+        aval = closed.out_avals[0]
+        return jax.ShapeDtypeStruct(aval.shape, aval.dtype, weak_type=aval.weak_type), outs[0]
+
+    def run_unit(statements: list[tuple[Any, ast.stmt]]) -> None:
+        for code, s in statements:
+            name = assigned_name(s)
+            aval, n = trace(code, s, name)
+            sv = spec.state.get(name)
+            if sv is not None:  # stored as the state variable's type
+                aval, dtype = sv.aval, np.dtype(sv.aval.dtype)
+                if n is not None and _narrow_int(dtype):
+                    if jnp.promote_types(n.dtype, dtype) != dtype:
+                        raise _narrow_error(spec, s, f"`{ast.unparse(s)}`", ("convert_element_type", n, dtype))
+                    n = None  # the kernel holds it in its narrow type too
+            env[name] = (aval, n)
+
+    def join(a: _Narrow | None, b: _Narrow | None) -> _Narrow | None:
+        if a is None or b is None or a == b:
+            return a or b
+        dtype = np.dtype(jnp.promote_types(a.dtype, b.dtype))
+        return _Narrow(dtype, a.origin) if _narrow_int(dtype) else a
+
+    pairs = iter(zip(compiled, [s for u in spec.units for s in u.statements], strict=True))
+    for unit in spec.units:
+        statements = [next(pairs) for _ in unit.statements]
+        if unit.kind == "segment":
+            run_unit(statements)
+            continue
+        for _ in range(32):  # a step's values flow into the next step (or past the loop, if it runs none)
+            entry = dict(env)
+            run_unit(statements)
+            env.update((k, (env[k][0], join(env[k][1], entry[k][1]))) for k in entry)
+            if all(env[k][1] == entry[k][1] for k in entry):
+                break
+    for st, code in zip(nest.stores, stores, strict=True):
+        trace(code, st.node, None)
+
+
+def _check_narrow_index(spec: Specialization, index: ast.expr, what: str, sl: ast.expr) -> None:
+    """A runtime index computed from a narrow integer scalar must be exact on the kernel's 32-bit value."""
+    origins = _narrow_scalars(spec)
+    if not origins or not reads(sl) & set(origins):
+        return
+    code = spec.code.compile(sl, "eval")
+    params = spec.scalars
+    avals = [kernel_scalar_aval(spec.specs[spec.nest.params.index(p)]) for p in params]
+
+    def index_value(*xs: Any) -> Any:
+        return jnp.asarray(eval(code, {**spec.namespace(), **dict(zip(params, xs, strict=True))}))
+
+    jaxpr = jax.make_jaxpr(index_value)(*avals).jaxpr
+    given = {v: origins[p] for v, p in zip(jaxpr.invars, params, strict=True) if p in origins}
+    problem, _ = _follow_narrow(jaxpr, given)
+    if problem is not None:
+        raise _narrow_error(spec, index, f"{what}: the runtime index `{ast.unparse(sl)}`", problem)
