@@ -53,7 +53,16 @@ from .frontend import assigned_name
 from .hardware import Hardware, nbytes, sublanes, vmem_nbytes
 from .schedule import COLUMN_SHIFT, Schedule
 
-__all__ = ["CALL_S", "LAUNCH_S", "STEP_OVERHEAD_S", "Estimate", "estimate", "overhead_bound", "step_seconds"]
+__all__ = [
+    "CALL_S",
+    "LAUNCH_S",
+    "STEP_OVERHEAD_S",
+    "Estimate",
+    "estimate",
+    "overhead_bound",
+    "slots_nbytes",
+    "step_seconds",
+]
 
 # Fixed cost of one step of the generated loop: decoding it and the loop itself, plus DMA_ISSUE_S for
 # each copy it starts and waits for. Measured on a v5e: 8192^3 bf16 matmuls (two copies a step) with 128^3
@@ -227,9 +236,10 @@ def estimate(
     # outputs written by fill DMAs, array state (scalars live in SMEM), plus the largest unit's peak
     # temporaries; Mosaic pads each buffer to whole (sublanes, 128) tiles.
     vmem = sum(
-        (buffers if op.phase is not None else 2) * vmem_nbytes(op.block.kernel_shape, op.dtype) for op in spec.operands
+        slots_nbytes(buffers if op.phase is not None else 2, op.block.kernel_shape, op.dtype) for op in spec.operands
     )
-    vmem += sum((3 if o.var in fills else 2) * vmem_nbytes(o.block.kernel_shape, o.out.dtype) for o in spec.outputs)
+    vmem += sum(slots_nbytes(2, o.block.kernel_shape, o.out.dtype) for o in spec.outputs)
+    vmem += sum(vmem_nbytes(o.block.kernel_shape, o.out.dtype) for o in spec.outputs if o.var in fills)
     vmem += sum(vmem_nbytes(sv.aval.shape, sv.aval.dtype) for sv in spec.state.values() if not sv.smem)
     vmem += max(c.peak_bytes for c in [*tile_costs, *body_costs])
     excess = max(0.0, vmem / hw.vmem_budget - 0.5) / 0.5
@@ -248,6 +258,13 @@ def estimate(
         fill_s=fill_s,
         drain_s=drain_s,
     )
+
+
+def slots_nbytes(depth: int, tile: Sequence[int], dtype: Any) -> int:
+    """Bytes of a ring of `depth` VMEM slots for `tile`, one `(depth, *tile)` buffer as codegen allocates it:
+    for a 1-D tile the slots are the buffer's rows, padded to whole sublane tiles (8 rows of 32-bit values,
+    more for packed types), so two slots of an f32 row take eight rows."""
+    return vmem_nbytes((depth, *tile), dtype)
 
 
 def step_seconds(compute: float, dma: float, copies: int, buffers: int) -> float:

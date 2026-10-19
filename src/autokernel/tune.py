@@ -119,10 +119,13 @@ class Space:
     Planning a combination (specialise, schedule, estimate) takes a few milliseconds, so thousands of them
     would take tens of seconds. Three things keep a search short:
 
-    1. *VMEM pruning.* A kernel's VMEM use only grows with its block sizes, so once a combination doesn't
-       fit, no combination with every block size at least as big does either: those are rejected without
+    1. *VMEM pruning.* A kernel's VMEM use grows with its block sizes, so once a combination doesn't fit,
+       no combination with every block size at least as big does either: those are rejected without
        planning. Each block size's largest value that can fit at all (with the other block sizes at their
-       smallest) is found first, by bisection.
+       smallest) is found first, by bisection. The exception is a block covering a whole loop: a reduction
+       of one step fetches its tiles once per tile, into two slots rather than `buffers`, and needs no
+       accumulator, so it can take less VMEM than a smaller block. Such a value is only compared with
+       itself.
     2. Spaces of up to `EXHAUSTIVE_MAX` combinations left are planned exhaustively, so the ranking is
        exact.
     3. Larger ones are searched by coordinate descent over the model's score, from several starting points
@@ -149,8 +152,14 @@ class Space:
             for name, values in tuned
         ]
         self.values = [
-            tuple(sorted(set(values))) if mono else tuple(dict.fromkeys(values))
+            tuple(sorted(set(values))) if mono else _distinct(values)
             for (_, values), mono in zip(tuned, self.monotone, strict=True)
+        ]
+        # Per name, the values that are a whole loop it steps (VMEM isn't monotone across them).
+        extents = _loop_extents(nest, fn, specs)
+        self.whole = [
+            {i for i, v in enumerate(values) if v in extents.get(name, ())} if mono else set()
+            for name, values, mono in zip(self.names, self.values, self.monotone, strict=True)
         ]
         self.cache: dict = {}  # unit costs, shared by every combination
         self.seen: dict[Point, Candidate] = {}
@@ -162,7 +171,7 @@ class Space:
 
     def rank(self, c: Candidate) -> tuple:
         """Sort key: valid first, best score first, ties in the order of the combinations."""
-        point = tuple(values.index(c.overrides[name]) for name, values in zip(self.names, self.values, strict=True))
+        point = tuple(_index(values, c.overrides[name]) for name, values in zip(self.names, self.values, strict=True))
         return (c.error is not None, c.score, point)
 
     def overrides(self, point: Point) -> dict[str, Any]:
@@ -171,9 +180,15 @@ class Space:
     def dominated(self, point: Point) -> Point | None:
         """A combination known not to fit in VMEM whose block sizes are all at most `point`'s."""
         for big in self.too_big:
-            if all((p >= b) if mono else (p == b) for p, b, mono in zip(point, big, self.monotone, strict=True)):
+            if self._covers(big, point):
                 return big
         return None
+
+    def _at_most(self, k: int, small: int, big: int) -> bool:
+        """Does value index `small` of name `k` take no more VMEM than `big`, the other names alike?"""
+        if not self.monotone[k] or small in self.whole[k] or big in self.whole[k]:
+            return small == big
+        return small <= big
 
     def evaluate(self, point: Point) -> Candidate:
         if point in self.seen:
@@ -194,7 +209,7 @@ class Space:
         return c
 
     def _covers(self, small: Point, big: Point) -> bool:
-        return all((b >= s) if mono else (b == s) for s, b, mono in zip(small, big, self.monotone, strict=True))
+        return all(self._at_most(k, s, b) for k, (s, b) in enumerate(zip(small, big, strict=True)))
 
     def search(self) -> list[Candidate]:
         self._prune()
@@ -211,13 +226,13 @@ class Space:
         """Bisect each block size for its largest value that fits in VMEM with the others at their smallest."""
         low = tuple(0 for _ in self.values)
         for k, mono in enumerate(self.monotone):
-            n = len(self.values[k])
-            if not mono or n == 1:
+            ordered = [i for i in range(len(self.values[k])) if i not in self.whole[k]]  # VMEM grows along these
+            if not mono or len(ordered) <= 1:
                 continue
-            at = lambda i, k=k: tuple(i if j == k else 0 for j in range(len(low)))  # noqa: E731
-            if self._fits(at(n - 1)) is not False:
+            at = lambda i, k=k, ordered=ordered: tuple(ordered[i] if j == k else 0 for j in range(len(low)))  # noqa: E731
+            if self._fits(at(len(ordered) - 1)) is not False:
                 continue
-            lo, hi = 0, n - 1  # values[lo] isn't known not to fit; values[hi] doesn't fit
+            lo, hi = 0, len(ordered) - 1  # ordered[lo] isn't known not to fit; ordered[hi] doesn't fit
             while hi - lo > 1:
                 mid = (lo + hi) // 2
                 fits = self._fits(at(mid))
@@ -269,7 +284,7 @@ class Space:
         for name, values, mono in zip(self.names, self.values, self.monotone, strict=True):
             current = env.get(name)
             if current in values:
-                point.append(values.index(current))
+                point.append(_index(values, current))
             elif mono and isinstance(current, (int, np.integer)) and current > 0:
                 point.append(min(range(len(values)), key=lambda i: abs(np.log2(values[i] / current))))
             else:
@@ -282,6 +297,47 @@ def _loop_steps(nest: LoopNest) -> set[str]:
     return {lp.step.id for lp in nest.loops if isinstance(lp.step, ast.Name)}
 
 
+def _loop_extents(
+    nest: LoopNest, fn: Callable | Environment, specs: Sequence[jax.ShapeDtypeStruct]
+) -> dict[str, set[int]]:
+    """Per block size, the extents of the loops it steps (a block that size covers its loop in one step);
+    empty when the bounds can't be worked out without the tuned values."""
+    try:
+        source = environment(fn)
+        env = {**source.names, **dict(zip(nest.params, specs, strict=True))}
+        code = UserCode(nest, source.filename)
+        code.run_prologue(env)
+        extents: dict[str, set[int]] = {}
+        for lp in nest.loops:
+            if isinstance(lp.step, ast.Name):
+                start = code.eval_int(lp.start, f"`range` start of loop `{lp.var}`", env)
+                stop = code.eval_int(lp.stop, f"`range` stop of loop `{lp.var}`", env)
+                extents.setdefault(lp.step.id, set()).add(stop - start)
+        return extents
+    except Exception:  # planning reports it
+        return {}
+
+
+def _same(a: Any, b: Any) -> bool:
+    """Are two tuned values the same candidate: equal and of the same type (`2` isn't `2.0`)?"""
+    return type(a) is type(b) and bool(a == b)
+
+
+def _distinct(values: Sequence[Any]) -> tuple[Any, ...]:
+    """`values` without repeats, in order; values of different types (`2`, `2.0`) are different candidates."""
+    out: list[Any] = []
+    for v in values:
+        if not any(_same(v, w) for w in out):
+            out.append(v)
+    return tuple(out)
+
+
+def _index(values: Sequence[Any], value: Any) -> int:
+    """Where `value` is among `values`: the same candidate, else an equal one (a block size as another int type)."""
+    same = [i for i, v in enumerate(values) if _same(v, value)]
+    return same[0] if same else values.index(value)
+
+
 def diverse(ranked: list[Candidate], top: int) -> list[Candidate]:
     """`top` of the best-ranked candidates, of which at most half share any one value of a tuned name.
 
@@ -289,12 +345,13 @@ def diverse(ranked: list[Candidate], top: int) -> list[Candidate]:
     measuring a spread of them is what lets timing find the real winner. Names with a single value among
     the candidates don't count, and if the cap leaves fewer than `top`, the best of the rest fill up.
     """
-    varied = {name for name in (ranked[0].overrides if ranked else {}) if len({c.overrides[name] for c in ranked}) > 1}
+    names = ranked[0].overrides if ranked else {}
+    varied = {name for name in names if len(_distinct([c.overrides[name] for c in ranked])) > 1}
     cap = max(1, -(-top // 2))
     chosen: list[Candidate] = []
-    counts: dict[tuple[str, Any], int] = {}
+    counts: dict[tuple, int] = {}
     for c in ranked:
-        traits = [(name, c.overrides[name]) for name in sorted(varied)]
+        traits = [(name, type(c.overrides[name]), c.overrides[name]) for name in sorted(varied)]
         if len(chosen) < top and all(counts.get(t, 0) < cap for t in traits):
             chosen.append(c)
             for t in traits:
@@ -326,7 +383,11 @@ def grid(
     used = {n.id for n in ast.walk(nest.fdef) if isinstance(n, ast.Name)}
     computed = _prologue_names(nest)
     explicit = {name: values for name, values in options.tune if values != AUTO}
-    for name in explicit:
+    for name, values in explicit.items():
+        if not isinstance(values, tuple):
+            raise AutoKernelError(
+                f"{nest.fn_name}: tune[{name!r}] must be {AUTO!r} or a sequence of candidate values, got {values!r}"
+            )
         if name in computed:
             raise AutoKernelError(
                 f"{nest.fn_name}: tune[{name!r}]: `{name}` is computed in the function's prologue, so overriding it "
@@ -470,7 +531,7 @@ def measure(candidates: list[Candidate], args: Sequence[Any], top: int) -> Lower
     """Time the `top` best-predicted block sizes on the attached TPU, then the other buffer depth of the
     winner; the fastest, or None if none ran."""
     valid = [c for c in candidates if c.lowered is not None]
-    shapes = list(dict.fromkeys(tuple(sorted(c.overrides.items())) for c in valid))  # ranked order
+    shapes = list(dict.fromkeys(_shape(c) for c in valid))  # ranked order
 
     def time_candidate(c: Candidate) -> None:
         try:
@@ -479,21 +540,29 @@ def measure(candidates: list[Candidate], args: Sequence[Any], top: int) -> Lower
             c.error = f"failed to run: {type(e).__name__}"
 
     for shape in shapes[:top]:  # each shape at its best-predicted (default) depth
-        time_candidate(next(c for c in valid if tuple(sorted(c.overrides.items())) == shape))
+        time_candidate(next(c for c in valid if _shape(c) == shape))
     timed = [c for c in valid if c.measured_s is not None]
     if not timed:
         return None
     best = min(timed, key=lambda c: c.measured_s)
     for c in valid:  # the winner's other depths
-        if c.overrides == best.overrides and c.measured_s is None and c.error is None:
+        if _shape(c) == _shape(best) and c.measured_s is None and c.error is None:
             time_candidate(c)
     timed = [c for c in valid if c.measured_s is not None]
     return min(timed, key=lambda c: c.measured_s).lowered
 
 
-def time_kernel(lowered: Lowered, args: Sequence[Any], runs: int = 10, repeats: int = 3) -> float:
-    """Median seconds per call on the attached TPU, after a compiling warm-up."""
-    fn = jax.jit(lambda *xs: lowered.entry(*xs, interpret=False))
+def _shape(c: Candidate) -> tuple:
+    """A candidate's tuned values as a key (`2` and `2.0` differ)."""
+    return tuple((k, type(v), v) for k, v in sorted(c.overrides.items(), key=lambda kv: kv[0]))
+
+
+def time_kernel(
+    lowered: Lowered, args: Sequence[Any], runs: int = 10, repeats: int = 3, interpret: Any = False
+) -> float:
+    """Median seconds per call on the attached TPU, after a compiling warm-up (`interpret`: in the Pallas TPU
+    interpreter instead, which says nothing about TPU time but runs anywhere)."""
+    fn = jax.jit(lambda *xs: lowered.entry(*xs, interpret=interpret))
     jax.block_until_ready(fn(*args))
     samples = []
     for _ in range(repeats):

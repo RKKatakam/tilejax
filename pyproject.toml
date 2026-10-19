@@ -5,8 +5,8 @@ description = "Compile Python tile loop nests into Pallas TPU kernels"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "jax>=0.11.2",
-    "numpy>=2.5.4",
+    "jax>=0.11.2,<0.12",  # uses jax._src internals (Pallas TPU interpreter, cost analysis)
+    "numpy>=2.1",
 ]
 keywords = ["jax", "pallas", "tpu", "compiler", "kernels"]
 classifiers = [
@@ -17,7 +17,7 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-tpu = ["jax[tpu]>=0.11.2"]
+tpu = ["jax[tpu]>=0.11.2,<0.12"]
 
 [dependency-groups]
 dev = [

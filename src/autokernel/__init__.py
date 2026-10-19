@@ -23,6 +23,8 @@ A function with several tile loop nests mixed with ordinary JAX code and Python 
 model) becomes a `TpuProgram`: every nest is its own kernel, and the code around them runs as JAX.
 """
 
+from importlib import metadata as _metadata
+
 from .api import TpuKernel, tpu
 from .errors import AutoKernelError
 from .fusion import FusedLowered
@@ -40,4 +42,7 @@ __all__ = [
     "__version__",
     "tpu",
 ]
-__version__ = "0.3.0"
+try:
+    __version__ = _metadata.version("autokernel")
+except _metadata.PackageNotFoundError:  # running from a source tree that isn't installed
+    __version__ = "0.3.0"

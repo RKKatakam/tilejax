@@ -41,5 +41,5 @@ if __name__ == "__main__":
         measured = f"{c.measured_s * 1e3:9.3f} ms" if c.measured_s else "-"
         predicted = f"{c.predicted_s * 1e3:9.3f} ms" if c.error is None else c.error
         tiles = " ".join(f"{c.overrides[k]:>5}" for k in ("TM", "TN", "TK"))
-        print(f"{tiles} {c.buffers:>7} {predicted:>12} {measured:>12}")
+        print(f"{tiles} {c.buffers or '-':>7} {predicted:>12} {measured:>12}")
     print("max diff vs Python loops:", matmul.verify(x, y))

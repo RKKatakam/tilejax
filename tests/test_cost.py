@@ -206,9 +206,15 @@ def predicted_ms():
     return [lower(k, buffers=b).estimate.seconds * 1e3 for k, b, _ in MEASURED]
 
 
+# How far each prediction may be from its measurement: the model's error when calibrated (+1.8%, +4.8%,
+# -0.8%, +2.2%, -15.5%, +1.3%, +9.6%, +6.6%) with a margin of a few percent, so that a change to the model
+# that loses accuracy on any one kernel fails here.
+TOLERANCE = [0.06, 0.09, 0.05, 0.06, 0.20, 0.05, 0.14, 0.11]
+
+
 def test_predictions_are_close_to_measured_times(predicted_ms):
-    for (_, _, measured), predicted in zip(MEASURED, predicted_ms, strict=True):
-        assert predicted == pytest.approx(measured, rel=0.25)
+    for (_, _, measured), predicted, rel in zip(MEASURED, predicted_ms, TOLERANCE, strict=True):
+        assert predicted == pytest.approx(measured, rel=rel)
 
 
 def test_attention_block_sizes_rank_like_the_hardware(predicted_ms):
