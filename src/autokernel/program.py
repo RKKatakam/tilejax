@@ -43,7 +43,7 @@ import dataclasses
 import functools
 import inspect
 import types
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -93,8 +93,11 @@ def is_single_nest(fdef: ast.FunctionDef) -> bool:
     before, after = body[: loops[0]], body[loops[0] + 1 :]
     if not all(isinstance(s, (ast.Assign, ast.AnnAssign, ast.Assert, ast.Pass)) for s in before):
         return False
-    if {_store_target(s) for s in stores} - {_target(s) for s in before}:
+    outs = {_store_target(s) for s in stores}
+    if outs - {_target(s) for s in before}:
         return False  # it updates an array it doesn't allocate (an argument): a program's nest can
+    if any(isinstance(n, ast.Name) and n.id in outs and id(n) in _shape_reads(top) for n in ast.walk(top)):
+        return False  # it reads an output's shape (`range(0, out.shape[0], T)`): a program's nest can
     if len(after) > 1:
         return False
     outputs: set[str] = set()
@@ -116,6 +119,28 @@ def _holds_nests(fdef: ast.FunctionDef, loop: ast.For) -> bool:
     return bool(_Finder(fdef, fdef.name, 1, strict=False, body=loop.body).regions)
 
 
+_FILLS = frozenset({"zeros", "ones", "full", "empty", "zeros_like", "ones_like", "full_like", "empty_like"})
+
+
+def _is_fill(e: ast.expr) -> bool:
+    """Is `e` a constant-fill allocation, `jnp.zeros(...)`, `jnp.full(..., v)`, ... (possibly `.astype(...)`)?"""
+    while isinstance(e, ast.Call) and isinstance(e.func, ast.Attribute) and e.func.attr == "astype":
+        e = e.func.value
+    if not isinstance(e, ast.Call):
+        return False
+    f = e.func
+    return (f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", None)) in _FILLS
+
+
+def _keeps(nest: frontend.LoopNest) -> frontend.LoopNest:
+    """A program's nest whose outputs computed by its allocations (`y = x * 2` just before it, moved into the
+    kernel) keep those values where no tile writes, as in Python (the kernel is given the allocation, aliased
+    to the output). A constant fill (`jnp.zeros(...)`) must still be covered by the tiles, as in a single
+    kernel: a nest that leaves zeros behind is most likely a mistake."""
+    outputs = [dataclasses.replace(o, keeps=o.keeps or not _is_fill(o.alloc)) for o in nest.outputs]
+    return dataclasses.replace(nest, outputs=outputs)
+
+
 def _strip_docstring(body: list[ast.stmt]) -> list[ast.stmt]:
     if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
         return body[1:]
@@ -129,9 +154,14 @@ def _target(s: ast.stmt) -> str | None:
     return None
 
 
+def _shape_reads(node: ast.AST) -> set[int]:
+    """The ids of the names in `node` read only for their `.shape`, `.dtype`, `.ndim` or `.size`."""
+    return {id(n.value) for n in ast.walk(node) if isinstance(n, ast.Attribute) and n.attr in _SHAPE_ATTRS}
+
+
 def _reads_values(s: ast.stmt, params: set[str]) -> bool:
     """Does `s` use one of `params` other than through `.shape`, `.dtype`, `.ndim` or `.size`?"""
-    shape_reads = {id(n.value) for n in ast.walk(s) if isinstance(n, ast.Attribute) and n.attr in _SHAPE_ATTRS}
+    shape_reads = _shape_reads(s)
     return any(isinstance(n, ast.Name) and n.id in params and id(n) not in shape_reads for n in ast.walk(s))
 
 
@@ -219,8 +249,41 @@ def _tiles(store: ast.Assign, loop_vars: set[str]) -> bool:
     return True
 
 
+_COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)
+_FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+
+
+def _stores(nodes: list[ast.AST]) -> set[str]:
+    """The names `nodes` bind in their own scope: assignment, loop and `with` targets, `del`, imports,
+    `except ... as`, `match` captures, nested function and class names and walrus targets (in comprehensions
+    too), but not the names comprehensions, lambdas and nested functions bind for themselves."""
+    names: set[str] = set()
+    stack: list[ast.AST] = list(nodes)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+            continue
+        if isinstance(node, ast.Lambda):
+            continue
+        if isinstance(node, _COMPREHENSIONS):  # its targets are its own; a walrus binds in the enclosing scope
+            names.update(n.target.id for n in ast.walk(node) if isinstance(n, ast.NamedExpr))
+            continue
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            names.add(node.id)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            names.update(a.asname or a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and node.name:
+            names.add(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            names.add(node.rest)
+        stack.extend(ast.iter_child_nodes(node))
+    return names
+
+
 def _bound(node: ast.AST) -> set[str]:
-    return {n.id for n in ast.walk(node) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+    """The names `node` binds in its scope (see `_stores`)."""
+    return _stores([node])
 
 
 def _loaded(node: ast.AST) -> set[str]:
@@ -261,9 +324,10 @@ def _nest_stores(top: ast.For) -> list[ast.Assign]:
             inner = [n for s in node.body for n in ast.walk(s) if isinstance(n, ast.For)]
             if any(_nest_stores(n) for n in inner):
                 return []  # a Python loop around nests (that also stores something itself)
-            bases = {id(s.value.func.value.value.value) for s in stores}  # the `v` of each `v.at`
+            # The `v` of each `v.at`, and reads of an output's shape (`range(0, v.shape[0], T)`), not its values.
+            allowed = {id(s.value.func.value.value.value) for s in stores} | _shape_reads(top)
             for n in ast.walk(top):
-                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id in outputs and id(n) not in bases:
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id in outputs and id(n) not in allowed:
                     return []
             return stores
         body = node.body
@@ -293,26 +357,8 @@ def _local_names(fdef: ast.FunctionDef) -> set[str]:
     a = fdef.args
     names = {p.arg for p in a.posonlyargs + a.args + a.kwonlyargs}
     names |= {p.arg for p in (a.vararg, a.kwarg) if p is not None}
-    declared: set[str] = set()
-    stack: list[ast.AST] = list(fdef.body)
-    scopes = (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
-    while stack:
-        node = stack.pop()
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            names.add(node.name)
-            continue
-        if isinstance(node, scopes):
-            continue
-        if isinstance(node, (ast.Global, ast.Nonlocal)):
-            declared.update(node.names)
-        elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
-            names.add(node.id)
-        elif isinstance(node, (ast.Import, ast.ImportFrom)):
-            names.update(alias.asname or alias.name.split(".")[0] for alias in node.names)
-        elif isinstance(node, ast.ExceptHandler) and node.name:
-            names.add(node.name)
-        stack.extend(ast.iter_child_nodes(node))
-    return names - declared
+    declared = {n for s in _walk_scope(fdef.body) if isinstance(s, (ast.Global, ast.Nonlocal)) for n in s.names}
+    return (names | _stores(fdef.body)) - declared
 
 
 class _Finder:
@@ -350,9 +396,15 @@ class _Finder:
     @staticmethod
     def allocation(stmts: list[ast.stmt], n: int, var: str) -> ast.Assign | None:
         """The statement allocating output `var` of the nest `stmts[n]` that can move into the nest: the
-        `var = expr` last binding `var` in the same block, when nothing between them reads `var` or
-        changes what `expr` reads (and the nest doesn't bind what it reads either). Otherwise None: the
-        nest starts from `var`'s current value, whatever computed it."""
+        `var = expr` last binding `var` in the same block, when nothing between them reads `var` or changes
+        what `expr` reads, the nest doesn't bind what it reads either, and the nest doesn't read `var`'s
+        shape. Otherwise None: the nest starts from `var`'s current value, whatever computed it.
+
+        Either way, elements no tile writes keep the value Python gives them, except that a constant fill
+        moved into the nest (`jnp.zeros(...)`) must be covered: see `_keeps`."""
+        loop = stmts[n]
+        if any(isinstance(m, ast.Name) and m.id == var and id(m) in _shape_reads(loop) for m in ast.walk(loop)):
+            return None  # the nest reads `var.shape`: it is given `var`
         for a in range(n - 1, -1, -1):
             s = stmts[a]
             if var not in _bound(s):
@@ -417,12 +469,13 @@ def _index(block: list[ast.stmt], node: ast.stmt) -> int:
 
 # --------------------------------------------------------------------------- names a nest binds
 
-_COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)
-
 
 def _scope_loads(node: ast.AST, bound: frozenset[str] = frozenset()) -> Iterator[ast.Name]:
     """The names `node` reads from its scope: not those its comprehensions, lambdas and nested functions
-    bind themselves. Reads inside nested functions count (a closure reads the variable when it runs)."""
+    bind themselves. Reads inside nested functions count (a closure reads the variable when it runs), and so
+    does the target of `name op= value`, which reads `name` before binding it."""
+    if isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name) and node.target.id not in bound:
+        yield node.target
     if isinstance(node, _COMPREHENSIONS):
         gens = node.generators
         inner = bound | {n.id for g in gens for n in ast.walk(g.target) if isinstance(n, ast.Name)}
@@ -451,18 +504,6 @@ def _scope_loads(node: ast.AST, bound: frozenset[str] = frozenset()) -> Iterator
         return
     for child in ast.iter_child_nodes(node):
         yield from _scope_loads(child, bound)
-
-
-def _scope_stores(s: ast.stmt) -> set[str]:
-    """The names a simple statement binds in its scope."""
-    inner = {
-        n.id
-        for c in ast.walk(s)
-        if isinstance(c, (*_COMPREHENSIONS, ast.Lambda))
-        for n in ast.walk(c)
-        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
-    }
-    return _stores([s]) - inner
 
 
 class _ReadsAfter:
@@ -528,10 +569,7 @@ class _ReadsAfter:
             return hit, set()
         if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             return self.first(s, live), {s.name}
-        hit = self.first(s, live)
-        if hit is None and isinstance(s, ast.AugAssign) and isinstance(s.target, ast.Name) and s.target.id in live:
-            hit = s.target
-        return hit, _scope_stores(s)
+        return self.first(s, live), _bound(s)
 
 
 def _path(stmts: list[ast.stmt], node: ast.stmt) -> list[tuple[list[ast.stmt], int]] | None:
@@ -584,14 +622,24 @@ def _check_reads_after(fdef: ast.FunctionDef, regions: list[_Region], fn_name: s
             )
 
 
-def _program_ast(
-    fdef: ast.FunctionDef, fn_name: str, first_line: int
-) -> tuple[ast.FunctionDef, list[_Region], list[tuple[list[int], list[str], list[str]]]]:
+@dataclass
+class _ProgramAst:
+    """A program's function, rewritten (see `_program_ast`)."""
+
+    fdef: ast.FunctionDef  # what runs: nests as kernel calls, runs of them as group calls, loops rolled
+    reference: ast.FunctionDef  # the original control flow, each nest a call of its Python loops
+    regions: list[_Region]
+    groups: list[tuple[list[int | _ViewStmt], list[str], list[str]]]  # (items, inputs, outputs) per group
+    unrolled: list[str]  # why Python loops around nests aren't rolled, decided from the code
+
+
+def _program_ast(fdef: ast.FunctionDef, fn_name: str, first_line: int) -> _ProgramAst:
     """The function with each nest (and its allocations) replaced by a call of the nest's kernels, each run
     of consecutive nests by one call of the run (a *group*: the nests a fused kernel can run), and each
     Python `for` loop around nests by a call of `_LOOP` (which runs it as a `jax.lax.fori_loop` if it can).
 
-    Returns the function, the nests, and per group: (its nests' indices, its inputs, its outputs).
+    Also the function with only the nests replaced (by calls of their Python loops), the original control
+    flow left as written: the reference, so that `verify` checks the grouping and loop rolling too.
     """
     fdef = copy.deepcopy(fdef)
     regions = _find(fdef, fn_name, first_line, strict=True)
@@ -608,12 +656,13 @@ def _program_ast(
         for var, alloc in zip(r.outputs, r.allocs, strict=True):
             if var not in r.existing:  # moved into the nest
                 del r.block[_index(r.block, alloc)]
+    reference = ast.fix_missing_locations(copy.deepcopy(fdef))
     groups = []
     local = _local_names(fdef)
     for block in {id(r.block): r.block for r in regions}.values():
         groups += _group_runs(block, calls, regions, local)
-    _roll_loops(fdef)
-    return ast.fix_missing_locations(fdef), regions, _number_groups(groups)
+    unrolled = _roll_loops(fdef, first_line)
+    return _ProgramAst(ast.fix_missing_locations(fdef), reference, regions, _number_groups(groups), unrolled)
 
 
 # Layout glue between nests that only relabels an array's elements: `x.reshape(...)`, `x.T`, `x[0]`, ...
@@ -776,48 +825,138 @@ def _escapes(body: list[ast.stmt]) -> bool:
     return False
 
 
-def _stores(nodes: list[ast.stmt]) -> set[str]:
-    names = set()
-    for node in _walk_scope(nodes):
-        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
-            names.add(node.id)
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            names.add(node.name)
-        elif isinstance(node, (ast.Import, ast.ImportFrom)):
-            names.update(a.asname or a.name.split(".")[0] for a in node.names)
-    return names
+# Calls a fori_loop would run once rather than once per iteration (side effects at trace time).
+_IMPURE_CALLS = frozenset(
+    {"print", "input", "open", "exec", "eval", "setattr", "delattr", "next", "breakpoint", "globals", "locals", "vars"}
+)
+# Methods of Python containers that only read them.
+_READERS = frozenset({"get", "items", "keys", "values", "copy", "index", "count"})
+
+
+def _exposed(stmts: list[ast.stmt], written: set[str]) -> tuple[set[str], set[str]]:
+    """The names `stmts` may read before binding them, when `written` are bound before them, and the names
+    bound after them for certain (`written` included). A statement's reads happen before its writes; a loop's
+    body may not run, and a branch of an `if` binds only what both branches bind."""
+    written, exposed = set(written), set()
+
+    def reads(node: ast.AST | None) -> set[str]:
+        return set() if node is None else {n.id for n in _scope_loads(node)} - written
+
+    for s in stmts:
+        if isinstance(s, (ast.For, ast.AsyncFor)):
+            exposed |= reads(s.iter) | _exposed(s.body, written | _bound(s.target))[0] | _exposed(s.orelse, written)[0]
+        elif isinstance(s, ast.While):
+            exposed |= reads(s.test) | _exposed(s.body, written)[0] | _exposed(s.orelse, written)[0]
+        elif isinstance(s, ast.If):
+            (e1, w1), (e2, w2) = _exposed(s.body, written), _exposed(s.orelse, written)
+            exposed |= reads(s.test) | e1 | e2
+            written |= w1 & w2
+        elif isinstance(s, (ast.With, ast.AsyncWith)):
+            for item in s.items:
+                exposed |= reads(item.context_expr)
+                written |= _bound(item.optional_vars) if item.optional_vars is not None else set()
+            e, written = _exposed(s.body, written)
+            exposed |= e
+        elif _blocks(s):  # try, match: every read may come first, and nothing is bound for certain
+            exposed |= reads(s)
+        else:
+            exposed |= reads(s)
+            written |= _bound(s)
+    return exposed, written
 
 
 def _upward_exposed(body: list[ast.stmt]) -> set[str]:
-    """Names `body` may read before writing them: the values a loop carries from one iteration to the next.
-
-    Statement by statement, a statement's reads count as happening before its writes.
-    """
-    written: set[str] = set()
-    exposed: set[str] = set()
-    for s in body:
-        exposed |= {n.id for n in ast.walk(s) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)} - written
-        written |= _stores([s])
-    return exposed
+    """Names `body` may read before writing them: the values a loop carries from one iteration to the next."""
+    return _exposed(body, set())[0]
 
 
-def _roll_loops(fdef: ast.FunctionDef) -> None:
+def _binds(s: ast.stmt) -> set[str]:
+    """The names statement `s` binds when it has run: for an `if`, those both branches bind; for loops and
+    other compound statements, everything they bind (a loop around nests runs: its range isn't empty)."""
+    if isinstance(s, ast.If):
+        return set().union(*map(_binds, s.body)) & set().union(*map(_binds, s.orelse))
+    return _bound(s)
+
+
+def _root(e: ast.expr) -> str | None:
+    """The name an attribute or subscript chain starts from: `a` for `a.b[0].c`."""
+    while isinstance(e, (ast.Attribute, ast.Subscript)):
+        e = e.value
+    return e.id if isinstance(e, ast.Name) else None
+
+
+def _side_effect(body: list[ast.stmt], line: Callable[[ast.AST], int]) -> str | None:
+    """Why the loop `body` changes state other than its own values (which a fori_loop, tracing it once,
+    would do once rather than once per iteration), or None. (Method calls, `outs.append(h)`, are checked when
+    the loop runs, from the objects they are called on: see `_receivers`.)"""
+    for node in (n for s in body for n in ast.walk(s)):
+        if isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            return f"line {line(node)}: `{ast.unparse(node)}` is assigned, which changes a Python object"
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Name) and node.func.id in _IMPURE_CALLS:
+            return f"line {line(node)}: `{node.func.id}(...)` has an effect outside the loop's values"
+    return None
+
+
+def _stale_closure(
+    fdef: ast.FunctionDef, loop: ast.For, assigned: set[str], carried: list[str], line: Callable[[ast.AST], int]
+) -> str | None:
+    """Why rolling `loop` would let a function read stale values, or None: a function, lambda or generator
+    defined outside the loop that reads a name the loop assigns would see the value from before the loop
+    (the rolled body binds its own copies), and one defined in it that reads a value the loop carries could
+    outlive the iteration (and the trace)."""
+    inside = {id(n) for n in ast.walk(loop)}
+    for node in ast.walk(fdef):
+        if node is fdef or not isinstance(node, (*_FUNCTIONS, ast.GeneratorExp)):
+            continue
+        if getattr(node, "name", "").startswith(_BODY):  # the body of a rolled loop: it runs where it is defined
+            continue
+        names = set(carried) if id(node) in inside else assigned
+        read = sorted({n.id for n in _scope_loads(node)} & names)
+        if read:
+            what = {ast.Lambda: "lambda", ast.GeneratorExp: "generator"}.get(type(node), "function")
+            where = "in" if id(node) in inside else "outside"
+            return f"line {line(node)}: a {what} defined {where} the loop reads `{read[0]}`, which the loop changes"
+    return None
+
+
+def _receivers(body: list[ast.stmt], local: set[str]) -> tuple[tuple[str, str], ...]:
+    """(name, method) for each method call `name....method(...)` in `body` on a value from outside it (not one
+    of `local`, the names it binds afresh): checked when the loop runs (a method of a Python object may change
+    it, so the loop is unrolled)."""
+    out = []
+    for node in (n for s in body for n in ast.walk(s)):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            root = _root(node.func.value)
+            if root is not None and root not in local and not root.startswith("__autokernel"):
+                out.append((root, node.func.attr))
+    return tuple(dict.fromkeys(out))
+
+
+def _roll_loops(fdef: ast.FunctionDef, first_line: int = 1) -> list[str]:
     """Replace each Python `for v in range(...)` loop around nests whose body can run as a function of `v`
-    and the values it carries by a call of `_LOOP` (innermost loops first)."""
+    and the values it carries by a call of `_LOOP` (innermost loops first). Returns why each other loop
+    around nests isn't (`TpuProgram.unrolled`).
+
+    Rolling is conservative: the body may only change its own local values (no attribute or item
+    assignments, `print`, `list.append`, ...), no function defined outside the loop may read what the loop
+    assigns, and every value it carries must have one before it. Values it carries that aren't arrays, and
+    methods it calls on Python objects from outside, unroll it when it runs (see `TpuProgram._loop`)."""
     a = fdef.args
     params = {p.arg for p in a.posonlyargs + a.args + a.kwonlyargs}
     params |= {p.arg for p in (a.vararg, a.kwarg) if p is not None}
     counter = iter(range(1 << 30))
+    reasons: list[str] = []
+
+    def line(node: ast.AST) -> int:
+        return first_line + node.lineno - 1
 
     def outside_loads(loop: ast.For) -> set[str]:
         inside = {id(n) for n in ast.walk(loop)}
-        return {
-            n.id
-            for n in ast.walk(fdef)
-            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and id(n) not in inside
-        }
+        return {n.id for s in fdef.body for n in _scope_loads(s) if id(n) not in inside}
 
-    def roll(loop: ast.For, bound: set[str]) -> list[ast.stmt] | None:
+    def roll(loop: ast.For, bound: set[str]) -> list[ast.stmt] | str:
         it = loop.iter
         ok = (
             not loop.orelse
@@ -829,16 +968,22 @@ def _roll_loops(fdef: ast.FunctionDef) -> None:
             and 1 <= len(it.args) <= 3
             and not any(isinstance(x, ast.Starred) for x in it.args)
         )
-        if not ok or _escapes(loop.body):
-            return None
+        if not ok:
+            return "it isn't a `for v in range(...)` loop"
+        if _escapes(loop.body):
+            return "control leaves its body early (`break`, `continue`, `return`, `del`, ...)"
         var = loop.target.id
         assigned = _stores(loop.body)
         loads = outside_loads(loop)
         if var in assigned or var in loads:
-            return None
+            return f"its body assigns `{var}`, or `{var}` is read after it"
         carried = sorted((assigned & (loads | _upward_exposed(loop.body))) - {var})
-        if any(c not in bound for c in carried):
-            return None  # a value the loop leaves behind that has none before it
+        unbound = [c for c in carried if c not in bound]
+        if unbound:
+            return f"`{unbound[0]}` changes in it but may have no value before it"
+        why = _side_effect(loop.body, line) or _stale_closure(fdef, loop, assigned, carried, line)
+        if why is not None:
+            return why
         k = next(counter)
         name = f"{_BODY}_{k}"
 
@@ -852,7 +997,8 @@ def _roll_loops(fdef: ast.FunctionDef) -> None:
         )
         fn = ast.FunctionDef(name=name, args=args, body=body, decorator_list=[], type_params=[])
         bounds = ast.Tuple(list(it.args), ast.Load())
-        call = ast.Call(ast.Name(_LOOP, ast.Load()), [bounds, ast.Name(name, ast.Load()), names(ast.Load)], [])
+        info = ast.Constant((line(loop), tuple(carried), _receivers(loop.body, (assigned - set(carried)) | {var})))
+        call = ast.Call(ast.Name(_LOOP, ast.Load()), [bounds, ast.Name(name, ast.Load()), names(ast.Load), info], [])
         run = ast.Assign([names(ast.Store)], call) if carried else ast.Expr(call)
         out = [ast.copy_location(fn, loop), ast.copy_location(run, loop)]
         for node in out:
@@ -862,18 +1008,32 @@ def _roll_loops(fdef: ast.FunctionDef) -> None:
         return out
 
     def process(block: list[ast.stmt], bound: set[str]) -> None:
+        """Roll the loops in `block`, where `bound` are the names that have values when it starts."""
         bound = set(bound)
         out: list[ast.stmt] = []
         for s in block:
-            inner = bound | (_stores([s]) if isinstance(s, (ast.For, ast.AsyncFor, ast.While)) else set())
-            for sub in _blocks(s):
-                process(sub, inner)
+            if isinstance(s, (ast.For, ast.AsyncFor)):  # on its first iteration, only the target is new
+                process(s.body, bound | _bound(s.target))
+                process(s.orelse, bound)
+            elif isinstance(s, (ast.With, ast.AsyncWith)):
+                process(s.body, bound | _stores([i.optional_vars for i in s.items if i.optional_vars is not None]))
+            elif isinstance(s, (ast.Try, ast.TryStar)):
+                for sub in (s.body, s.orelse, s.finalbody):
+                    process(sub, bound)
+                for handler in s.handlers:
+                    process(handler.body, bound | ({handler.name} if handler.name else set()))
+            else:
+                for sub in _blocks(s):
+                    process(sub, bound)
             rolled = roll(s, bound) if isinstance(s, ast.For) and _calls_kernels(s) else None
-            out += rolled if rolled is not None else [s]
-            bound |= _stores([s])
+            if isinstance(rolled, str):
+                reasons.append(f"line {line(s)}: {rolled}")
+            out += rolled if isinstance(rolled, list) else [s]
+            bound |= _binds(s)
         block[:] = out
 
     process(fdef.body, params)
+    return reasons
 
 
 def _compile(fdef: ast.FunctionDef, fn: Callable, filename: str, first_line: int, extra: dict[str, Any]) -> Callable:
@@ -951,6 +1111,117 @@ def _uses(region: _Region) -> dict[str, set[tuple[str, ...]]]:
     return uses
 
 
+_BINARY: dict[type, Callable[[int, int], int]] = {
+    ast.Add: int.__add__,
+    ast.Sub: int.__sub__,
+    ast.Mult: int.__mul__,
+    ast.FloorDiv: int.__floordiv__,
+    ast.Mod: int.__mod__,
+    ast.Pow: int.__pow__,
+    ast.LShift: int.__lshift__,
+    ast.RShift: int.__rshift__,
+    ast.BitOr: int.__or__,
+    ast.BitXor: int.__xor__,
+    ast.BitAnd: int.__and__,
+}
+_UNARY: dict[type, Callable[[int], int]] = {ast.USub: int.__neg__, ast.UAdd: int.__pos__, ast.Invert: int.__invert__}
+
+
+@dataclass(frozen=True)
+class _IntArith:
+    """The integer arithmetic of a nest's tile body (`x * (p * p)`, `h * (layer + 1)`): a Python int it reads
+    is a runtime scalar only if this arithmetic, done in the kernel's int32, gives what Python gives."""
+
+    exprs: dict[str, list[ast.expr]]  # per name: the largest integer expressions it is part of
+    unknown: frozenset[str]  # integers whose values only the kernel knows: loop variables, integer temporaries
+
+    def fits(self, name: str, value_of: Callable[[str], Any]) -> bool:
+        """Does every integer expression `name` is part of stay inside int32, with the values `value_of` gives
+        (None: not a Python int, so not integer arithmetic)?"""
+
+        def ev(e: ast.expr) -> int | None:
+            if isinstance(e, ast.Constant):
+                return e.value if isinstance(e.value, int) else None
+            if isinstance(e, ast.Name):
+                if e.id in self.unknown:
+                    raise OverflowError  # its range isn't known here: assume the worst
+                v = value_of(e.id)
+                return int(v) if v is not None else None
+            if isinstance(e, ast.UnaryOp):
+                v = ev(e.operand)
+                out = None if v is None else _UNARY[type(e.op)](v)
+            else:
+                a, b = ev(e.left), ev(e.right)
+                if a is None or b is None:
+                    return None
+                if isinstance(e.op, (ast.Pow, ast.LShift)) and not 0 <= b <= 64:
+                    raise OverflowError
+                out = _BINARY[type(e.op)](a, b)
+            if out is not None and not _INT32.min <= out <= _INT32.max:
+                raise OverflowError
+            return out
+
+        try:
+            for e in self.exprs.get(name, ()):
+                ev(e)
+        except (OverflowError, ZeroDivisionError, ValueError):
+            return False
+        return True
+
+
+def _int_arith(region: _Region) -> _IntArith:
+    """Find the integer expressions of a nest's tile body (see `_IntArith`). An operand counts as an integer
+    if it is a constant, a loop variable, a name from outside the nest (its value decides) or a temporary
+    assigned only integer expressions; a tile (`x[...]`, a call) ends the expression."""
+    loop = region.loop
+    loop_vars = {n.target.id for n in ast.walk(loop) if isinstance(n, ast.For) and isinstance(n.target, ast.Name)}
+    own = _bound(loop)
+    assigns: dict[str, list[ast.expr]] = {}
+    for n in ast.walk(loop):
+        if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
+            assigns.setdefault(n.targets[0].id, []).append(n.value)
+        elif isinstance(n, (ast.AugAssign, ast.AnnAssign)) and isinstance(n.target, ast.Name):
+            value = ast.BinOp(n.target, n.op, n.value) if isinstance(n, ast.AugAssign) else n.value
+            assigns.setdefault(n.target.id, []).append(value)
+
+    def int_like(e: ast.expr | None, ints: set[str]) -> bool:
+        if isinstance(e, ast.Constant):
+            return isinstance(e.value, int)
+        if isinstance(e, ast.Name):
+            return e.id in ints or e.id not in own
+        if isinstance(e, ast.UnaryOp):
+            return type(e.op) in _UNARY and int_like(e.operand, ints)
+        if isinstance(e, ast.BinOp):
+            return type(e.op) in _BINARY and int_like(e.left, ints) and int_like(e.right, ints)
+        return False
+
+    ints = set(loop_vars)
+    while True:  # temporaries assigned only integer expressions (of loop variables, constants, ...)
+        more = {v for v, xs in assigns.items() if v not in ints and all(int_like(x, ints) for x in xs)}
+        if not more:
+            break
+        ints |= more
+    parents = {id(c): p for p in ast.walk(loop) for c in ast.iter_child_nodes(p)}
+    exprs: dict[str, list[ast.expr]] = {}
+    for n in ast.walk(loop):
+        if not (isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)) or n.id in own:
+            continue
+        node, root = n, None
+        while True:
+            p = parents.get(id(node))
+            if isinstance(p, ast.UnaryOp) and int_like(p, ints):
+                node = root = p
+            elif isinstance(p, ast.BinOp) and type(p.op) in _BINARY:
+                if not int_like(p.right if p.left is node else p.left, ints):
+                    break
+                node = root = p
+            else:
+                break
+        if root is not None:
+            exprs.setdefault(n.id, []).append(root)
+    return _IntArith(exprs, frozenset(ints))
+
+
 # --------------------------------------------------------------------------- runtime
 
 
@@ -999,9 +1270,32 @@ def _concrete(args: tuple[Any, ...]) -> bool:
     return all(isinstance(x, np.ndarray) or not isinstance(x, (jax.core.Tracer, jax.ShapeDtypeStruct)) for x in leaves)
 
 
+class _Static:
+    """A static argument (one holding no arrays: a number, a string, a dict of options) as `jax.jit` needs
+    it: hashable, by its pytree structure and leaves, even when it is a list or a dict."""
+
+    def __init__(self, value: Any):
+        self.value = value
+        leaves, tree = jax.tree.flatten(value)
+        self.key = (tree, tuple((type(x), x) for x in leaves))
+        try:
+            self.hash = hash(self.key)
+        except TypeError:
+            raise AutoKernelError(
+                f"a static argument (one holding no arrays) must be hashable, or a list, tuple or dict of hashable "
+                f"values: the program is compiled once per value of it, and {value!r} isn't"
+            ) from None
+
+    def __hash__(self) -> int:
+        return self.hash
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _Static) and self.key == other.key
+
+
 def _arg_key(arg: Any) -> Any:
     if _is_static(arg):
-        return ("static", arg)
+        return ("static", _Static(arg))
     leaves, tree = jax.tree.flatten(arg)
     specs = tuple((tuple(x.shape), np.dtype(x.dtype)) if _is_array(x) else type(x) for x in leaves)
     return (tree, specs)
@@ -1101,9 +1395,13 @@ class ProgramNest:
         self.outputs = list(region.outputs)
         self.kernels: dict[tuple, TpuKernel] = {}  # (arrays, scalars, constants) -> kernel
         self.uses = _uses(region)
+        self.int_arith = _int_arith(region)
+        # Global and closure names it reads (not arrays read through subscripts): constants of its kernels.
+        own = set(region.inputs) | set(region.globals) | set(region.outputs) | _bound(region.loop)
+        self.outer_names = sorted(region.names - own)
         self.compiled_in: set[str] = set()  # Python ints that turned out to be needed at trace time
         self.unmapped: set[tuple[str, tuple]] = set()  # (param, view) pairs it can't read as windows of a base
-        self._compiled: dict[int, Callable] = {}  # kernels reading views: by id(lowered)
+        self._compiled: dict[int, tuple[Lowered, Callable]] = {}  # kernels reading views: by id(lowered)
 
     def __repr__(self) -> str:
         return f"<ProgramNest {self.name} (line {self.line}): {', '.join(self.outputs)}>"
@@ -1141,6 +1439,8 @@ class ProgramNest:
             if _known(v):
                 v = int(v)
                 runtime = runtime and n not in self.compiled_in and _INT32.min <= v <= _INT32.max
+                # Integer arithmetic on it (`p * p`) runs in int32 in the kernel: only if Python gets the same.
+                runtime = runtime and self.int_arith.fits(n, functools.partial(self._int_value, values))
             if runtime:
                 scalars.append(n)
             elif _known(v):
@@ -1154,6 +1454,12 @@ class ProgramNest:
                 )
         return arrays, scalars, consts
 
+    def _int_value(self, values: dict[str, Any], name: str) -> int | None:
+        """The value of `name` (one of the nest's values, or a global or closure variable) if it is a known
+        Python integer, else None."""
+        v = values[name] if name in values else self.program._outer_value(name)
+        return int(v) if _is_int(v) and _known(v) and not _is_array(v) else None
+
     def prepare(self, values: dict[str, Any]) -> NestCall:
         """The kernel for these values (arrays, or their shapes), lowered."""
         values = self.with_globals(values)
@@ -1163,11 +1469,15 @@ class ProgramNest:
             scalar_key = tuple((n, np.dtype(values[n].dtype).name, _weak_type(values[n])) if _is_float(values[n])
                                else n for n in scalars)  # fmt: skip
             key = (tuple(arrays), scalar_key, tuple((n, type(v), self._hashable(n, v)) for n, v in consts.items()))
+            key += (self._outer_consts(),)
             # Views (of an earlier nest's output, say) it reads as windows of their base array: no copy.
             remap = {
                 n: values[n]
                 for n in arrays
-                if isinstance(values[n], View) and not self.program._eager and (n, values[n].key) not in self.unmapped
+                if isinstance(values[n], View)
+                and not self.program._eager
+                and n not in self.region.existing  # an output updated in place is its own array
+                and (n, values[n].key) not in self.unmapped
             }
             if remap:
                 key += (tuple((n, v.key) for n, v in remap.items()),)
@@ -1214,6 +1524,22 @@ class ProgramNest:
         outs = tuple(jnp.zeros(o.out.shape, o.out.dtype) for o in call.lowered.outputs)
         return outs if len(outs) > 1 else outs[0]
 
+    def _outer_consts(self) -> tuple:
+        """The current values of the global and closure variables the nest reads (but arrays), which its
+        kernels compile in when they are built: part of a kernel's key, so that a kernel built before one of
+        them changed isn't reused for later calls (which see the new value, as the code between nests does)."""
+        out = []
+        for name in self.outer_names:
+            v = self.program._outer_value(name)
+            if _is_array(v):
+                continue
+            try:
+                hash(v)
+            except TypeError:  # a dict or list: compiled in as it was when the kernel was built
+                continue
+            out.append((name, type(v), v))
+        return tuple(out)
+
     def _hashable(self, name: str, value: Any) -> Any:
         try:
             hash(value)
@@ -1229,11 +1555,13 @@ class ProgramNest:
         `call.kernel(...)`, which takes the views' arrays)."""
         lowered, kernel = call.lowered, call.kernel
         lowered.check_indices({p: a for p, a in zip(call.params, args, strict=True) if p in lowered.scalars})
-        fn = self._compiled.get(id(lowered))
-        if fn is None:
-            fn = self._compiled[id(lowered)] = jax.jit(
-                functools.partial(lowered.entry, interpret=kernel._interpret_mode())
+        cached = self._compiled.get(id(lowered))
+        if cached is None or cached[0] is not lowered:
+            cached = self._compiled[id(lowered)] = (
+                lowered,
+                jax.jit(functools.partial(lowered.entry, interpret=kernel._interpret_mode())),
             )
+        fn = cached[1]
         views = {n: values[n] for n in call.views}
 
         def arrays(*xs: Any) -> list[Any]:
@@ -1249,7 +1577,7 @@ class ProgramNest:
 
     def _kernel(self, params: list[str], consts: dict[str, Any], views: dict | None = None) -> TpuKernel:
         program = self.program
-        nest = frontend.parse_function(_nest_ast(self.region, params), self.name, program.first_line)
+        nest = _keeps(frontend.parse_function(_nest_ast(self.region, params), self.name, program.first_line))
         names = analysis.user_globals(program.fn)
         names.update(consts)
         options = program.options
@@ -1322,8 +1650,9 @@ class ProgramGroup:
         self.program, self.items, self.inputs, self.outputs = program, items, inputs, outputs
         self.nests = [item for item in items if isinstance(item, ProgramNest)]
         self.views = [item for item in items if isinstance(item, _ViewStmt)]
+        # By the parts' ids: the fused kernel holds its parts (`parts`), so their ids aren't reused meanwhile.
         self.fused: dict[tuple, fusion.FusedLowered] = {}
-        self._compiled: dict[int, Callable] = {}
+        self._compiled: dict[int, tuple[fusion.FusedLowered, Callable]] = {}  # by id(fused), with it
 
     def __repr__(self) -> str:
         return f"<ProgramGroup {', '.join(n.name for n in self.nests)}>"
@@ -1435,7 +1764,10 @@ class ProgramGroup:
                 arrays = {r: _spec(x) for r, x in values.items() if _is_array(x)}
                 others = {r: x for r, x in values.items() if r not in arrays}
                 fn = fns[id(v.item)]
-                shapes[id(v)] = jax.eval_shape(lambda a, fn=fn, others=others: fn({**others, **a}), arrays)
+                if arrays:
+                    shapes[id(v)] = jax.eval_shape(lambda a, fn=fn, others=others: fn({**others, **a}), arrays)
+                else:  # Python glue (`tm = tiles[0]` of a tuple): its value, as the code will compute it
+                    shapes[id(v)] = fn(others)
             return shapes[id(v)]
 
         calls, names = [], []
@@ -1553,13 +1885,14 @@ class ProgramGroup:
     ) -> Any:
         """Run a fused kernel (with derivatives: those of its nests' Python loops)."""
         calls = plan.calls[seg.start : seg.end]
-        fn = self._compiled.get(id(fused))
-        if fn is None:
+        cached = self._compiled.get(id(fused))
+        if cached is None or cached[0] is not fused:
             interpret = calls[0].kernel._interpret_mode()
             if fused.cores > 1 and dataclasses.is_dataclass(interpret):  # the parts meet at barriers: simulate
                 interpret = dataclasses.replace(interpret, num_cores_or_threads=fused.cores)  # every core
             entry = functools.partial(fused.entry, interpret=interpret)
-            fn = self._compiled[id(fused)] = jax.jit(lambda *a: tuple(entry(*a)))
+            cached = self._compiled[id(fused)] = (fused, jax.jit(lambda *a: tuple(entry(*a))))
+        fn = cached[1]
 
         def reference(*arrays: Any, kernels: bool = False) -> tuple[Any, ...]:
             # The fused nests as Python loops, one after another: what `jax.grad` differentiates (with
@@ -1594,11 +1927,36 @@ def _keywords(fn: Callable, names: tuple[str, ...]) -> Callable:
     return call
 
 
-def _python_loop(bounds: tuple[int, ...], body: Callable, carry: tuple) -> tuple:
-    """Run a Python loop around nests as the plain loop it is (for the reference)."""
-    for i in range(*bounds):
-        carry = body(i, carry)
-    return carry
+def _inert(x: Any) -> bool:
+    """Is `x` a value whose methods can't change Python state a loop's next iteration sees: an array, a
+    number, a string, a dtype, a module, a function or a class?"""
+    plain = (types.ModuleType, int, float, complex, str, bytes, np.generic, np.dtype, type, types.FunctionType)
+    return x is None or _is_array(x) or isinstance(x, (*plain, types.BuiltinFunctionType))
+
+
+def _python_values(body: Callable, carry: tuple, names: tuple[str, ...], receivers: tuple) -> str | None:
+    """Why a rolled loop's body must run as Python rather than as a fori_loop, given the values it starts
+    with: a value it carries that isn't an array (a fori_loop would make a Python number a traced one), or
+    a method it calls on a Python object from outside the loop (`outs.append(h)`: it would run once)."""
+    for name, value in zip(names, carry, strict=True):
+        leaf = next((x for x in jax.tree.leaves(value) if not _is_array(x)), None)
+        if leaf is not None:
+            return f"it changes `{name}`, a Python {type(leaf).__name__}: a fori_loop would make it a traced value"
+    carried = dict(zip(names, carry, strict=True))
+    cells = dict(zip(body.__code__.co_freevars, body.__closure__ or (), strict=True))
+    for name, method in receivers:
+        try:
+            value = carried[name] if name in carried else cells[name].cell_contents if name in cells else None
+        except ValueError:  # an empty cell
+            continue
+        if name not in carried and name not in cells:
+            if name not in body.__globals__:
+                continue  # a builtin
+            value = body.__globals__[name]
+        if _inert(value) or (isinstance(value, (tuple, list, dict, set, frozenset)) and method in _READERS):
+            continue
+        return f"it calls `{name}.{method}(...)` on a Python {type(value).__name__}, which may change it"
+    return None
 
 
 class TpuProgram:
@@ -1651,7 +2009,9 @@ class TpuProgram:
         self.filename = inspect.getsourcefile(fn) or "<autokernel>"
         self.first_line = fn.__code__.co_firstlineno
         fdef = fdef if fdef is not None else frontend.function_ast(fn)
-        self._program_ast, regions, groups = _program_ast(fdef, fn.__name__, self.first_line)
+        rewritten = _program_ast(fdef, fn.__name__, self.first_line)
+        self._program_ast, self._reference_ast = rewritten.fdef, rewritten.reference
+        regions, groups = rewritten.regions, rewritten.groups
         if not regions:
             raise AutoKernelError(
                 f"{fn.__name__}: found no tile loop nest (`for v in range(...)` loops ending in stores of tiles "
@@ -1669,7 +2029,9 @@ class TpuProgram:
         self._verified: set[tuple] = set()
         self._recording: list | None = None
         self._eager = False  # running eagerly (to measure kernels): no fusion, no rolled loops
-        self.unrolled: list[str] = []  # why loops around nests were unrolled rather than rolled, most recent last
+        # Why loops around nests run unrolled rather than as fori_loops: decided from the code, then when
+        # tracing (each reason once, in the order first seen).
+        self.unrolled: list[str] = list(rewritten.unrolled)
         self._signature = inspect.signature(fn)
         self._outer_names = list(dict.fromkeys(g for nest in self.nests for g in nest.globals))
         self._outer: dict[str, Any] | None = None  # while tracing: the global arrays nests read, as traced values
@@ -1687,32 +2049,40 @@ class TpuProgram:
             self._program = _compile(self._program_ast, self.fn, self.filename, self.first_line, extra)
         return self._program
 
-    def _loop(self, bounds: tuple[int, ...], body: Callable, carry: tuple) -> tuple:
+    def _loop(
+        self, bounds: tuple[int, ...], body: Callable, carry: tuple, info: tuple[int, tuple, tuple] = (0, (), ())
+    ) -> tuple:
         """Run a Python loop around nests: as `jax.lax.fori_loop` (each kernel traced once, the loop variable a
-        runtime scalar), or, when unrolling is asked for or the body needs the loop variable's value at trace
-        time, as the Python loop it is."""
+        runtime scalar), or, when unrolling is asked for or the body needs Python values (the loop variable's
+        value at trace time, a carried Python number, a method of a Python object), as the Python loop it is.
+        `info` is (the loop's line, the names of the values it carries, its method calls (`_receivers`))."""
         r = range(*bounds)
         if not self.unroll and not self._eager and len(r) > 1:
-            recording = self._recording
-            mark = len(recording) if recording is not None else 0
-            try:
-                return jax.lax.fori_loop(0, len(r), lambda n, c: tuple(body(r.start + n * r.step, c)), tuple(carry))
-            except Exception as e:  # the body needs Python values: unroll it
-                if recording is not None:
-                    del recording[mark:]
-                self.unrolled.append(f"{type(e).__name__}: {e}")
+            line, names, receivers = info
+            why = _python_values(body, carry, names, receivers)
+            if why is None:
+                recording = self._recording
+                mark = len(recording) if recording is not None else 0
+                try:
+                    step = lambda n, c: tuple(body(r.start + n * r.step, c))  # noqa: E731
+                    return jax.lax.fori_loop(0, len(r), step, tuple(carry))
+                except Exception as e:  # the body needs Python values: unroll it
+                    if recording is not None:
+                        del recording[mark:]
+                    why = f"{type(e).__name__}: {e}"
+            why = f"line {line}: {why}"
+            if why not in self.unrolled:
+                self.unrolled.append(why)
         for i in r:
             carry = body(i, carry)
         return carry
 
     def _reference_fn(self) -> Callable:
-        if self._reference is None:  # the program, with each nest run by its kernel's `reference`
-            extra = {
-                _NESTS: [nest.reference for nest in self.nests],
-                _GROUPS: [group.reference for group in self.groups],
-                _LOOP: _python_loop,
-            }
-            self._reference = _compile(self._program_ast, self.fn, self.filename, self.first_line, extra)
+        """The original function, its control flow as written, with each nest run by its kernel's `reference`
+        (its Python loops): nothing of the program's rewriting (groups, loops run as fori_loops) is in it."""
+        if self._reference is None:
+            extra = {_NESTS: [nest.reference for nest in self.nests]}
+            self._reference = _compile(self._reference_ast, self.fn, self.filename, self.first_line, extra)
         return self._reference
 
     def _bind(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[tuple[Any, ...], tuple[str, ...]]:
@@ -1755,7 +2125,7 @@ class TpuProgram:
         def run(outer: dict[str, Any], *args: Any) -> Any:
             saved, self._outer = self._outer, outer
             try:
-                return fn(*args)
+                return fn(*(a.value if isinstance(a, _Static) else a for a in args))
             finally:
                 self._outer = saved
 
@@ -1790,7 +2160,7 @@ class TpuProgram:
                 jitted = self._jitted[(names, len(flat), static)] = jax.jit(run, static_argnums=[1 + n for n in static])
             # With `backward`, global arrays are read when tracing (its VJP takes only the arguments).
             outer = self._outer_arrays(self._outer_names) if self.backward is None else {}
-            out = jitted(outer, *flat)
+            out = jitted(outer, *(_Static(a) if n in static else a for n, a in enumerate(flat)))
         if self.verify_on_first_call and concrete and key not in self._verified:
             self._verified.add(key)
             self._check(out, self.reference(*args, **kwargs), args, kwargs)
@@ -1886,12 +2256,7 @@ class TpuProgram:
         calls = self._trace(args, kwargs)
         cuts = tuple(dict.fromkeys(c[1] for c in calls if c[0] == "cut"))
         calls = [c for c in calls if c[0] != "cut"]
-        keys: dict[ProgramNest, list[tuple]] = {}
-        for c in calls:
-            for call in [c[1]] if c[0] == "nest" else c[3]:
-                keys.setdefault(call.nest, [])
-                if call.key not in keys[call.nest]:
-                    keys[call.nest].append(call.key)
+        keys = _kernel_keys(call for c in calls for call in ([c[1]] if c[0] == "nest" else c[3]))
         kernels: dict[tuple, tuple[str, Kernel, tuple]] = {}
         for c in calls:
             specs = c[2]
@@ -1926,15 +2291,21 @@ class TpuProgram:
             else:
                 for call in c[3]:
                     nest_calls.append((call, tuple(_spec(s) for s in call.lowered.plan.spec.specs)))
-        keys: dict[ProgramNest, list[tuple]] = {}
-        for call, _ in nest_calls:
-            keys.setdefault(call.nest, [])
-            if call.key not in keys[call.nest]:
-                keys[call.nest].append(call.key)
+        keys = _kernel_keys(call for call, _ in nest_calls)
         out = {}
         for call, specs in nest_calls:
             out.setdefault(_kernel_name(call.nest, call.key, keys[call.nest]), call.kernel.tuning(*specs))
         return out
+
+
+def _kernel_keys(calls: Iterable[NestCall]) -> dict[ProgramNest, list[tuple]]:
+    """Each nest's distinct kernel keys among `calls`, in the order they first run (see `_kernel_name`)."""
+    keys: dict[ProgramNest, list[tuple]] = {}
+    for call in calls:
+        seen = keys.setdefault(call.nest, [])
+        if call.key not in seen:
+            seen.append(call.key)
+    return keys
 
 
 def _unique_names(kernels: list[tuple[str, Any, tuple]]) -> list[tuple[str, Any, tuple]]:
