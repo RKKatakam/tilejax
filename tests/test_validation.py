@@ -138,8 +138,7 @@ def f(a):
         autokernel.tpu(_load(tmp_path, src)).lower(rand((64, 128)))
 
 
-def test_rejects_tiles_that_break_tpu_layout():
-    @autokernel.tpu
+def test_rejects_tiles_that_break_tpu_layout(pipeline):
     def bad(a, b):
         c = jnp.zeros((256, 192))
         for i in range(0, 256, 64):
@@ -152,11 +151,12 @@ def test_rejects_tiles_that_break_tpu_layout():
 
     a, b = rand((256, 384)), rand((384, 192), 1)
     with pytest.raises(AutoKernelError, match="multiple of 128"):
-        bad(a, b)
-    unchecked = autokernel.tpu(bad.fn, check_tiling=False)
+        autokernel.tpu(bad, pipeline=pipeline)(a, b)
+    unchecked = autokernel.tpu(bad, check_tiling=False, pipeline=pipeline)
     if jax.default_backend() == "tpu":
-        # Mosaic itself rejects the same tiles, so the pre-check matches real hardware.
-        with pytest.raises(ValueError, match="divisible by 8 and 128"):
+        # Mosaic itself rejects the same tiles (grid: Pallas's BlockSpec check; manual: the DMA slice),
+        # so the pre-check matches real hardware.
+        with pytest.raises(Exception, match=r"divisible by 8 and 128|aligned to tiles"):
             unchecked(a, b)
     else:
         # The interpreter doesn't enforce layout rules; the kernel is still semantically correct.

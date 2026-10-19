@@ -36,18 +36,41 @@ can develop and test on a laptop.
 
 ## What it generates
 
-| Python | Pallas |
-| --- | --- |
-| outer `for` loops whose tiles the output is written in | `"parallel"` grid axes |
-| an inner loop that updates an accumulator | an `"arbitrary"` grid axis (last) |
-| `x[i:i + T, k:k + T]` | a `BlockSpec` with an index map; Pallas double-buffers the copies |
-| `acc = jnp.zeros(...)` before the inner loop | a VMEM scratch buffer, zeroed on the first step |
-| `out = out.at[...].set(value)` | the output `BlockSpec`, written on the last step |
-| `a @ b` | an MXU matmul accumulating in f32 (i32 for integer inputs) |
-| `if cond:` / `if cond: continue` on tile coordinates | a compacted grid over the active tiles only |
+By default autokernel generates a **gridless** kernel (`pipeline="manual"`): one loop over every step
+(output tile × reduction index) with hand-written, double-buffered DMAs, the way you'd write a
+performance-critical Pallas kernel by hand. A Pallas grid adds roughly 15–25 ns of pipeline bookkeeping
+to every step on a v5e; the gridless loop carries its tile and reduction counters in registers instead.
 
-Measured on a TPU v5e at 8192³, a dense matmul compiles to the same MXU instruction stream as a
-hand-written manual-DMA kernel and runs at the same speed, about 190 TFLOP/s in bf16.
+| Python | Generated Pallas (manual pipeline) |
+| --- | --- |
+| outer `for` loops whose tiles the output is written in | the tiles one loop walks, from SMEM tables |
+| an inner loop that updates an accumulator | the reduction steps of each tile |
+| `x[i:i + T, k:k + T]` | async copies into a 2-slot VMEM buffer, prefetched one step ahead |
+| `acc = jnp.zeros(...)` before the inner loop | a VMEM scratch buffer, zeroed on the first step |
+| `out = out.at[...].set(value)` | a 2-slot VMEM output buffer, copied to HBM asynchronously |
+| `a @ b` | an MXU matmul accumulating in f32 (i32 for integer inputs) |
+| `if cond:` / `if cond: continue` on tile coordinates | the loop visits the active tiles only |
+
+Inputs whose block only changes between tiles (a bias row, say) are fetched once per tile, not once per
+step. `pipeline="grid"` generates the Pallas-grid version instead: outer loops become `"parallel"` grid
+axes and slices become `BlockSpec`s, which chips with two TensorCores can split between them.
+
+## Performance
+
+TPU v5e, 8192³, milliseconds (median of 3 × 20 runs). "Hand-written" is a manual-DMA gridless Pallas
+kernel written by hand for the same tiles.
+
+| Kernel | Tiles | XLA | Hand-written | autokernel (manual) | autokernel (grid) |
+| --- | --- | --- | --- | --- | --- |
+| causal `tril(x @ y)`, bf16 | 128³ | 5.91 | 46.74 | **44.83** | 49.12 |
+| causal `tril(x @ y)`, bf16 | 1024×1024×512 | 5.91 | 3.36 | **3.35** | 3.39 |
+| causal `tril(x @ y)`, f32 | 512×512×1024 | 35.16 | 18.14 | **18.08** | 18.16 |
+| dense `x @ y`, bf16 | 1024×1024×512 | 5.90 | 5.92 | **5.89** | 5.92 |
+| dense `x @ y`, f32 | 512×512×1024 | 35.08 | 34.06 | **34.00** | 34.04 |
+
+The gridless backend matches or beats the hand-written kernel at every tile size measured (by up to 4%
+with small tiles, where per-step overhead dominates). A causal matmul with the tile mask is about 1.75×
+faster than XLA in bf16 and 1.9× in f32, because XLA computes the whole matrix.
 
 ## Supported code
 
@@ -98,14 +121,13 @@ def causal_matmul(x, y):
     return out
 ```
 
-The mask is evaluated for every tile at trace time. The grid walks only the active tiles (their
-coordinates live in scalar-prefetch tables), so skipped tiles cost no compute, no copies and no grid
-steps. Skipped tiles keep the output allocation's value. When that value is a known constant
-(`jnp.zeros`, `jnp.full(..., -inf)`, and so on), the kernel writes those tiles itself with async DMAs that
-overlap the matmuls, and the output buffer starts uninitialised instead of being filled first.
+The mask is evaluated for every tile at trace time, and the kernel visits only the active tiles
+(their coordinates live in SMEM tables), so skipped tiles cost no compute, no copies and no steps.
+Skipped tiles keep the output allocation's value. When that value is a known constant (`jnp.zeros`,
+`jnp.full(..., -inf)`, and so on), the kernel writes those tiles itself with async DMAs that overlap the
+matmuls, so the output never needs a separate fill pass.
 
-On a TPU v5e at 8192³ this runs 1.65–1.9x faster than the same loops without the mask, and nearly 2x
-faster than XLA's `jnp.tril(x @ y)`.
+On a TPU v5e at 8192³ this runs 1.65–1.9× faster than the same loops without the mask.
 
 ## Options
 
@@ -117,11 +139,12 @@ faster than XLA's `jnp.tril(x @ y)`.
     vmem_limit_bytes=None,       # raise Mosaic's scoped-VMEM limit for big tiles
     matmul_precision="highest",  # "default" uses a single bf16 MXU pass for f32 (faster, less exact)
     background_fill=True,        # write masked-out tiles with in-kernel DMAs (see Tile masks)
+    pipeline="manual",           # "manual": gridless, hand-pipelined (fastest). "grid": Pallas grid.
 )
 ```
 
-`TpuKernel.lower(*args)` returns a `Lowered` with the grid, BlockSpecs, VMEM estimate, tile-mask
-statistics and generated `source`. Arguments can be arrays or `jax.ShapeDtypeStruct`s.
+`TpuKernel.lower(*args)` returns a `Lowered` with the pipeline, grid and step count, operand tiles, VMEM
+estimate, tile-mask statistics and generated `source`. Arguments can be arrays or `jax.ShapeDtypeStruct`s.
 
 ## TPU rules it enforces
 
@@ -157,7 +180,10 @@ errors the interpreter can't see. Timing still needs real hardware.
 src/autokernel/
   frontend.py   parse the Python loop nest into a LoopNest
   analysis.py   resolve it for concrete input shapes: loops, tiles, operands, masks, accumulators
-  codegen.py    emit the Pallas kernel and pallas_call wrapper, compile them
+  emit.py       what both backends share: options, the tile body, fill DMAs, hardware checks
+  manual.py     the gridless backend: one loop, hand-written double-buffered DMAs (default)
+  grid.py       the grid backend: a Pallas grid with BlockSpecs
+  codegen.py    pick a backend, generate and compile the kernel
   hardware.py   TPU layout and VMEM rules
   api.py        the @autokernel.tpu decorator
 examples/       runnable examples
@@ -172,5 +198,6 @@ tests/
   masks on the reduction loop.
 - `@` on 3-D or higher tiles is lowered as `jnp.dot`, which isn't batched matmul semantics; only
   use it on 2-D tiles.
-- With background fill, the tile axis runs in order on one core (`"arbitrary"`), so chips with two
-  TensorCores (v4, v5p) don't split it. Pass `background_fill=False` to keep it `"parallel"`.
+- Gridless kernels run on one TensorCore. On chips with two per device (v4, v5p), use
+  `pipeline="grid"` (with `background_fill=False` for masked kernels) so the parallel grid axes can be
+  split between them. v5e and v6e have one TensorCore per chip.

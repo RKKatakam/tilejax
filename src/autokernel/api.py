@@ -149,6 +149,7 @@ def tpu(
     vmem_limit_bytes: int | None = None,
     matmul_precision: str = "highest",
     background_fill: bool = True,
+    pipeline: str = "manual",
 ) -> Any:
     """Compile a Python tile loop nest into a Pallas TPU kernel.
 
@@ -170,12 +171,17 @@ def tpu(
             "default" uses Mosaic's faster single bf16 pass (verify then uses looser tolerances).
         background_fill: with a tile mask, write the skipped tiles' constant value (zeros for causal)
             from the kernel with async DMAs instead of filling the whole output before the kernel runs.
+        pipeline: "manual" (default) generates a kernel with no grid that runs every step in one loop and
+            double-buffers its DMAs by hand, avoiding the grid pipeliner's per-step overhead. "grid"
+            generates a Pallas grid with BlockSpecs, whose "parallel" axes chips with two TensorCores
+            can split.
     """
     options = Options(
         check_tiling=check_tiling,
         vmem_limit_bytes=vmem_limit_bytes,
         matmul_precision=matmul_precision,
         background_fill=background_fill,
+        pipeline=pipeline,
     )
 
     def wrap(f: Callable) -> TpuKernel:

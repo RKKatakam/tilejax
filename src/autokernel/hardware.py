@@ -9,11 +9,23 @@ from typing import Any
 import jax
 import numpy as np
 
-__all__ = ["DEFAULT_VMEM_BUDGET", "LANES", "check_block", "check_vmem", "on_tpu", "sublanes"]
+__all__ = [
+    "DEFAULT_VMEM_BUDGET",
+    "LANES",
+    "SMEM_CAPACITY",
+    "check_block",
+    "check_smem",
+    "check_vmem",
+    "on_tpu",
+    "sublanes",
+]
 
 LANES = 128
 # Default scoped-VMEM budget Mosaic gives a kernel (v5e: 16 MiB; newer chips allow more).
 DEFAULT_VMEM_BUDGET = 16 * 1024 * 1024
+
+# Scalar memory per TensorCore on v4 and newer (v2/v3 have 16 KiB).
+SMEM_CAPACITY = 1024 * 1024
 
 Shape = tuple[int, ...]
 
@@ -59,6 +71,16 @@ def check_vmem(pipelined: Sequence[tuple[Shape, Any]], scratch: Sequence[tuple[S
             stacklevel=2,
         )
     return used
+
+
+def check_smem(used: int) -> None:
+    """Tile tables live in SMEM; reject kernels whose tables can't fit next to Mosaic's own use."""
+    if used > SMEM_CAPACITY // 2:
+        from .errors import AutoKernelError
+
+        raise AutoKernelError(
+            f"tile tables need {used / 1024:.0f} KiB of SMEM (limit {SMEM_CAPACITY // 2 // 1024} KiB); use bigger tiles"
+        )
 
 
 def on_tpu() -> bool:
