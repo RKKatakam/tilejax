@@ -30,17 +30,31 @@ from dataclasses import dataclass
 
 from .errors import AutoKernelError
 
-__all__ = ["Loop", "LoopNest", "Output", "Reduction", "Store", "assigned_name", "parse"]
+__all__ = ["Loop", "LoopNest", "Output", "Reduction", "Store", "assigned_name", "is_simple_assignment", "parse"]
+
+
+def is_simple_assignment(s: ast.stmt) -> bool:
+    """`name = expr` or `name op= expr`: the only statements allowed inside the loop nest."""
+    if isinstance(s, ast.Assign):
+        return len(s.targets) == 1 and isinstance(s.targets[0], ast.Name)
+    return isinstance(s, ast.AugAssign) and isinstance(s.target, ast.Name)
 
 
 def assigned_name(s: ast.stmt) -> str:
-    """The variable a tile-body statement (`name = ...` or `name op= ...`) assigns."""
+    """The variable a simple assignment assigns."""
     return s.targets[0].id if isinstance(s, ast.Assign) else s.target.id
+
+
+def _error(fn_name: str, first_line: int, node: ast.AST | None, msg: str) -> AutoKernelError:
+    """An error naming the function and, when `node` has one, the line in the user's source file."""
+    if node is not None and hasattr(node, "lineno"):
+        return AutoKernelError(f"{fn_name} (line {first_line + node.lineno - 1}): {msg}")
+    return AutoKernelError(f"{fn_name}: {msg}")
 
 
 @dataclass
 class Loop:
-    """`for var in range(start, stop, step)`, with the range arguments still as source expressions."""
+    """`for var in range(...)`, with the range arguments still as source expressions."""
 
     var: str
     start: ast.expr
@@ -84,7 +98,8 @@ class LoopNest:
     """
 
     fn_name: str
-    first_line: int
+    first_line: int  # of the function's source (its first decorator) in its file
+    fdef: ast.FunctionDef  # the whole function, lines relative to `first_line`
     params: list[str]
     prologue: list[ast.stmt]
     outputs: list[Output]
@@ -97,9 +112,7 @@ class LoopNest:
     stores: list[Store]
 
     def error(self, node: ast.AST | None, msg: str) -> AutoKernelError:
-        if node is not None and hasattr(node, "lineno"):
-            return AutoKernelError(f"{self.fn_name} (line {self.first_line + node.lineno - 1}): {msg}")
-        return AutoKernelError(f"{self.fn_name}: {msg}")
+        return _error(self.fn_name, self.first_line, node, msg)
 
     @property
     def loops(self) -> list[Loop]:
@@ -126,13 +139,13 @@ def parse(fn: Callable) -> LoopNest:
 
 
 class _Parser:
-    def __init__(self, name: str, first_line: int, fdef: ast.FunctionDef):
-        self.name, self.first_line, self.fdef = name, first_line, fdef
+    def __init__(self, fn_name: str, first_line: int, fdef: ast.FunctionDef):
+        self.fn_name, self.first_line, self.fdef = fn_name, first_line, fdef
+        self.params = [p.arg for p in fdef.args.args]
+        self.out_vars: list[str] = []
 
     def err(self, node: ast.AST | None, msg: str) -> AutoKernelError:
-        if node is not None and hasattr(node, "lineno"):
-            return AutoKernelError(f"{self.name} (line {self.first_line + node.lineno - 1}): {msg}")
-        return AutoKernelError(f"{self.name}: {msg}")
+        return _error(self.fn_name, self.first_line, node, msg)
 
     # ------------------------------------------------------------------ top level
 
@@ -141,20 +154,11 @@ class _Parser:
         a = fdef.args
         if a.vararg or a.kwarg or a.kwonlyargs or a.defaults or a.posonlyargs:
             raise self.err(fdef, "only plain positional array parameters are supported")
-        self.params = [p.arg for p in a.args]
 
         body = list(fdef.body)
         if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
             body = body[1:]  # docstring
-        if not body or not isinstance(body[-1], ast.Return):
-            raise self.err(body[-1] if body else fdef, "function must end with `return <output>` or a tuple of outputs")
-        ret = body[-1].value
-        names = ret.elts if isinstance(ret, ast.Tuple) else [ret]
-        if not names or not all(isinstance(n, ast.Name) for n in names):
-            raise self.err(body[-1], "return the output arrays by name: `return out` or `return out1, out2`")
-        self.out_vars = [n.id for n in names]
-        if len(set(self.out_vars)) != len(self.out_vars):
-            raise self.err(body[-1], "each output may be returned only once")
+        ret = self._returns(body)
         body = body[:-1]
 
         fors = [s for s in body if isinstance(s, ast.For)]
@@ -163,22 +167,7 @@ class _Parser:
                 fors[1] if len(fors) > 1 else fdef, "expected one top-level tile loop nest before the return"
             )
         top = fors[0]
-
-        prologue, allocs = [], {}
-        for s in body[:-1]:
-            if self._is_assign_to(s, self.out_vars):
-                allocs[s.targets[0].id] = s.value
-                continue
-            if not isinstance(s, (ast.Assign, ast.AnnAssign, ast.Assert, ast.Pass)):
-                raise self.err(s, "only simple constant assignments / asserts may precede the loop nest")
-            for t in ast.walk(s):
-                if isinstance(t, ast.Name) and isinstance(t.ctx, ast.Store) and t.id in self.params:
-                    raise self.err(s, f"the prologue may not rebind input `{t.id}`")
-            prologue.append(s)
-        for var in self.out_vars:
-            if var not in allocs:
-                raise self.err(top, f"missing output allocation `{var} = jnp.zeros(...)` before the loop nest")
-        outputs = [Output(var, allocs[var]) for var in self.out_vars]
+        prologue, outputs = self._prologue(body[:-1], top)
 
         parallel, hoisted, inner = self._parallel_loops(top)
         guard, guard_node, inner = self._split_guard(inner, "tile mask")
@@ -186,8 +175,9 @@ class _Parser:
         segments, reductions = self._tile_body(hoisted + inner)
 
         nest = LoopNest(
-            fn_name=self.name,
+            fn_name=self.fn_name,
             first_line=self.first_line,
+            fdef=fdef,
             params=self.params,
             prologue=prologue,
             outputs=outputs,
@@ -202,18 +192,47 @@ class _Parser:
         self._validate(nest)
         return nest
 
+    def _returns(self, body: list[ast.stmt]) -> ast.expr:
+        """The final `return out` / `return out1, out2`; records the output names."""
+        if not body or not isinstance(body[-1], ast.Return) or body[-1].value is None:
+            raise self.err(
+                body[-1] if body else self.fdef, "function must end with `return <output>` or a tuple of outputs"
+            )
+        ret = body[-1].value
+        names = ret.elts if isinstance(ret, ast.Tuple) else [ret]
+        if not names or not all(isinstance(n, ast.Name) for n in names):
+            raise self.err(body[-1], "return the output arrays by name: `return out` or `return out1, out2`")
+        self.out_vars = [n.id for n in names]
+        if len(set(self.out_vars)) != len(self.out_vars):
+            raise self.err(body[-1], "each output may be returned only once")
+        return ret
+
+    def _prologue(self, stmts: list[ast.stmt], top: ast.For) -> tuple[list[ast.stmt], list[Output]]:
+        """Split the statements before the loop nest into shape-level constants and output allocations."""
+        prologue, allocs = [], {}
+        for s in stmts:
+            if self._is_assign_to(s, self.out_vars):
+                allocs[s.targets[0].id] = s.value
+                continue
+            if not isinstance(s, (ast.Assign, ast.AnnAssign, ast.Assert, ast.Pass)):
+                raise self.err(s, "only simple constant assignments / asserts may precede the loop nest")
+            for t in ast.walk(s):
+                if isinstance(t, ast.Name) and isinstance(t.ctx, ast.Store) and t.id in self.params:
+                    raise self.err(s, f"the prologue may not rebind input `{t.id}`")
+            prologue.append(s)
+        for var in self.out_vars:
+            if var not in allocs:
+                raise self.err(top, f"missing output allocation `{var} = jnp.zeros(...)` before the loop nest")
+        return prologue, [Output(var, allocs[var]) for var in self.out_vars]
+
     # ------------------------------------------------------------------ pieces
 
     @staticmethod
     def _is_assign_to(s: ast.stmt, names: list[str]) -> bool:
-        return (
-            isinstance(s, ast.Assign)
-            and len(s.targets) == 1
-            and isinstance(s.targets[0], ast.Name)
-            and s.targets[0].id in names
-        )
+        return isinstance(s, ast.Assign) and is_simple_assignment(s) and s.targets[0].id in names
 
     def _loop(self, node: ast.For) -> Loop:
+        """`for v in range(stop)`, `range(start, stop)` or `range(start, stop, step)`."""
         if node.orelse or not isinstance(node.target, ast.Name):
             raise self.err(node, "tile loops must be `for v in range(start, stop, step)`")
         it = node.iter
@@ -222,11 +241,18 @@ class _Parser:
             and isinstance(it.func, ast.Name)
             and it.func.id == "range"
             and not it.keywords
-            and len(it.args) == 3
+            and 1 <= len(it.args) <= 3
         )
         if not ok:
-            raise self.err(node, "tile loops must use the 3-argument form `range(start, stop, step)`")
-        return Loop(node.target.id, *it.args, node=node)
+            raise self.err(node, "tile loops must be `for v in range(start, stop, step)`")
+        args = list(it.args)
+        if len(args) == 1:
+            args.insert(0, ast.Constant(0))
+        if len(args) == 2:
+            args.append(ast.Constant(1))
+        for arg in args:
+            ast.copy_location(arg, it)
+        return Loop(node.target.id, *args, node=node)
 
     def _is_tile_body(self, body: list[ast.stmt]) -> bool:
         """Does this loop body hold the output stores (possibly under a tile mask)?"""
@@ -252,6 +278,8 @@ class _Parser:
                 raise self.err(
                     node, "the innermost parallel loop must end with the output stores `out = out.at[...].set(...)`"
                 )
+            if isinstance(body[0], ast.If):
+                raise self.err(body[0], "a tile mask goes on the innermost parallel loop, around the output stores")
             hoisted += body[:-1]
             node = body[-1]
 
@@ -297,10 +325,7 @@ class _Parser:
         n = len(body)
         while n and self._is_store(body[n - 1]):
             n -= 1
-        stores = []
-        for s in body[n:]:
-            call = s.value
-            stores.append(Store(s.targets[0].id, call.func.value.slice, call.args[0], s))
+        stores = [Store(s.targets[0].id, s.value.func.value.slice, s.value.args[0], s) for s in body[n:]]
         written = [st.out for st in stores]
         for var in self.out_vars:
             if written.count(var) != 1:
@@ -336,13 +361,12 @@ class _Parser:
 
     def _validate(self, nest: LoopNest) -> None:
         loop_vars = [lp.var for lp in nest.loops]
-        if len(set(loop_vars)) != len(loop_vars):
-            raise self.err(nest.parallel[0].node, "loop variables must have distinct names")
+        for var in loop_vars:
+            if loop_vars.count(var) > 1:
+                node = next(lp.node for lp in reversed(nest.loops) if lp.var == var)
+                raise self.err(node, f"loop variable `{var}` is used by two loops; loop variables must be distinct")
         for s in nest.tile_statements():
-            ok = (isinstance(s, ast.Assign) and len(s.targets) == 1 and isinstance(s.targets[0], ast.Name)) or (
-                isinstance(s, ast.AugAssign) and isinstance(s.target, ast.Name)
-            )
-            if not ok:
+            if not is_simple_assignment(s):
                 raise self.err(s, "loop bodies may only contain `name = expr` / `name op= expr` statements")
             target = assigned_name(s)
             if target in nest.out_vars:

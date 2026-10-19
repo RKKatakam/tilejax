@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import ast
 import copy
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -25,10 +26,11 @@ import jax.numpy as jnp
 import numpy as np
 from jax.experimental import pallas as pl
 
+from . import mxu
 from .analysis import Specialization, Unit
 from .frontend import assigned_name
 from .hardware import Hardware, nbytes
-from .schedule import Schedule
+from .schedule import COLUMN_SHIFT, Schedule
 
 __all__ = ["STEP_OVERHEAD_S", "Estimate", "estimate"]
 
@@ -59,44 +61,45 @@ class _UnitCost:
     intermediate_bytes: int
 
 
-def estimate(spec: Specialization, sched: Schedule, hw: Hardware, buffers: int, highest: bool) -> Estimate:
+def estimate(
+    spec: Specialization, sched: Schedule, hw: Hardware, buffers: int, highest: bool, fills: Sequence[str] = ()
+) -> Estimate:
+    """Predicted run time, work and VMEM use; `fills` are the outputs whose skipped tiles get fill DMAs."""
     segments = [u for u in spec.units if u.kind == "segment"]
     bodies = [u for u in spec.units if u.kind == "body"]
-    seg_costs = [_unit_cost(spec, u, None) for u in segments]
-    body_costs = [_unit_cost(spec, u, u.index) for u in bodies]
-    store_cost = _unit_cost(spec, None, None)
-
-    tiles = sched.tiles
-    body_steps = _body_steps(spec, sched)
+    body_costs = [_unit_cost(spec, u) for u in bodies]
+    tile_costs = [_unit_cost(spec, u) for u in segments] + [_unit_cost(spec, None)]  # segments and the stores
 
     def compute_s(c: _UnitCost) -> float:
-        mxu = c.mxu_flops / hw.matmul_flops_per_s(c.matmul_dtype, highest) if c.mxu_flops else 0.0
-        return mxu + (c.other_flops + c.transcendentals) / hw.vpu_ops_per_s
+        mxu_s = c.mxu_flops / hw.matmul_flops_per_s(c.matmul_dtype, highest) if c.mxu_flops else 0.0
+        return mxu_s + (c.other_flops + c.transcendentals) / hw.vpu_ops_per_s
 
     seconds = 0.0
     flops = transcendentals = hbm = 0.0
-    for p, (cost, steps) in enumerate(zip(body_costs, body_steps, strict=True)):
+    for p, (cost, steps) in enumerate(zip(body_costs, _body_steps(spec, sched), strict=True)):
         streamed = sum(nbytes(op.block.shape, op.dtype) for op in spec.operands if op.phase == p)
         seconds += steps * (max(compute_s(cost), streamed / hw.hbm_bytes_per_s) + STEP_OVERHEAD_S)
         flops += steps * (cost.mxu_flops + cost.other_flops)
         transcendentals += steps * cost.transcendentals
         hbm += steps * streamed
-    tile_bytes = sum(nbytes(op.block.shape, op.dtype) for op in spec.operands if op.phase is None)
-    tile_bytes += sum(nbytes(o.block.shape, o.out.dtype) for o in spec.outputs)
-    tile_compute = sum(compute_s(c) for c in [*seg_costs, store_cost])
+    tiles = sched.tiles
+    out_bytes = sum(nbytes(o.block.shape, o.out.dtype) for o in spec.outputs)
+    tile_bytes = sum(nbytes(op.block.shape, op.dtype) for op in spec.operands if op.phase is None) + out_bytes
+    tile_compute = sum(compute_s(c) for c in tile_costs)
     seconds += tiles * (max(tile_compute, tile_bytes / hw.hbm_bytes_per_s) + (0 if spec.phases else STEP_OVERHEAD_S))
-    flops += tiles * sum(c.mxu_flops + c.other_flops for c in [*seg_costs, store_cost])
-    transcendentals += tiles * sum(c.transcendentals for c in [*seg_costs, store_cost])
-    hbm += tiles * tile_bytes
-    hbm += len(spec.constant_tiles) * sum(nbytes(o.block.shape, o.out.dtype) for o in spec.outputs)
+    flops += tiles * sum(c.mxu_flops + c.other_flops for c in tile_costs)
+    transcendentals += tiles * sum(c.transcendentals for c in tile_costs)
+    hbm += tiles * tile_bytes + len(spec.constant_tiles) * out_bytes
     seconds /= sched.cores
 
+    # The kernel's scratch, as codegen lays it out: input rings, two slots per output, a fill tile for
+    # outputs written by fill DMAs, array state (scalars live in SMEM), plus the largest unit's temporaries.
     vmem = sum(
         (buffers if op.phase is not None else 2) * nbytes(op.block.kernel_shape, op.dtype) for op in spec.operands
     )
-    vmem += sum(3 * nbytes(o.block.kernel_shape, o.out.dtype) for o in spec.outputs)  # two slots and a fill tile
-    vmem += sum(nbytes(sv.aval.shape, sv.aval.dtype) for sv in spec.state.values())
-    vmem += max(c.intermediate_bytes for c in [*seg_costs, *body_costs, store_cost])
+    vmem += sum((3 if o.var in fills else 2) * nbytes(o.block.kernel_shape, o.out.dtype) for o in spec.outputs)
+    vmem += sum(nbytes(sv.aval.shape, sv.aval.dtype) for sv in spec.state.values() if not sv.smem)
+    vmem += max(c.intermediate_bytes for c in [*tile_costs, *body_costs])
     return Estimate(seconds, flops, transcendentals, hbm, int(vmem))
 
 
@@ -104,11 +107,9 @@ def _body_steps(spec: Specialization, sched: Schedule) -> list[int]:
     """Non-empty steps of each phase, over the whole kernel (an upper bound for runtime masks)."""
     if sched.mode == "table":
         reps = sched.steps // sched.pattern_steps
-        codes = sched.tables["step_code"] >> 2
-        columns = sched.columns
         counts = [0] * len(spec.phases)
-        for c in codes:
-            col = columns[int(c)]
+        for code in sched.tables["step_code"]:
+            col = sched.columns[int(code) >> COLUMN_SHIFT]
             if not col.empty:
                 counts[col.phase] += 1
         return [n * reps for n in counts]
@@ -118,14 +119,14 @@ def _body_steps(spec: Specialization, sched: Schedule) -> list[int]:
 # --------------------------------------------------------------------------- per-unit costs
 
 
-def _unit_cost(spec: Specialization, unit: Unit | None, phase: int | None) -> _UnitCost:
+def _unit_cost(spec: Specialization, unit: Unit | None) -> _UnitCost:
     """Trace a unit (None: the output stores) on tile-shaped values and ask JAX what it costs."""
     nest = spec.nest
     stmts = list(unit.statements) if unit is not None else []
     exprs = [st.value for st in nest.stores] if unit is None else []
     if not stmts and not exprs:
         return _UnitCost(0, 0, 0, jnp.bfloat16, 0)
-
+    phase = unit.phase if unit is not None else None
     operands = {op.ref: op for op in spec.operands}
     state = spec.state
 
@@ -135,9 +136,9 @@ def _unit_cost(spec: Specialization, unit: Unit | None, phase: int | None) -> _U
                 return ast.copy_location(ast.Name(spec.operand(n, phase).ref, ast.Load()), n)
             return self.generic_visit(n)
 
-    body = [Placeholders().visit(copy.deepcopy(s)) for s in stmts]
+    body = [Placeholders().visit(mxu.rewrite_matmuls(s)) for s in stmts]
     results = [ast.Name(assigned_name(s), ast.Load()) for s in stmts]
-    results += [Placeholders().visit(copy.deepcopy(e)) for e in exprs]
+    results += [Placeholders().visit(mxu.rewrite_matmuls(copy.deepcopy(e))) for e in exprs]
     loop_vars = sorted(spec.loops)
     args = [*operands, *state, *loop_vars]
     fn_def = ast.FunctionDef(
@@ -149,7 +150,7 @@ def _unit_cost(spec: Specialization, unit: Unit | None, phase: int | None) -> _U
         type_params=[],
     )
     module = ast.fix_missing_locations(ast.Module(body=[fn_def], type_ignores=[]))
-    namespace = dict(spec.consts)
+    namespace = {**spec.consts, **mxu.helpers("highest")}
     exec(compile(module, f"<autokernel cost:{nest.fn_name}>", "exec"), namespace)
     fn = namespace["_unit"]
     avals = [jax.ShapeDtypeStruct(op.block.kernel_shape, op.dtype) for op in operands.values()]
@@ -159,7 +160,7 @@ def _unit_cost(spec: Specialization, unit: Unit | None, phase: int | None) -> _U
         jaxpr = jax.make_jaxpr(fn)(*avals)
     except Exception:  # can't trace on tile shapes: count nothing rather than fail planning
         return _UnitCost(0, 0, 0, jnp.bfloat16, 0)
-    mxu, dtype, inter, elementwise, transcendental = 0.0, jnp.bfloat16, 0, 0.0, 0.0
+    mxu_flops, dtype, inter, elementwise, transcendental = 0.0, jnp.bfloat16, 0, 0.0, 0.0
     for eqn in jaxpr.jaxpr.eqns:
         size = 0
         for out in eqn.outvars:
@@ -172,7 +173,7 @@ def _unit_cost(spec: Specialization, unit: Unit | None, phase: int | None) -> _U
             (contracting, _), _ = eqn.params["dimension_numbers"]
             x, y = (a.aval for a in eqn.invars)
             contract = np.prod([x.shape[d] for d in contracting], dtype=np.int64)
-            mxu += 2.0 * np.prod(eqn.outvars[0].aval.shape, dtype=np.int64) * contract
+            mxu_flops += 2.0 * np.prod(eqn.outvars[0].aval.shape, dtype=np.int64) * contract
             dtype = jnp.result_type(x.dtype, y.dtype)
         elif eqn.primitive.name in _TRANSCENDENTAL:
             transcendental += size
@@ -180,9 +181,9 @@ def _unit_cost(spec: Specialization, unit: Unit | None, phase: int | None) -> _U
             elementwise += size
     analysis = _cpu_cost_analysis(fn, avals)
     if analysis is not None:  # JAX's own count, when the CPU backend can give one
-        elementwise = max(0.0, float(analysis.get("flops", 0.0)) - mxu)
+        elementwise = max(0.0, float(analysis.get("flops", 0.0)) - mxu_flops)
         transcendental = float(analysis.get("transcendentals", transcendental))
-    return _UnitCost(mxu, elementwise, transcendental, dtype, inter)
+    return _UnitCost(mxu_flops, elementwise, transcendental, dtype, inter)
 
 
 _TRANSCENDENTAL = frozenset(

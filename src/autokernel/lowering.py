@@ -12,16 +12,19 @@ from typing import Any
 
 import jax
 
-from . import codegen, hardware
+from . import codegen, hardware, mxu
 from . import cost as cost_lib
 from . import schedule as schedule_lib
 from .analysis import Operand, OutputSpec, StateVar, specialize
 from .errors import AutoKernelError
 from .frontend import LoopNest
 
-__all__ = ["AUTOTUNE", "Lowered", "Options", "lower"]
+__all__ = ["AUTOTUNE", "DEFAULT_BUFFERS", "Lowered", "Options", "lower"]
 
 AUTOTUNE = ("model", "measure")
+# Slots per streamed input when none is asked for: three where they fit in VMEM (on a v5e, three
+# buffers ran a 512^3-tiled bf16 matmul 14% faster than two), else two.
+DEFAULT_BUFFERS = (3, 2)
 
 
 @dataclass(frozen=True)
@@ -37,12 +40,12 @@ class Options:
     cores: int | None = None
     tune: tuple[tuple[str, tuple[Any, ...]], ...] = ()
     autotune: str = "model"
-    measure_top: int = 4
+    measure_top: int = 8
 
     def __post_init__(self) -> None:
-        if self.matmul_precision not in codegen.MATMUL_PRECISIONS:
+        if self.matmul_precision not in mxu.MATMUL_PRECISIONS:
             raise AutoKernelError(
-                f"matmul_precision must be one of {sorted(codegen.MATMUL_PRECISIONS)}, got {self.matmul_precision!r}"
+                f"matmul_precision must be one of {sorted(mxu.MATMUL_PRECISIONS)}, got {self.matmul_precision!r}"
             )
         if self.buffers is not None and self.buffers < 2:
             raise AutoKernelError(f"buffers must be at least 2, got {self.buffers}")
@@ -72,6 +75,7 @@ class Lowered:
     tiles: int  # output tiles computed (candidates with a runtime tile mask)
     total_tiles: int  # output tiles without any mask
     cores: int  # TensorCores the work is split across
+    core_steps: list[tuple[int, int]]  # each core's [begin, end) steps (empty with runtime masks)
     buffers: int  # VMEM slots per streamed input
     operands: list[Operand]
     outputs: list[OutputSpec]
@@ -96,9 +100,16 @@ def lower(
         raise codegen.layout_error(spec, problems)
     cores = options.cores or hw.cores
     sched = schedule_lib.plan(spec, cores, hw.smem_budget)
-    buffers = buffers or options.buffers or 2
+    fills, aliased = codegen.plan_fills(spec, options.background_fill)
     highest = options.matmul_precision == "highest"
-    est = cost_lib.estimate(spec, sched, hw, buffers, highest)
+    if buffers or options.buffers:
+        buffers = buffers or options.buffers
+        est = cost_lib.estimate(spec, sched, hw, buffers, highest, fills)
+    else:
+        for buffers in DEFAULT_BUFFERS:  # the deepest default that fits
+            est = cost_lib.estimate(spec, sched, hw, buffers, highest, fills)
+            if est.vmem_bytes <= hw.vmem_budget:
+                break
     if est.vmem_bytes > hw.vmem_budget:
         raise AutoKernelError(
             f"{nest.fn_name}: needs about {est.vmem_bytes / 2**20:.0f} MiB of VMEM, more than the "
@@ -112,34 +123,26 @@ def lower(
         sched,
         buffers=buffers,
         matmul_precision=options.matmul_precision,
-        background_fill=options.background_fill,
+        fills=fills,
+        aliased=aliased,
         vmem_limit_bytes=limit,
         cost=est.cost_estimate(),
     )
-    skipped = bool(spec.constant_tiles) or spec.tile_mask_runtime
-    uses_fill = (
-        skipped
-        and options.background_fill
-        and not spec.tile_mask_runtime
-        and all(o.fill is not None for o in spec.outputs)
-    )
-    total = 1
-    for lb in spec.parallel:
-        total *= lb.count
     return Lowered(
         source=generated.source,
         entry=generated.entry,
         schedule=sched.mode,
         steps=sched.steps,
         tiles=sched.tiles,
-        total_tiles=total,
+        total_tiles=spec.total_tiles,
         cores=cores,
+        core_steps=list(sched.core_steps),
         buffers=buffers,
         operands=spec.operands,
         outputs=spec.outputs,
         state=spec.state,
         estimate=est,
         vmem_limit_bytes=limit,
-        fill=("background" if uses_fill else "prefill") if skipped else None,
+        fill="prefill" if aliased else "background" if fills else None,
         overrides=dict(overrides or {}),
     )

@@ -28,8 +28,10 @@ print(matmul.source(x, y))  # the generated Pallas code
 matmul.verify(x, y)  # checks the kernel against the Python loops
 ```
 
-The Python function is the specification: `verify` runs it eagerly and compares. The generated kernel
-is plain Pallas you can read, copy and edit.
+The Python function is the specification: `verify` runs it eagerly and compares. The one thing the
+kernel does differently from plain JAX is `@`: it accumulates in f32 (i32 for integers) like the MXU,
+instead of rounding `bf16 @ bf16` to bf16 or wrapping `int8 @ int8`; `verify` compares against that. The
+generated kernel is plain Pallas you can read, copy and edit.
 
 autokernel targets **TPU only**. Without a TPU it plans for a named chip (a v5e by default) and runs
 kernels in the Pallas TPU interpreter, so you can develop, test and tune on a laptop.
@@ -53,8 +55,10 @@ loop instead decodes each step with a few scalar ops.
 | `a @ b`, `a @ b.T`, batched `@` | MXU matmuls accumulating in f32 (i32 for integers) |
 | `if cond: continue` on loop coordinates | skipped tiles or steps: no copies, no compute, no step |
 
-On chips with two TensorCores per device (v4, v5p) the work is split between them on tile boundaries.
-Each kernel also carries a `pl.CostEstimate` for XLA and a VMEM limit sized from its own needs.
+On chips with two TensorCores per device (v4, v5p) the work is split between them on a tile boundary
+chosen so that both cores run about the same number of steps, even when a mask gives tiles very different
+step counts. Each kernel also carries a `pl.CostEstimate` for XLA and a VMEM limit sized from its own
+needs.
 
 ## Performance
 
@@ -62,20 +66,26 @@ Measured on a TPU v5e with autokernel 0.2, milliseconds, lower is better. Reprod
 
 ### Matmul
 
-8192³, median of 3 × 20 runs. "Hand-written" is a manual-DMA gridless Pallas kernel written by hand for
-the same tiles.
+8192³, median of 20 runs. autokernel picks its block sizes the way XLA does: `benchmarks/matmul.py` tunes
+each kernel over a grid of 18 block sizes (the cost model ranks them, the best eight are timed), with 2
+or 3 input buffers.
 
-| Kernel | Tiles | XLA | Hand-written | autokernel |
-| --- | --- | --- | --- | --- |
-| causal `tril(x @ y)`, bf16 | 128³ | 5.91 | 46.73 | **44.94** |
-| causal `tril(x @ y)`, bf16 | 1024×1024×512 | 5.91 | 3.37 | **3.35** |
-| causal `tril(x @ y)`, f32 | 512×512×1024 | 35.15 | 18.12 | **18.08** |
-| dense `x @ y`, bf16 | 1024×1024×512 | 5.90 | 5.92 | **5.89** |
-| dense `x @ y`, f32 | 512×512×1024 | 35.08 | 34.05 | **33.99** |
+| Kernel | XLA | autokernel | Blocks chosen |
+| --- | --- | --- | --- |
+| dense `x @ y`, bf16 | 5.90 | **5.73** | 1024×2048×1024 |
+| dense `x @ y`, f32 | 35.08 | **33.84** | 512×1024×1024 |
+| causal `tril(x @ y)`, bf16 | 5.91 | **3.26** | 512×512×1024 |
+| causal `tril(x @ y)`, f32 | 35.15 | **18.10** | 512×512×1024 |
 
-autokernel matches or beats the hand-written kernel at almost every tile size measured (by up to 4% with
-small tiles, where per-step overhead dominates). The causal matmul is about 1.75× faster than XLA in bf16
-and 1.9× in f32, because XLA computes the whole matrix.
+The dense kernels run at 192 TFLOP/s (bf16, 97% of the chip's 197) and 32.5 TFLOP/s (f32 at
+`Precision.HIGHEST`), 3–4% ahead of XLA; the causal ones are 1.8× faster than XLA, which computes the
+whole matrix. At 4096³ the bf16 dense kernel is 3% behind XLA (0.75 against 0.73 ms): with only eight
+output tiles the pipeline's first fetch and last write-back aren't hidden.
+
+Block sizes matter more than anything in the kernel. Each step costs a fixed ~0.2 µs on top of its
+DMAs and matmul, so a 512³ bf16 block (1.3 µs of DMA against 1.4 µs of MXU time) leaves no slack and runs
+at 174 TFLOP/s, and 128³ blocks run at 18 TFLOP/s. The tuner avoids both; hand-picked tiles should be
+checked with `kernel.tuning(x, y)`.
 
 ### Causal multi-head attention
 
@@ -83,23 +93,23 @@ bf16, head dim 128, median of 3 × 10 runs. "JAX Splash" is
 `jax.experimental.pallas.ops.tpu.splash_attention` with a causal mask and the same block sizes.
 TFLOP/s counts the causal half of the work. Reproduce with `benchmarks/attention.py`.
 
-Batch 4, 16 heads, sequence 4096. XLA (`jax.nn.dot_product_attention(is_causal=True)`): 32.32 ms.
+Batch 4, 16 heads, sequence 4096. XLA (`jax.nn.dot_product_attention(is_causal=True)`): 32.3 ms.
 
 | Blocks (q × kv) | JAX Splash | autokernel | Speedup |
 | --- | --- | --- | --- |
-| 256 × 256 | 8.31 (33 TFLOP/s) | **5.25** (52 TFLOP/s) | 1.58× |
-| 512 × 256 | 5.28 (52 TFLOP/s) | **3.59** (77 TFLOP/s) | 1.47× |
-| 512 × 512 | 3.38 (82 TFLOP/s) | **2.40** (115 TFLOP/s) | 1.41× |
-| 1024 × 512 | 3.16 (87 TFLOP/s) | **2.51** (110 TFLOP/s) | 1.26× |
+| 256 × 256 | 8.31 (33 TFLOP/s) | **5.13** (54 TFLOP/s) | 1.62× |
+| 512 × 256 | 5.28 (52 TFLOP/s) | **3.62** (76 TFLOP/s) | 1.46× |
+| 512 × 512 | 3.37 (82 TFLOP/s) | **2.41** (114 TFLOP/s) | 1.40× |
+| 1024 × 512 | 3.16 (87 TFLOP/s) | **2.51** (109 TFLOP/s) | 1.26× |
 
 Batch 2, 16 heads, sequence 8192. XLA runs out of HBM (it materialises the 16 GB score matrix).
 
 | Blocks (q × kv) | JAX Splash | autokernel | Speedup |
 | --- | --- | --- | --- |
-| 256 × 256 | 16.04 (34 TFLOP/s) | **9.94** (55 TFLOP/s) | 1.61× |
-| 512 × 256 | 9.89 (56 TFLOP/s) | **6.58** (84 TFLOP/s) | 1.50× |
-| 512 × 512 | 6.19 (89 TFLOP/s) | **4.36** (126 TFLOP/s) | 1.42× |
-| 1024 × 512 | 5.53 (99 TFLOP/s) | **4.37** (126 TFLOP/s) | 1.27× |
+| 256 × 256 | 16.04 (34 TFLOP/s) | **9.77** (56 TFLOP/s) | 1.64× |
+| 512 × 256 | 9.90 (56 TFLOP/s) | **6.66** (83 TFLOP/s) | 1.49× |
+| 512 × 512 | 6.20 (89 TFLOP/s) | **4.39** (125 TFLOP/s) | 1.41× |
+| 1024 × 512 | 5.53 (100 TFLOP/s) | **4.39** (125 TFLOP/s) | 1.26× |
 
 Both kernels' outputs agree with XLA (or, at sequence 8192, with each other) to within one bf16 rounding
 step.
@@ -107,8 +117,9 @@ step.
 ### Tuning
 
 `examples/tuned_matmul.py` (2048³ bf16, 27 block-size candidates) on a v5e: the cost model's pick,
-512³, was also the fastest measured, and `autotune="measure"` then chose 3 input buffers over 2
-(0.132 ms against 0.146 ms).
+512³, was also the fastest measured, and `autotune="measure"` confirmed 3 input buffers over 2
+(0.130 ms against 0.145 ms). Three buffers are the default where they fit in VMEM: on a v5e they run the
+8192³ bf16 matmul with 512³ tiles in 6.31 ms against 7.37 ms with two.
 
 ## Writing kernels
 
@@ -117,7 +128,7 @@ step.
 def f(x, y, mask):  # positional array parameters
     M, K = x.shape  # optional prologue: shape-level constants
     out = jnp.zeros((M, N))  # one allocation per output
-    stats = jnp.zeros((M, 128))
+    relu = jnp.zeros((M, N), jnp.bfloat16)
     for i in range(0, M, TM):  # parallel loops: the tiles of the outputs
         scale = i / M  # statements between them run once per tile
         for j in range(0, N, TN):
@@ -129,11 +140,14 @@ def f(x, y, mask):  # positional array parameters
                     continue
                 acc += x[i : i + TM, k : k + TK] @ y[k : k + TK, j : j + TN]
             out = out.at[i : i + TM, j : j + TN].set(acc * scale)  # one store per output, at the end
-            stats = stats.at[i : i + TM, :].set(...)
-    return out, stats  # one output or a tuple
+            relu = relu.at[i : i + TM, j : j + TN].set(jnp.maximum(acc, 0).astype(jnp.bfloat16))
+    return out, relu  # one output or a tuple
 ```
 
-- Loops are `range(start, stop, step)` with values known at trace time (constants, closures, `x.shape`).
+- Loops are `range(stop)`, `range(start, stop)` or `range(start, stop, step)` with values known at trace
+  time (constants, closures, `x.shape`).
+- Every parallel loop tiles exactly one dim of every output, so no two tiles write the same block and
+  the tiles cover the whole array.
 - Inputs are read through tiles: each dimension is `v:v + T` (T equal to loop `v`'s step), a constant
   aligned block `c:c + T`, `:`, or an integer index: a loop variable stepping by 1 (`q[b, h, ...]`) or a
   constant. Integer-indexed dimensions are dropped from the tile, as in NumPy.
@@ -141,6 +155,8 @@ def f(x, y, mask):  # positional array parameters
   survive between steps are found automatically and kept in VMEM.
 - Loop variables may be used as values, e.g. `jax.lax.broadcasted_iota(...) + i`.
 - Every output element must be produced: each output's tiles cover it, apart from masked-out tiles.
+- `a @ b` and `a @ b.T` run on the MXU and accumulate in f32 (i32 for integer inputs), whatever the
+  inputs' dtype; `reference` and `verify` use the same semantics.
 
 Anything else is rejected with an `AutoKernelError` naming the line, before anything runs.
 
@@ -188,8 +204,9 @@ don't fit in VMEM, and ranks the rest with a roofline cost model:
   capacity and TensorCores;
 - a measured fixed cost per step.
 
-With `autotune="measure"` it also times the best few candidates on the TPU (on the first call with
-concrete arrays) and tries 2 and 3 input buffers. `kernel.tuning(*args)` lists every candidate with its
+With `autotune="measure"` it also times the best eight block sizes on the TPU (on the first call with
+concrete arrays), then 2 and 3 input buffers for the winner; the model's predictions for good block sizes
+are often within a few percent of each other, and only timing tells those apart. `kernel.tuning(*args)` lists every candidate with its
 predicted and measured time, or why it was rejected. [examples/tuned_matmul.py](examples/tuned_matmul.py)
 shows it.
 
@@ -198,10 +215,10 @@ shows it.
 ```python
 @autokernel.tpu(
     interpret=None,              # None: native on TPU, interpreter elsewhere. False: require a TPU.
-    verify=False,                # check against the Python loops on the first call per input shape
+    verify=False,                # check against the Python loops on the first call with arrays, per input shape
     tune=None,                   # {constant: candidate values} to search
     autotune="model",            # "model": cost model only. "measure": also time the best few on the TPU.
-    buffers=None,                # VMEM slots per streamed input (2 = double buffering); default 2, or tuned
+    buffers=None,                # VMEM slots per streamed input; default 3 (2 if 3 don't fit in VMEM), or tuned
     target=None,                 # the TPU to plan for off-TPU: "v5e" (default), "v5p", "v6e", ...
     cores=None,                  # TensorCores to split across; default: all of the target's
     check_tiling=True,           # reject tiles that break TPU (8, 128) layout rules
@@ -211,9 +228,9 @@ shows it.
 )
 ```
 
-`kernel.lower(*args)` returns a `Lowered` with the schedule, step and tile counts, operand tiles, state
-variables, cost estimate, VMEM limit and generated `source`. Arguments can be arrays or
-`jax.ShapeDtypeStruct`s.
+`kernel.lower(*args)` returns a `Lowered` with the schedule, step and tile counts (per TensorCore too),
+operand tiles, state variables, cost estimate, VMEM limit and generated `source`. Arguments can be arrays
+or `jax.ShapeDtypeStruct`s.
 
 ## TPU rules it enforces
 
@@ -254,13 +271,16 @@ interpreter can't see. Timing still needs real hardware.
 src/autokernel/
   frontend.py   parse the Python loop nest
   analysis.py   resolve it for concrete shapes: loops, tiles, operands, outputs, masks, state variables
-  schedule.py   order and decode the steps: arithmetic, static step tables, or tables built on device
+  schedule.py   order and decode the steps: arithmetic, static step tables, or tables built on device;
+                split them across TensorCores
   codegen.py    emit the gridless Pallas kernel and its pallas_call wrapper
+  mxu.py        what `@` means: MXU dots accumulating in f32 / i32, shared by the kernel, the trace and verify
   cost.py       the roofline cost model (JAX cost analysis + TPU specs)
   lowering.py   options, and the pipeline from parsed loops to a compiled kernel
   tune.py       block-size search
   hardware.py   TPU specs (from pltpu.get_tpu_info) and layout rules
   api.py        the @autokernel.tpu decorator
+  errors.py     AutoKernelError
 examples/       runnable examples
 benchmarks/     timing scripts for a TPU
 tests/

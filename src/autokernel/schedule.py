@@ -12,10 +12,12 @@ Steps are decoded in one of three ways:
 - `table`: static reduction masks. Steps are listed in SMEM tables. When the masks only depend on the
   innermost parallel loops (causal attention ignores batch and head), the table holds one *pattern*
   that repeats for every combination of the outer loops, which keeps it small.
-- `runtime`: a mask reads inputs. The same tables are built on device by `build_tables` (the kernel's
+- `runtime`: a mask reads inputs. The same tables are built on device by `runtime_tables` (the kernel's
   wrapper calls it with jax.numpy), and the step count is read at run time.
 
-Tiles are numbered by *ordinal*: their position among the tiles the kernel computes.
+Tiles are numbered by *ordinal*: their position among the tiles the kernel computes. With several
+TensorCores each core takes a contiguous run of ordinals, cut so that the cores' step counts are as even
+as possible (a tile can't be split: its accumulator lives on one core).
 """
 
 from __future__ import annotations
@@ -30,10 +32,13 @@ import numpy as np
 from .analysis import Specialization, evaluate_mask, phase_coords, tile_coords
 from .errors import AutoKernelError
 
-__all__ = ["Column", "Schedule", "build_tables", "plan"]
+__all__ = ["RUNTIME_TABLES", "Column", "Schedule", "build_tables", "plan", "runtime_tables"]
 
 # A table entry's column code: (column << 2) | (first step of its phase << 1) | (last step of its phase).
 FIRST, LAST, COLUMN_SHIFT = 2, 1, 2
+
+# Tables a runtime schedule builds on device, in kernel-argument order.
+RUNTIME_TABLES = ("step_tile", "step_code", "tile_ids", "bounds")
 
 
 @dataclass(frozen=True)
@@ -52,12 +57,12 @@ class Schedule:
     columns: list[Column]  # the per-tile step pattern's columns (table and runtime modes)
     tiles: int  # tile ordinals (static) or candidate tiles (runtime)
     steps: int  # steps, or the most there can be (runtime)
+    cores: int = 1
     pattern_tiles: int = 0  # table mode: tiles in the repeating pattern
     pattern_steps: int = 0  # table mode: steps in the repeating pattern
     tables: dict[str, np.ndarray] = field(default_factory=dict)  # static SMEM tables
     core_steps: list[tuple[int, int]] = field(default_factory=list)  # static: each core's [begin, end) steps
     core_tiles: list[tuple[int, int]] = field(default_factory=list)  # static: each core's [begin, end) ordinals
-    cores: int = 1
 
     @property
     def steps_per_tile(self) -> int:
@@ -66,11 +71,7 @@ class Schedule:
 
     def column_offsets(self) -> list[int]:
         """Index of each phase's first column (its empty column follows its reduction columns)."""
-        offsets, at = [], 0
-        for k in self.phase_steps:
-            offsets.append(at)
-            at += k + 1
-        return offsets
+        return list(itertools.accumulate([0, *(k + 1 for k in self.phase_steps[:-1])]))[: len(self.phase_steps)]
 
 
 # --------------------------------------------------------------------------- planning
@@ -79,48 +80,51 @@ class Schedule:
 def plan(spec: Specialization, cores: int, smem_budget: int) -> Schedule:
     """Choose how the kernel's steps are ordered and decoded."""
     phase_steps = [p.steps for p in spec.phases]
-    columns = [Column(p, d, False) for p, k in enumerate(phase_steps) for d in [*range(k), k]]
-    columns = [Column(c.phase, c.depth, c.depth == phase_steps[c.phase]) for c in columns]
-    masked = any(m is not None for m in spec.phase_masks)
+    columns = [Column(p, d, d == k) for p, k in enumerate(phase_steps) for d in range(k + 1)]
 
     if spec.runtime_masks:
         candidates = len(spec.tiles)
         steps = candidates * max(1, len(columns))
-        sched = Schedule("runtime", phase_steps, columns, candidates, steps, cores=cores)
         _check_smem(spec, 2 * steps * 4 + 4 * (2 * cores + 2), smem_budget)
-        return sched
+        return Schedule("runtime", phase_steps, columns, candidates, steps, cores)
 
-    if not masked:
-        sched = Schedule("uniform", phase_steps, columns, len(spec.tiles), 0, cores=cores)
-        sched.steps = sched.tiles * sched.steps_per_tile
-        sched.core_tiles = _split(sched.tiles, cores)
-        sched.core_steps = [(b * sched.steps_per_tile, e * sched.steps_per_tile) for b, e in sched.core_tiles]
-        return sched
-
-    # Static reduction masks: list the steps of one repeating pattern of tiles.
-    inner = _pattern_tiles(spec)
-    keep = _column_mask(spec, [m[:inner] if m is not None else None for m in spec.phase_masks], inner, np)
-    step_tile, step_code, _ = build_tables(keep, columns, np)
-    reps = len(spec.tiles) // inner
-    sched = Schedule("table", phase_steps, columns, len(spec.tiles), reps * len(step_tile), cores=cores)
-    sched.pattern_tiles, sched.pattern_steps = inner, len(step_tile)
-    sched.tables = {"step_tile": step_tile.astype(np.int32), "step_code": step_code.astype(np.int32)}
-    _check_smem(spec, sum(t.nbytes for t in sched.tables.values()), smem_budget)
-    # Steps before each pattern tile, to find the step where each core's first tile starts.
-    starts = np.searchsorted(step_tile, np.arange(inner + 1))
-    sched.core_tiles = _split(sched.tiles, cores)
-    sched.core_steps = [(_step_of(b, inner, starts), _step_of(e, inner, starts)) for b, e in sched.core_tiles]
+    if all(m is None for m in spec.phase_masks):
+        per = max(1, sum(phase_steps))
+        sched = Schedule("uniform", phase_steps, columns, len(spec.tiles), len(spec.tiles) * per, cores)
+        tile_starts = np.arange(sched.tiles + 1) * per
+    else:
+        # Static reduction masks: list the steps of one repeating pattern of tiles.
+        inner = _pattern_tiles(spec)
+        keep = _column_mask(spec, [m[:inner] if m is not None else None for m in spec.phase_masks], inner, np)
+        step_tile, step_code, _ = build_tables(keep, columns, np)
+        reps = len(spec.tiles) // inner
+        sched = Schedule("table", phase_steps, columns, len(spec.tiles), reps * len(step_tile), cores)
+        sched.pattern_tiles, sched.pattern_steps = inner, len(step_tile)
+        sched.tables = {"step_tile": step_tile, "step_code": step_code}
+        _check_smem(spec, sum(t.nbytes for t in sched.tables.values()), smem_budget)
+        starts = np.searchsorted(step_tile, np.arange(inner))  # first step of each pattern tile
+        tile_starts = (np.arange(reps)[:, None] * len(step_tile) + starts[None, :]).reshape(-1)
+        tile_starts = np.append(tile_starts, sched.steps)
+    bounds = core_bounds(tile_starts, cores, np)
+    sched.core_tiles = list(itertools.pairwise(bounds.tolist()))
+    sched.core_steps = list(itertools.pairwise(tile_starts[bounds].tolist()))
     return sched
 
 
-def _split(n: int, cores: int) -> list[tuple[int, int]]:
-    bounds = [c * n // cores for c in range(cores + 1)]
-    return list(itertools.pairwise(bounds))
+def core_bounds(tile_starts: Any, cores: int, xp: Any) -> Any:
+    """Cut tile ordinals into `cores` contiguous runs with step counts as even as possible.
 
-
-def _step_of(ordinal: int, inner: int, starts: np.ndarray) -> int:
-    rep, o = divmod(ordinal, inner)
-    return int(rep * starts[-1] + starts[o])
+    `tile_starts[t]` is the first step of tile `t`, and `tile_starts[-1]` the total step count; the result
+    has `cores + 1` ordinals, starting at 0 and ending at the tile count. Works with numpy and jax.numpy.
+    """
+    n_tiles = tile_starts.shape[0] - 1
+    targets = xp.arange(cores + 1) * tile_starts[-1] // cores
+    after = xp.clip(xp.searchsorted(tile_starts, targets), 0, n_tiles)  # first tile starting at/after the target
+    before = xp.maximum(after - 1, 0)
+    nearest = xp.where(targets - tile_starts[before] < tile_starts[after] - targets, before, after)
+    nearest = xp.maximum.accumulate(nearest)  # keep the runs in order
+    ends = xp.asarray([0, n_tiles])
+    return xp.where(xp.arange(cores + 1) == 0, ends[0], xp.where(xp.arange(cores + 1) == cores, ends[1], nearest))
 
 
 def _pattern_tiles(spec: Specialization) -> int:
@@ -232,11 +236,12 @@ def runtime_tables(spec: Specialization, schedule: Schedule, inputs: dict[str, A
     step_tile, step_code, count = build_tables(keep, schedule.columns, jnp, tile_keep)
     n_tiles = tiles if tile_keep is None else tile_keep.sum()
     tile_ids = jnp.arange(tiles) if tile_keep is None else jnp.nonzero(tile_keep, size=tiles, fill_value=0)[0]
-    # Each core takes a contiguous run of tile ordinals; find the step where each run starts.
-    cores = schedule.cores
-    tile_bounds = (jnp.arange(cores + 1) * n_tiles) // cores
-    step_bounds = jnp.searchsorted(jnp.where(jnp.arange(step_tile.shape[0]) < count, step_tile, n_tiles), tile_bounds)
-    bounds = jnp.concatenate([step_bounds, tile_bounds]).astype(jnp.int32)
+    # Each core takes a contiguous run of tile ordinals; cut the runs where the step counts come out even.
+    valid_tile = jnp.where(jnp.arange(step_tile.shape[0]) < count, step_tile, n_tiles)  # padding sorts last
+    tile_starts = jnp.searchsorted(valid_tile, jnp.arange(tiles + 1))  # tiles >= n_tiles start at `count`
+    tile_starts = jnp.minimum(tile_starts, count)
+    tile_bounds = jnp.minimum(core_bounds(tile_starts, schedule.cores, jnp), n_tiles)
+    bounds = jnp.concatenate([tile_starts[tile_bounds], tile_bounds]).astype(jnp.int32)
     return {
         "step_tile": step_tile,
         "step_code": step_code,

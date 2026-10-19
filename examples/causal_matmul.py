@@ -17,8 +17,9 @@ import autokernel
 #   # \ . .     below: computed, the jnp.where keeps everything
 #   # # \ .
 #
-# autokernel evaluates the `if` for every tile at trace time and runs a grid over only the tiles
-# that survive, so skipped tiles cost no math, no copies and no grid steps.
+# autokernel evaluates the `if` for every tile at trace time and the kernel loops over only the tiles
+# that survive, so skipped tiles cost no math, no copies and no steps; their zeros are written by
+# async DMAs that overlap the compute.
 M, K, N = 1024, 1024, 1024
 TILE_M, TILE_N, TILE_K = 256, 256, 256
 

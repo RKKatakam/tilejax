@@ -36,11 +36,11 @@ def test_matmul_matches_reference_and_jnp():
 
 def test_lowering_structure():
     lw = matmul.lower(*specs())
-    assert (lw.schedule, lw.steps, lw.tiles, lw.cores, lw.buffers) == ("uniform", 24, 8, 1, 2)
+    assert (lw.schedule, lw.steps, lw.tiles, lw.cores, lw.buffers) == ("uniform", 24, 8, 1, 3)
     assert [op.block.kernel_shape for op in lw.operands] == [(TM, TK), (TK, TN)]
     assert [op.phase for op in lw.operands] == [0, 0]
     assert lw.state["acc"].aval.shape == (TM, TN)
-    assert "grid=" not in lw.source and "pltpu.VMEM((2, 64, 128), jnp.float32)" in lw.source
+    assert "grid=" not in lw.source and "pltpu.VMEM((3, 64, 128), jnp.float32)" in lw.source
     assert "cost_estimate=_COST" in lw.source and lw.estimate.flops >= 2 * M * N * K
 
 
@@ -159,7 +159,7 @@ def test_loop_index_as_value():
 
     x = rand((64, 128))
     add_row_block_offset.verify(x)
-    assert "i = o * 16" in add_row_block_offset.source(x)
+    assert "i = i_blk * 16" in add_row_block_offset.source(x)
 
 
 def test_same_input_with_two_tilings():
