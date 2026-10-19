@@ -203,9 +203,16 @@ def check_smem(spec: Specialization, sched: Schedule, fills: bool, budget: int) 
     total = sum(used.values())
     if total > budget:
         parts = ", ".join(f"{what} {n / 1024:.0f} KiB" for what, n in used.items() if n)
+        # How to shrink each table, biggest first.
+        hints = {
+            "tile tables": "bigger blocks of the parallel loops (the tile mask's tables list every kept tile)",
+            "fill tables": "background_fill=False (skipped tiles then keep their allocation's values instead)",
+            "step tables": "bigger blocks (the step tables list every step)",
+        }
+        ways = [hints[what] for what, _ in sorted(used.items(), key=lambda kv: -kv[1]) if what in hints and used[what]]
         raise AutoKernelError(
             f"{spec.nest.fn_name}: its tables need {total / 1024:.0f} KiB of SMEM ({parts}; budget "
-            f"{budget // 1024} KiB); use bigger blocks"
+            f"{budget // 1024} KiB); use " + ("; or ".join(ways) if ways else "bigger blocks")
         )
 
 

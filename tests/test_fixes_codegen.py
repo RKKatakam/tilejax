@@ -169,9 +169,13 @@ def reads_pl(x):
     return out
 
 
-def test_user_global_named_like_an_import_of_the_kernel_is_rejected():
-    with pytest.raises(AutoKernelError, match="uses `pl` for"):
-        autokernel.tpu(reads_pl).lower(rand((128, 128)))
+def test_user_global_named_like_an_import_of_the_kernel_is_renamed():
+    x = rand((128, 128))
+    lowered = autokernel.tpu(reads_pl).lower(x)
+    assert "pl_ = 'not pallas'" in lowered.source  # the kernel reads the user's `pl` under a fresh name
+    want = np.asarray(x) * len(pl)
+    np.testing.assert_allclose(lowered.entry(x, interpret=pltpu.InterpretParams()), want, rtol=1e-6)
+    np.testing.assert_allclose(_standalone(lowered.source, (x,)), want, rtol=1e-6)
 
 
 # --------------------------------------------------------------------------- types
@@ -202,8 +206,8 @@ def test_single_step_accumulator_keeps_a_python_floats_weak_type():
 
 
 def causal_tiles(x):
-    out = jnp.zeros((64, 4096, 4096), jnp.bfloat16)
-    for b in range(64):
+    out = jnp.zeros((128, 4096, 4096), jnp.bfloat16)
+    for b in range(128):
         for i in range(0, 4096, T):
             for j in range(0, 4096, T):
                 if j > i:
@@ -213,8 +217,9 @@ def causal_tiles(x):
 
 
 def test_tile_and_fill_tables_count_against_smem():
-    x = jax.ShapeDtypeStruct((64, 4096, 4096), jnp.bfloat16)
-    with pytest.raises(AutoKernelError, match=r"tile tables .* fill tables .*use bigger blocks"):
+    x = jax.ShapeDtypeStruct((128, 4096, 4096), jnp.bfloat16)
+    match = r"tile tables .* fill tables .*use background_fill=False.*; or bigger blocks"
+    with pytest.raises(AutoKernelError, match=match):
         autokernel.tpu(causal_tiles).lower(x)
 
 
