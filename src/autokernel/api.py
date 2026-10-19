@@ -7,7 +7,6 @@ instead; see `program.py`.
 from __future__ import annotations
 
 import ast
-import contextlib
 import copy
 import dataclasses
 import functools
@@ -51,8 +50,15 @@ def _spec(x: Any) -> jax.ShapeDtypeStruct:
     return jax.ShapeDtypeStruct(shape, x.dtype, weak_type=weak)
 
 
+def _arg_signature(x: Any) -> tuple[tuple[int, ...], np.dtype, bool]:
+    if isinstance(x, jax.Array) and x.ndim:  # the common case, without building a spec
+        return x.shape, x.dtype, False
+    s = _spec(x)
+    return tuple(s.shape), np.dtype(s.dtype), bool(s.weak_type)
+
+
 def _signature(args: tuple[Any, ...]) -> _Signature:
-    return tuple((tuple(s.shape), np.dtype(s.dtype), bool(s.weak_type)) for s in map(_spec, args))
+    return tuple(map(_arg_signature, args))
 
 
 def _concrete(args: tuple[Any, ...]) -> bool:
@@ -65,74 +71,162 @@ def _typed(overrides: Mapping[str, Any]) -> tuple:
     return tuple((k, type(v), v) for k, v in sorted(overrides.items(), key=lambda kv: kv[0]))
 
 
-class _Same:
-    """A cache-key stand-in for an object compared by identity (a module, a function, an array)."""
-
-    __slots__ = ("obj",)
-
-    def __init__(self, obj: Any):
-        self.obj = obj
-
-    def __eq__(self, other: object) -> bool:
-        return isinstance(other, _Same) and other.obj is self.obj
-
-    def __hash__(self) -> int:
-        return id(self.obj)
-
-
-_MISSING = object()
-_SMALL_TABLE = 4096  # NumPy arrays up to this size (mask tables) are compared by value, bigger ones by identity
-
-
-def _value_key(value: Any) -> Any:
-    """A hashable stand-in for the value of a constant a kernel reads: equal keys, the same kernel."""
-    if value is None or isinstance(value, (bool, int, float, complex, str, bytes, np.generic)):
-        return (type(value), repr(value))  # repr: 2 isn't 2.0, and nan is nan
-    if isinstance(value, np.dtype):
-        return (np.dtype, value.str)
-    if isinstance(value, (tuple, list)):
-        return (type(value), tuple(map(_value_key, value)))
-    if isinstance(value, np.ndarray) and value.size <= _SMALL_TABLE:
-        return (np.ndarray, value.shape, value.dtype.str, value.tobytes())
-    return _Same(value)
-
-
 def _is_outer_array(value: Any) -> bool:
     """A global or closure value the kernel reads as an input array (rather than as a constant)."""
     return isinstance(value, (jax.Array, np.ndarray)) and value.ndim >= 1
 
 
+# --------------------------------------------------------------------------- the names a nest reads
+
+_FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+_COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+_SCOPES = (*_FUNCTIONS, ast.ClassDef, *_COMPREHENSIONS)
+
+
+def _parts(scope: ast.AST) -> tuple[list[ast.AST], list[ast.AST]]:
+    """A nested scope's parts evaluated in the scope around it (defaults, decorators, a comprehension's
+    first iterable), and those evaluated in its own."""
+    if isinstance(scope, _FUNCTIONS):
+        a = scope.args
+        outer: list[ast.AST] = [*a.defaults, *(d for d in a.kw_defaults if d is not None)]
+        if isinstance(scope, ast.Lambda):
+            return outer, [scope.body]
+        params = [*a.posonlyargs, *a.args, *a.kwonlyargs, a.vararg, a.kwarg]
+        outer += [*scope.decorator_list, *(p.annotation for p in params if p is not None and p.annotation)]
+        return outer + ([scope.returns] if scope.returns else []), list(scope.body)
+    if isinstance(scope, ast.ClassDef):
+        return [*scope.decorator_list, *scope.bases, *scope.keywords], list(scope.body)
+    first, *rest = scope.generators
+    elts = [scope.key, scope.value] if isinstance(scope, ast.DictComp) else [scope.elt]
+    return [first.iter], [*elts, first.target, *first.ifs, *rest]
+
+
+def _in_scope(nodes: Iterable[ast.AST]) -> Iterable[ast.AST]:
+    """Every node of `nodes` that belongs to their scope: nested scopes are yielded, but only their parts
+    evaluated in this scope are entered."""
+    todo = list(nodes)[::-1]
+    while todo:
+        node = todo.pop()
+        yield node
+        todo.extend(reversed(_parts(node)[0] if isinstance(node, _SCOPES) else list(ast.iter_child_nodes(node))))
+
+
+def _params(scope: ast.AST) -> set[str]:
+    if not isinstance(scope, _FUNCTIONS):
+        return set()
+    a = scope.args
+    return {p.arg for p in [*a.posonlyargs, *a.args, *a.kwonlyargs, a.vararg, a.kwarg] if p is not None}
+
+
+def _binds(nodes: list[ast.AST], comprehension: bool) -> set[str]:
+    """The names code in one scope binds: assigned, imported, defined or caught (walrus targets in its
+    comprehensions bind in the function around them), less those it declares `global` or `nonlocal`."""
+    bound, declared = set(), set()
+    for node in _in_scope(nodes):
+        if isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
+            bound.add(node.id)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(node.name)
+        elif isinstance(node, ast.alias):
+            bound.add((node.asname or node.name).split(".")[0])
+        elif isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and node.name:
+            bound.add(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            bound.add(node.rest)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            declared.update(node.names)
+        elif isinstance(node, _COMPREHENSIONS) and not comprehension:
+            bound |= {n.target.id for n in ast.walk(node) if isinstance(n, ast.NamedExpr)}
+    if comprehension:  # its own walrus targets aren't its own
+        bound -= {n.target.id for node in nodes for n in ast.walk(node) if isinstance(n, ast.NamedExpr)}
+    return bound - declared
+
+
+def _free_loads(nodes: list[ast.AST], bound: set[str]) -> Iterable[ast.Name]:
+    """The `Name`s in `nodes` (code in a scope that binds `bound`) that read a module global or closure
+    variable: not bound there, in a scope around them or in their own (a lambda's parameters, a
+    comprehension's targets, a nested function's locals)."""
+    for node in _in_scope(nodes):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id not in bound:
+            yield node
+        elif isinstance(node, _SCOPES):
+            inner = _parts(node)[1]
+            own = _params(node) | _binds(inner, isinstance(node, _COMPREHENSIONS))
+            yield from _free_loads(inner, bound | own)
+
+
+def _fn_bound(nest: frontend.LoopNest) -> set[str]:
+    return set(nest.params) | _binds(list(nest.fdef.body), False)
+
+
 def _free_names(nest: frontend.LoopNest) -> tuple[str, ...]:
     """Names the nest's code reads that it doesn't bind: its module globals and closure variables."""
-    nodes = [n for s in nest.fdef.body for n in ast.walk(s) if isinstance(n, ast.Name)]
-    bound = {n.id for n in nodes if not isinstance(n.ctx, ast.Load)} | set(nest.params)
-    return tuple(dict.fromkeys(n.id for n in nodes if n.id not in bound))
+    a = nest.fdef.args
+    annotations = [p.annotation for p in [*a.posonlyargs, *a.args] if p.annotation is not None]
+    nodes = [*annotations, *nest.fdef.body]
+    return tuple(dict.fromkeys(n.id for n in _free_loads(nodes, _fn_bound(nest))))
 
 
 def _sliced_names(nest: frontend.LoopNest) -> set[str]:
-    """Names the tile body reads through slices or loop variables (`BIAS[i : i + T, :]`): if they are global
-    arrays, the kernel reads them as inputs, as a program's nests do."""
+    """Free names the tile body reads through slices or loop variables (`BIAS[i : i + T, :]`): if they are
+    global arrays, the kernel reads them as inputs, as a program's nests do."""
     loop_vars = {lp.var for lp in nest.loops}
+    bound = _fn_bound(nest)
     found = set()
     for tree in [*nest.tile_statements(), *(st.value for st in nest.stores)]:
+        free = {id(n) for n in _free_loads([tree], bound)}
         for n in ast.walk(tree):
-            if isinstance(n, ast.Subscript) and isinstance(n.value, ast.Name):
+            if isinstance(n, ast.Subscript) and id(n.value) in free:
                 dims = n.slice.elts if isinstance(n.slice, ast.Tuple) else [n.slice]
                 if any(isinstance(d, ast.Slice) or (isinstance(d, ast.Name) and d.id in loop_vars) for d in dims):
                     found.add(n.value.id)
     return found
 
 
+class _Reader:
+    """Reads the current values of a function's module globals and closure variables by name."""
+
+    def __init__(self, fn: Callable):
+        fn = fn.__func__ if inspect.ismethod(fn) else fn
+        self.name = fn.__name__
+        self.cells = dict(zip(fn.__code__.co_freevars, fn.__closure__ or (), strict=True))
+        self.globals = fn.__globals__
+
+    def get(self, name: str, default: Any = None) -> Any:
+        cell = self.cells.get(name)
+        if cell is None:
+            return self.globals.get(name, default)
+        try:
+            return cell.cell_contents
+        except ValueError:  # an empty cell
+            return default
+
+    def snapshot(self, names: Iterable[str]) -> dict[str, Any]:
+        """The current values of `names` (unbound ones, builtins say, left out)."""
+        out = {}
+        for n in names:
+            if n in self.cells:
+                try:
+                    out[n] = self.cells[n].cell_contents
+                except ValueError:
+                    raise AutoKernelError(
+                        f"{self.name}: closure variable `{n}` has no value yet; assign it before calling the kernel"
+                    ) from None
+            elif n in self.globals:
+                out[n] = self.globals[n]
+        return out
+
+
 @dataclasses.dataclass(frozen=True, eq=False)
 class _Context:
-    """What a kernel's code sees, fixed for every artefact derived from it (kernel, reference, batched and
-    per-shard kernels): the values of its globals and closure variables, and the nest with the global arrays
-    it reads as extra parameters."""
+    """What a kernel's code sees for one input signature, fixed for every artefact built for it (kernel,
+    tuning, reference and derivative, batched and per-shard kernels), as `jax.jit` reads a function's
+    globals once per signature: the values its module and closure constants had when it was first called
+    with that signature, and the nest with the global arrays it reads as extra parameters."""
 
     env: analysis.Environment
     nest: frontend.LoopNest
     outer: tuple[str, ...]  # global and closure arrays passed as inputs after the function's own
-    key: tuple
 
 
 _warned_interpreting = False
@@ -160,11 +254,15 @@ class TpuKernel:
     - `verify(*args)`: run both and raise if they disagree; returns the max abs error
     - `tuning(*args)`: every tuning candidate tried, with predicted (and measured) times
 
-    Every entry point takes the arguments positionally or by name. `args` for `lower`, `source` and
-    `tuning` may be arrays or `jax.ShapeDtypeStruct`s. Kernels are generated, and tuned, once per input
-    signature (shapes and dtypes) and per set of values of the module and closure constants the nest reads,
-    so changing such a constant gives a new kernel, as it would change what the Python computes. Global and
-    closure arrays the tile body reads through slices are inputs, read with their current values.
+    Every entry point takes the arguments positionally or by name (but see `verify` for parameters named
+    `rtol` or `atol`). `args` for `lower`, `source` and `tuning` may be arrays or `jax.ShapeDtypeStruct`s.
+
+    Kernels are generated, and tuned, once per input signature (shapes and dtypes). As `jax.jit` does,
+    the kernel reads the module and closure constants its code uses once per signature, when it is first
+    built for it: the kernel, `reference`, `verify`, the derivative and batched and per-shard kernels for
+    that signature all use those values, and changing such a constant afterwards changes none of them.
+    Global and closure arrays the tile body reads through slices (`BIAS[i : i + T, :]`) are inputs
+    instead, read with their current values on every call (under `jax.jit`, when it traces).
 
     Calls compose with `jax.jit`, `jax.vmap` (a batch runs as one kernel generated with an extra batch
     loop), forward- and reverse-mode differentiation, and inputs sharded over a mesh (each device runs a
@@ -190,86 +288,72 @@ class TpuKernel:
         self.options = options or Options()
         self.backward = backward
         self._lock = threading.RLock()  # concurrent first calls generate (and tune) a kernel once
-        self._contexts: dict[tuple, _Context] = {}
-        self._lowered: dict[tuple, Lowered] = {}  # by (context, signature)
-        self._tuning: dict[tuple, list[tune_lib.Candidate]] = {}
-        self._measured: set[tuple] = set()
+        # Caches by input signature, through its `_Context`.
+        self._contexts: dict[tuple, _Context] = {}  # by (global arrays read as inputs, signature)
+        self._lowered: dict[_Context, Lowered] = {}
+        self._tuning: dict[_Context, list[tune_lib.Candidate]] = {}
+        self._measured: set[_Context] = set()
         self._compiled: dict[tuple, tuple[Lowered, Callable[..., Any], Callable[..., Any]]] = {}
-        self._verified: set[tuple] = set()
+        self._verified: set[_Context] = set()
         self._reference: dict[tuple, Callable] = {}  # by context and tuned constants
         self._batched: dict[tuple, TpuKernel | Exception] = {}  # (context, in_batched, size) -> kernel for jax.vmap
         self._local: dict[tuple, TpuKernel] = {}  # per-shard kernels for sharded inputs
         self._shard_plans: dict[tuple, sharding.ShardPlan] = {}
         self._warned: set[str] = set()
+        # The frontend only takes plain positional-or-keyword array parameters (no defaults, `*args` or
+        # keyword-only ones): arguments bind to them by position or by name.
         params = [inspect.Parameter(p, inspect.Parameter.POSITIONAL_OR_KEYWORD) for p in self.nest.params]
-        self._signature = inspect.Signature(params)
+        self._parameters = inspect.Signature(params)
         if isinstance(fn, analysis.Environment):
             self.__name__ = self.__qualname__ = self.nest.fn_name
-            self._free: tuple[str, ...] = ()
-            self._sliced: set[str] = set()
-            self._fixed: _Context | None = _Context(fn, self.nest, (), ())
+            self._reader: _Reader | None = None
+            self._read: tuple[str, ...] = ()
+            self._sliced: tuple[str, ...] = ()
         else:
             functools.update_wrapper(self, fn)
-            with contextlib.suppress(TypeError, ValueError):  # a plain function: its defaults apply too
-                self._signature = inspect.signature(fn)
-            self._free = _free_names(self.nest)
-            self._sliced = _sliced_names(self.nest) & set(self._free)
-            self._fixed = None
+            self._reader = _Reader(fn)
+            self._filename = inspect.getsourcefile(fn) or "<autokernel>"
+            self._read = _free_names(self.nest)  # the constants a context snapshots (tuned ones are among them)
+            self._sliced = tuple(sorted(_sliced_names(self.nest)))
 
     # ------------------------------------------------------------------ arguments and contexts
 
     def _bind(self, args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> tuple[_Context, tuple[Any, ...]]:
-        """The context the kernel runs in now, and the kernel's inputs: the arguments bound to the function's
-        parameters (defaults filled in), then the global arrays the nest reads."""
-        params = self.nest.params
-        try:
-            bound = self._signature.bind(*args, **kwargs)
-        except TypeError as e:
-            raise AutoKernelError(
-                f"{self.__name__} takes {len(params)} arrays, got {len(args) + len(kwargs)}: {e}"
-            ) from None
-        bound.apply_defaults()
-        if set(bound.arguments) != set(params):
-            raise AutoKernelError(f"{self.__name__}'s parameters must be its arrays {params}")
-        inputs = tuple(bound.arguments[p] for p in params)
-        if self._fixed is not None:
-            return self._fixed, inputs
-        values = self._current_values()
-        outer = tuple(n for n in sorted(self._sliced) if _is_outer_array(values.get(n)))
-        key = (outer, tuple((n, _value_key(values.get(n, _MISSING))) for n in self._free if n not in outer))
+        """The context for these arguments' signature, and the kernel's inputs: the arguments bound to the
+        function's parameters, then the global arrays the nest reads."""
+        if kwargs or len(args) != len(self.nest.params):
+            try:
+                args = tuple(self._parameters.bind(*args, **kwargs).arguments.values())
+            except TypeError as e:
+                raise AutoKernelError(
+                    f"{self.__name__} takes {len(self.nest.params)} arrays, got {len(args) + len(kwargs)}: {e}"
+                ) from None
+        outer: tuple[str, ...] = ()
+        if self._sliced:  # global arrays: their current values are inputs
+            values = [self._reader.get(n) for n in self._sliced]
+            outer = tuple(n for n, v in zip(self._sliced, values, strict=True) if _is_outer_array(v))
+            args = (*args, *(v for v in values if _is_outer_array(v)))
+        key = (outer, _signature(args))
         ctx = self._contexts.get(key)
         if ctx is None:
             with self._lock:
                 ctx = self._contexts.get(key)
                 if ctx is None:
-                    ctx = self._contexts[key] = self._make_context(key, outer)
-        return ctx, (*inputs, *(values[n] for n in outer))
+                    ctx = self._contexts[key] = self._make_context(outer)
+        return ctx, args
 
-    def _current_values(self) -> dict[str, Any]:
-        """The current values of the globals and closure variables the nest reads (unbound ones left out)."""
-        fn = self.fn
-        code = getattr(fn, "__code__", None)
-        if code is None:
-            names = analysis.user_globals(fn)
-            return {n: names[n] for n in self._free if n in names}
-        cells = dict(zip(code.co_freevars, fn.__closure__ or (), strict=True))
-        out = {}
-        for n in self._free:
-            if n in cells:
-                with contextlib.suppress(ValueError):  # an empty cell
-                    out[n] = cells[n].cell_contents
-            elif n in fn.__globals__:
-                out[n] = fn.__globals__[n]
-        return out
-
-    def _make_context(self, key: tuple, outer: tuple[str, ...]) -> _Context:
-        env = analysis.environment(self.fn)  # a snapshot: everything built for this context uses it
+    def _make_context(self, outer: tuple[str, ...]) -> _Context:
+        """A new signature's context: the current values of the constants the code reads, and the nest
+        taking the global arrays it reads as extra parameters."""
+        if self._reader is None:
+            return _Context(self.fn, self.nest, ())
+        names = self._reader.snapshot(n for n in self._read if n not in outer)
         nest = self.nest
         if outer:
             fdef = copy.deepcopy(nest.fdef)
             fdef.args.args += [ast.arg(n) for n in outer]
             nest = frontend.parse_function(fdef, nest.fn_name, nest.first_line)
-        return _Context(env, nest, outer, key)
+        return _Context(analysis.Environment(names, self._filename), nest, outer)
 
     # ------------------------------------------------------------------ entry points
 
@@ -279,7 +363,7 @@ class TpuKernel:
     def tuning(self, *args: Any, **kwargs: Any) -> list[tune_lib.Candidate]:
         ctx, inputs = self._bind(args, kwargs)
         self._lower(ctx, inputs)
-        return self._tuning.get((ctx.key, _signature(inputs)), [])
+        return self._tuning.get(ctx, [])
 
     def source(self, *args: Any, **kwargs: Any) -> str:
         return self.lower(*args, **kwargs).source
@@ -296,6 +380,16 @@ class TpuKernel:
         return self._call(*self._bind(args, kwargs))
 
     def verify(self, *args: Any, rtol: float | None = None, atol: float | None = None, **kwargs: Any) -> float:
+        """Run the kernel and `reference` and raise if they disagree; returns the max abs error.
+
+        `rtol` and `atol` override the tolerances the dtypes allow, unless the kernel has a parameter of
+        that name: the keyword then passes that argument, and the tolerance keeps its default.
+        """
+        for name, value in (("rtol", rtol), ("atol", atol)):
+            if name in self.nest.params and value is not None:
+                kwargs[name] = value
+        rtol = None if "rtol" in self.nest.params else rtol
+        atol = None if "atol" in self.nest.params else atol
         ctx, inputs = self._bind(args, kwargs)
         return self._check(self._call(ctx, inputs), self._run_reference(ctx, inputs), rtol, atol)
 
@@ -320,38 +414,41 @@ class TpuKernel:
         return self.interpret
 
     def _lower(self, ctx: _Context, inputs: tuple[Any, ...]) -> Lowered:
-        key = (ctx.key, _signature(inputs))
         options = self.options
         # Measuring without tuned names still picks the buffer depth: the search then has one combination.
         search = bool(options.tune) or options.autotune == "measure"
+        lowered = self._lowered.get(ctx)
+        if lowered is not None and (options.autotune != "measure" or ctx in self._measured):
+            return lowered
         with self._lock:
-            if key not in self._lowered:
+            if ctx not in self._lowered:
                 specs = [_spec(a) for a in inputs]
                 if search:
-                    self._tuning[key] = tune_lib.search(ctx.nest, ctx.env, specs, options)
-                    self._lowered[key] = self._tuning[key][0].lowered  # the cost model's pick
+                    self._tuning[ctx] = tune_lib.search(ctx.nest, ctx.env, specs, options)
+                    self._lowered[ctx] = self._tuning[ctx][0].lowered  # the cost model's pick
                 else:
-                    self._lowered[key] = lower(ctx.nest, ctx.env, specs, options)
-                    if hardware.on_tpu() and cost_lib.overhead_bound(self._lowered[key].estimate):
+                    self._lowered[ctx] = lower(ctx.nest, ctx.env, specs, options)
+                    if hardware.on_tpu() and cost_lib.overhead_bound(self._lowered[ctx].estimate):
                         warnings.warn(
                             f"autokernel: {self.__name__}'s steps are too small to hide their fixed per-step cost "
-                            f'({self._lowered[key].steps} steps); larger blocks would run faster: try tune="auto"',
+                            f'({self._lowered[ctx].steps} steps); larger blocks would run faster: try tune="auto"',
                             stacklevel=4,
                         )
             # Measuring needs real arrays on a real TPU: do it on the first call that has them.
-            measure = search and options.autotune == "measure" and key not in self._measured
+            measure = search and options.autotune == "measure" and ctx not in self._measured
             if measure and _concrete(inputs) and hardware.on_tpu():
-                self._measured.add(key)
+                self._measured.add(ctx)
                 arrays = tuple(jax.numpy.asarray(a) for a in inputs)
-                best = tune_lib.measure(self._tuning[key], arrays, options.measure_top)
+                best = tune_lib.measure(self._tuning[ctx], arrays, options.measure_top)
                 if best is not None:
-                    self._lowered[key] = best
-            return self._lowered[key]
+                    self._lowered[ctx] = best
+            return self._lowered[ctx]
 
     def _run_reference(self, ctx: _Context, inputs: tuple[Any, ...]) -> Any:
-        # A tuned kernel runs with the tuned constants: so must the loops it is compared with.
-        overrides = self._lower(ctx, inputs).overrides
-        key = (ctx.key, _typed(overrides))
+        # A tuned kernel runs with the tuned constants: so must the loops it is compared with. Without
+        # tuning there is nothing to lower: the loops run even where no kernel can be planned.
+        overrides = self._lower(ctx, inputs).overrides if self.options.tune else {}
+        key = (ctx, _typed(overrides))
         reference = self._reference.get(key)
         if reference is None:
             with self._lock:
@@ -380,33 +477,45 @@ class TpuKernel:
         if lowered.scalars:  # runtime indices whose values are known now: check them against the inputs
             known = {p: a for p, a in zip(ctx.nest.params, inputs, strict=True) if p in lowered.scalars}
             lowered.check_indices(known)  # traced ones: a checkify check (the kernel clamps them)
-        key = (ctx.key, _signature(inputs))
-        with self._lock:
-            shard_plan = self._shard_plan(ctx, lowered, inputs)
-            ckey = (key, shard_plan.key if shard_plan is not None else None)
+        found = sharding.find_mesh(inputs)
+        if found is None:
+            ckey: tuple = (ctx, None)
             compiled = self._compiled.get(ckey)
-            if compiled is None or compiled[0] is not lowered:  # first call, or measuring changed the pick
-                if shard_plan is None:
-                    forward = jax.jit(functools.partial(lowered.entry, interpret=self._interpret_mode()))
-                    reference = functools.partial(self._reference_of, ctx)
-                else:  # each device runs its shard's kernel, and differentiates its shard's loops
-                    local = self._local_kernel(ctx, lowered, shard_plan)
-                    if local is None:  # nothing is split: every device runs this kernel on gathered inputs
-                        run, run_reference = self._runner(ctx), functools.partial(self._reference_of, ctx)
-                    else:
-                        run, run_reference = local, local.reference
-                    forward = sharding.run(shard_plan, run, self.nest.returns_tuple)
-                    reference = sharding.run(shard_plan, run_reference, self.nest.returns_tuple)
-                backward = self._backward(ctx)
-                vmap_rule = functools.partial(self._vmap_rule, ctx)
-                entry = autodiff.differentiable(forward, reference, backward, vmap_rule=vmap_rule)
-                # jit: one cached trace of the wrappers rather than one per eager call
-                compiled = self._compiled[ckey] = (lowered, jax.jit(entry), reference)
+        else:
+            compiled = None
+        if compiled is None or compiled[0] is not lowered:  # first call, or measuring changed the pick
+            with self._lock:
+                shard_plan = self._shard_plan(ctx, lowered, inputs, found)
+                ckey = (ctx, shard_plan.key if shard_plan is not None else None)
+                compiled = self._compiled.get(ckey)
+                if compiled is None or compiled[0] is not lowered:
+                    compiled = self._compiled[ckey] = self._compile(ctx, lowered, shard_plan)
         out = compiled[1](*inputs)
-        if self.verify_on_first_call and key not in self._verified and _concrete(inputs):
+        if self.verify_on_first_call and ctx not in self._verified and _concrete(inputs):
             self._check(out, compiled[2](*inputs))
-            self._verified.add(key)  # only once it agrees: a mismatch is reported on every call
+            self._verified.add(ctx)  # only once it agrees: a mismatch is reported on every call
         return out
+
+    def _compile(
+        self, ctx: _Context, lowered: Lowered, shard_plan: sharding.ShardPlan | None
+    ) -> tuple[Lowered, Callable[..., Any], Callable[..., Any]]:
+        """The kernel with its derivative and batching rule, jitted, and the reference it is checked with."""
+        if shard_plan is None:
+            forward = jax.jit(functools.partial(lowered.entry, interpret=self._interpret_mode()))
+            reference = functools.partial(self._reference_of, ctx)
+        else:  # each device runs its shard's kernel, and differentiates its shard's loops
+            local = self._local_kernel(ctx, lowered, shard_plan)
+            if local is None:  # nothing is split: every device runs this kernel on gathered inputs
+                run, run_reference = self._runner(ctx), functools.partial(self._reference_of, ctx)
+            else:
+                run, run_reference = local, local.reference
+            forward = sharding.run(shard_plan, run, self.nest.returns_tuple)
+            reference = sharding.run(shard_plan, run_reference, self.nest.returns_tuple)
+        backward = self._backward(ctx)
+        vmap_rule = functools.partial(self._vmap_rule, ctx)
+        entry = autodiff.differentiable(forward, reference, backward, vmap_rule=vmap_rule)
+        # jit: one cached trace of the wrappers rather than one per eager call
+        return lowered, jax.jit(entry), reference
 
     def _runner(self, ctx: _Context) -> Callable[..., Any]:
         return lambda *inputs: self._call(ctx, inputs)
@@ -446,7 +555,7 @@ class TpuKernel:
             if b and analysis.is_scalar_spec(jax.ShapeDtypeStruct(tuple(a.shape)[1:], a.dtype)):
                 self._warn_sequential(f"its runtime scalar `{p}` is batched")
                 return None
-        bkey = (ctx.key, in_batched, size)
+        bkey = (ctx, in_batched, size)
         with self._lock:
             kernel = self._batched.get(bkey)
             if kernel is None:
@@ -483,9 +592,11 @@ class TpuKernel:
 
     # ------------------------------------------------------------------ sharded inputs
 
-    def _shard_plan(self, ctx: _Context, lowered: Lowered, args: tuple[Any, ...]) -> sharding.ShardPlan | None:
-        """How to run on `args` when some are sharded over a mesh (None when none is)."""
-        found = sharding.find_mesh(args)
+    def _shard_plan(
+        self, ctx: _Context, lowered: Lowered, args: tuple[Any, ...], found: tuple | None
+    ) -> sharding.ShardPlan | None:
+        """How to run on `args` when some are sharded over a mesh (`found`: `sharding.find_mesh(args)`;
+        None when none is)."""
         if found is None or lowered.plan is None:
             return None
         key = (id(lowered), found[0], tuple(found[1]))

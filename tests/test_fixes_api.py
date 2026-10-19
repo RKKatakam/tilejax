@@ -96,22 +96,26 @@ def test_a_weak_scalar_mixes_with_tiles_as_in_the_reference():
 # --------------------------------------------------------------------------- changed constants
 
 
-def test_a_changed_module_constant_gives_a_new_kernel_everywhere(monkeypatch):
+def test_a_module_constant_is_read_once_per_signature_everywhere(monkeypatch):
     kernel = autokernel.tpu(scaled)
     x = jnp.ones((M, N))
     assert float(kernel(x)[0, 0]) == 2.0
     monkeypatch.setattr(sys.modules[__name__], "SCALE", 3.0)
-    assert float(kernel(x)[0, 0]) == 3.0  # as the Python would compute now
-    assert float(kernel.reference(x)[0, 0]) == 3.0
-    assert float(jax.grad(lambda x: kernel(x).sum())(x)[0, 0]) == 3.0
-    assert float(jax.vmap(kernel)(x[None])[0, 0, 0]) == 3.0
-    assert float(jax.jvp(kernel, (x,), (x,))[1][0, 0]) == 3.0
-    monkeypatch.setattr(sys.modules[__name__], "SCALE", 2.0)
+    # As under jax.jit: this signature's kernel, reference, derivatives and batched kernel keep 2.0.
     assert float(kernel(x)[0, 0]) == 2.0
-    assert len(kernel._contexts) == 2  # the first kernel is reused for the old value
+    assert float(kernel.reference(x)[0, 0]) == 2.0
+    assert float(jax.grad(lambda x: kernel(x).sum())(x)[0, 0]) == 2.0
+    assert float(jax.vmap(kernel)(x[None])[0, 0, 0]) == 2.0
+    assert float(jax.jvp(kernel, (x,), (x,))[1][0, 0]) == 2.0
+    kernel.verify(x)
+    # A new signature reads the constant as it is now.
+    xb = x.astype(jnp.bfloat16)
+    assert float(kernel(xb)[0, 0]) == float(kernel.reference(xb)[0, 0]) == 3.0
+    assert float(jax.grad(lambda x: kernel(x).sum())(xb)[0, 0]) == 3.0
+    assert len(kernel._contexts) == len(kernel._lowered) == 2
 
 
-def test_a_changed_closure_constant_gives_a_new_kernel():
+def test_a_closure_constant_is_read_once_per_signature():
     def make():
         factor = 2.0
 
@@ -132,16 +136,9 @@ def test_a_changed_closure_constant_gives_a_new_kernel():
     x = jnp.ones((M, N))
     assert float(kernel(x)[0, 0]) == 2.0
     change(5.0)
-    assert float(kernel(x)[0, 0]) == float(jax.grad(lambda x: kernel(x).sum())(x)[0, 0]) == 5.0
-
-
-def test_constant_keys_tell_values_apart():
-    key = api._value_key
-    assert key(2) != key(2.0) != key(True)
-    assert key(float("nan")) == key(float("nan"))  # nan as a constant still reuses its kernel
-    assert key((1, 2)) == key((1, 2)) != key((1, 3))
-    assert key(np.arange(4)) == key(np.arange(4)) != key(np.arange(1, 5))  # small tables: by value
-    assert key(jnp) == key(jnp) != key(np)
+    assert float(kernel(x)[0, 0]) == float(jax.grad(lambda x: kernel(x).sum())(x)[0, 0]) == 2.0
+    xb = x.astype(jnp.bfloat16)
+    assert float(kernel(xb)[0, 0]) == float(jax.grad(lambda x: kernel(x).sum())(xb)[0, 0]) == 5.0
 
 
 # --------------------------------------------------------------------------- keyword arguments
