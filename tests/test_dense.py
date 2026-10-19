@@ -1,9 +1,10 @@
-"""Kernels without tile masks: matmuls, elementwise ops, accumulators and precision, on both backends."""
+"""Kernels without masks: matmuls, elementwise ops, accumulators, precision, buffering and core splits."""
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from helpers import rand
+import pytest
+from helpers import rand, run_checking_races
 
 import autokernel
 
@@ -27,28 +28,20 @@ def specs():
     return jax.ShapeDtypeStruct((M, K), jnp.float32), jax.ShapeDtypeStruct((K, N), jnp.float32)
 
 
-def test_matmul_matches_reference_and_jnp(pipeline):
-    kern = autokernel.tpu(matmul.fn, pipeline=pipeline)
+def test_matmul_matches_reference_and_jnp():
     a, b = rand((M, K)), rand((K, N), 1)
-    kern.verify(a, b)
-    np.testing.assert_allclose(kern(a, b), jnp.dot(a, b, precision="highest"), atol=1e-4, rtol=1e-4)
+    matmul.verify(a, b)
+    np.testing.assert_allclose(matmul(a, b), jnp.dot(a, b, precision="highest"), atol=1e-4, rtol=1e-4)
 
 
-def test_manual_is_the_default_and_has_no_grid():
+def test_lowering_structure():
     lw = matmul.lower(*specs())
-    assert (lw.pipeline, lw.grid, lw.steps) == ("manual", (), (M // TM) * (N // TN) * (K // TK))
-    assert "grid=" not in lw.source and "pl.loop(0, 24" in lw.source
-    assert "pltpu.VMEM((2, 64, 128), jnp.float32)" in lw.source  # double-buffered x tiles
-
-
-def test_grid_lowering_structure():
-    lw = autokernel.tpu(matmul.fn, pipeline="grid").lower(*specs())
-    assert (lw.pipeline, lw.grid) == ("grid", (M // TM, N // TN, K // TK))
-    assert [op.block.shape for op in lw.operands] == [(TM, TK), (TK, TN)]
-    assert [op.block.index for op in lw.operands] == [("i", "k"), ("k", "j")]
-    assert lw.out_block.shape == (TM, TN)
-    assert "dimension_semantics=('parallel', 'parallel', 'arbitrary')" in lw.source
-    assert "pltpu.VMEM((64, 128), jnp.float32)" in lw.source
+    assert (lw.schedule, lw.steps, lw.tiles, lw.cores, lw.buffers) == ("uniform", 24, 8, 1, 2)
+    assert [op.block.kernel_shape for op in lw.operands] == [(TM, TK), (TK, TN)]
+    assert [op.phase for op in lw.operands] == [0, 0]
+    assert lw.state["acc"].aval.shape == (TM, TN)
+    assert "grid=" not in lw.source and "pltpu.VMEM((2, 64, 128), jnp.float32)" in lw.source
+    assert "cost_estimate=_COST" in lw.source and lw.estimate.flops >= 2 * M * N * K
 
 
 def test_lowering_is_cached_per_signature():
@@ -56,14 +49,30 @@ def test_lowering_is_cached_per_signature():
     assert matmul.lower(a, b) is matmul.lower(jax.ShapeDtypeStruct((M, K), jnp.float32), b)
 
 
-def test_works_under_jit(pipeline):
-    kern = autokernel.tpu(matmul.fn, pipeline=pipeline)
+def test_works_under_jit():
     a, b = rand((M, K)), rand((K, N), 1)
-    np.testing.assert_allclose(jax.jit(kern)(a, b), kern.reference(a, b), atol=1e-4, rtol=1e-4)
+    np.testing.assert_allclose(jax.jit(matmul)(a, b), matmul.reference(a, b), atol=1e-4, rtol=1e-4)
 
 
-def test_elementwise_without_reduction(pipeline):
-    @autokernel.tpu(verify=True, pipeline=pipeline)
+@pytest.mark.parametrize("buffers", [2, 3, 4])
+def test_deeper_input_buffering(buffers):
+    kern = autokernel.tpu(matmul.fn, buffers=buffers)
+    a, b = rand((M, K)), rand((K, N), 1)
+    assert kern.lower(a, b).buffers == buffers
+    np.testing.assert_allclose(run_checking_races(kern, a, b), matmul.reference(a, b), atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("cores", [2, 3])
+def test_work_split_across_tensorcores(cores):
+    kern = autokernel.tpu(matmul.fn, cores=cores)
+    a, b = rand((M, K)), rand((K, N), 1)
+    lw = kern.lower(a, b)
+    assert lw.cores == cores and f"grid=({cores},)" in lw.source and 'dimension_semantics=("parallel",)' in lw.source
+    kern.verify(a, b)
+
+
+def test_elementwise_without_reduction():
+    @autokernel.tpu(verify=True)
     def add_relu(x, y):
         out = jnp.zeros((256, 512))
         for i in range(0, 256, 64):
@@ -76,10 +85,10 @@ def test_elementwise_without_reduction(pipeline):
     assert add_relu.lower(rand((256, 512)), rand((256, 512), 1)).steps == 8
 
 
-def test_per_tile_operand_and_fused_epilogue(pipeline):
-    """`bias` only changes between output tiles, so the manual backend fetches it once per column."""
+def test_per_tile_operand_and_fused_epilogue():
+    """`bias` only changes between output tiles, so it's fetched once per tile, not once per step."""
 
-    @autokernel.tpu(pipeline=pipeline)
+    @autokernel.tpu
     def linear_relu(x, w, bias):
         B, D = x.shape
         H = w.shape[1]
@@ -94,11 +103,13 @@ def test_per_tile_operand_and_fused_epilogue(pipeline):
         return out
 
     for B, D, H in [(16, 256, 256), (32, 128, 384)]:
-        linear_relu.verify(rand((B, D)), rand((D, H), 1), rand((1, H), 2))
+        x, w, bias = rand((B, D)), rand((D, H), 1), rand((1, H), 2)
+        linear_relu.verify(x, w, bias)
+        assert [op.phase for op in linear_relu.lower(x, w, bias).operands] == [0, 0, None]
 
 
-def test_operand_that_never_changes(pipeline):
-    @autokernel.tpu(pipeline=pipeline)
+def test_operand_that_never_changes():
+    @autokernel.tpu
     def scale_rows(x, scale):
         out = jnp.zeros((256, 256))
         for i in range(0, 256, 64):
@@ -108,10 +119,8 @@ def test_operand_that_never_changes(pipeline):
     scale_rows.verify(rand((256, 256)), rand((8, 256), 1))
 
 
-def test_reduction_over_part_of_an_axis(pipeline):
-    """A reduction loop that starts past 0 offsets every reduction block."""
-
-    @autokernel.tpu(pipeline=pipeline)
+def test_reduction_over_part_of_an_axis():
+    @autokernel.tpu
     def partial_matmul(a, b):
         out = jnp.zeros((256, 256))
         for i in range(0, 256, 128):
@@ -125,8 +134,8 @@ def test_reduction_over_part_of_an_axis(pipeline):
     partial_matmul.verify(rand((256, 512)), rand((512, 256), 1))
 
 
-def test_single_step_reduction(pipeline):
-    @autokernel.tpu(pipeline=pipeline)
+def test_single_step_reduction():
+    @autokernel.tpu
     def one_k(a, b):
         out = jnp.zeros((256, 256))
         for i in range(0, 256, 128):
@@ -140,20 +149,8 @@ def test_single_step_reduction(pipeline):
     one_k.verify(rand((256, 128)), rand((128, 256), 1))
 
 
-def test_batched_three_dim_tiles(pipeline):
-    @autokernel.tpu(pipeline=pipeline)
-    def batched_scale(x):
-        out = jnp.zeros((4, 64, 256))
-        for b in range(0, 4, 1):
-            for i in range(0, 64, 32):
-                out = out.at[b : b + 1, i : i + 32, :].set(x[b : b + 1, i : i + 32, :] * (b + 1))
-        return out
-
-    batched_scale.verify(rand((4, 64, 256)))
-
-
-def test_loop_index_as_value(pipeline):
-    @autokernel.tpu(pipeline=pipeline)
+def test_loop_index_as_value():
+    @autokernel.tpu
     def add_row_block_offset(x):
         out = jnp.zeros((64, 128))
         for i in range(0, 64, 16):
@@ -162,12 +159,11 @@ def test_loop_index_as_value(pipeline):
 
     x = rand((64, 128))
     add_row_block_offset.verify(x)
-    expected = "i = pl.program_id(0) * 16" if pipeline == "grid" else "i = i_blocks[tile] * 16"
-    assert expected in add_row_block_offset.source(x)
+    assert "i = o * 16" in add_row_block_offset.source(x)
 
 
-def test_same_input_with_two_tilings(pipeline):
-    @autokernel.tpu(pipeline=pipeline)
+def test_same_input_with_two_tilings():
+    @autokernel.tpu
     def square(a):
         c = jnp.zeros((256, 256))
         for i in range(0, 256, 128):
@@ -183,8 +179,8 @@ def test_same_input_with_two_tilings(pipeline):
     assert len(square.lower(a).operands) == 2
 
 
-def test_bf16_inputs_accumulate_in_f32(pipeline):
-    @autokernel.tpu(pipeline=pipeline)
+def test_bf16_inputs_accumulate_in_f32():
+    @autokernel.tpu
     def mm_bf16(a, b):
         c = jnp.zeros((128, 256), jnp.bfloat16)
         for i in range(0, 128, 32):
@@ -196,8 +192,7 @@ def test_bf16_inputs_accumulate_in_f32(pipeline):
         return c
 
     a, b = rand((128, 256), dtype=jnp.bfloat16), rand((256, 256), 1, dtype=jnp.bfloat16)
-    lw = mm_bf16.lower(a, b)
-    assert lw.scratch["acc"].dtype == jnp.float32
+    assert mm_bf16.lower(a, b).state["acc"].aval.dtype == jnp.float32
     assert mm_bf16(a, b).dtype == jnp.bfloat16
     mm_bf16.verify(a, b)
 
@@ -210,12 +205,7 @@ def test_default_precision_is_the_faster_path():
     fast.verify(a, b)
 
 
-def test_manual_kernel_has_no_races():
-    from jax._src.pallas.mosaic.interpret import interpret_pallas_call as interpreter
-    from jax.experimental.pallas import tpu as pltpu
-
+def test_kernel_has_no_races():
     a, b = rand((M, K)), rand((K, N), 1)
-    params = pltpu.InterpretParams(detect_races=True, uninitialized_memory="nan")
-    out = matmul.lower(a, b).entry(a, b, interpret=params).block_until_ready()
-    assert interpreter.races is not None and not interpreter.races.races_found
+    out = run_checking_races(matmul, a, b)
     np.testing.assert_allclose(out, matmul.reference(a, b), atol=1e-4, rtol=1e-4)

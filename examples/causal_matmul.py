@@ -45,7 +45,7 @@ if __name__ == "__main__":
 
     print(causal_matmul.source(x, y))
     lowered = causal_matmul.lower(x, y)
-    print(f"computing {lowered.active_tiles} of {lowered.total_tiles} output tiles")
+    print(f"computing {lowered.tiles} of {lowered.total_tiles} output tiles")
 
     ref = jnp.tril(jnp.dot(x, y, precision="highest"))
     print("max diff vs tril(jnp.dot):", jnp.max(jnp.abs(causal_matmul(x, y) - ref)))

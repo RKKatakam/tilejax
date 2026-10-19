@@ -52,7 +52,7 @@ def f(a):
         out = out.at[i:i + 8, :].set(a[i:i + 8, :])
     return out
 """,
-            "doesn't write all of output dim 0",
+            "don't write all of `out`'s dim 0",
         ),
         (
             """
@@ -92,11 +92,15 @@ def f(a):
 def f(a):
     out = jnp.zeros((64, 128))
     for i in range(0, 64, 8):
-        if a[0, 0] > 0:
-            out = out.at[i:i + 8, :].set(a[i:i + 8, :])
+        acc = jnp.zeros((8, 128))
+        for k in range(0, 128, 128):
+            if acc[0, 0] > 0:
+                continue
+            acc += a[i:i + 8, k:k + 128]
+        out = out.at[i:i + 8, :].set(acc)
     return out
 """,
-            "only depend on loop variables",
+            "only depend on loop variables, constants and inputs, not `acc`",
         ),
         (
             """
@@ -138,7 +142,7 @@ def f(a):
         autokernel.tpu(_load(tmp_path, src)).lower(rand((64, 128)))
 
 
-def test_rejects_tiles_that_break_tpu_layout(pipeline):
+def test_rejects_tiles_that_break_tpu_layout():
     def bad(a, b):
         c = jnp.zeros((256, 192))
         for i in range(0, 256, 64):
@@ -151,11 +155,10 @@ def test_rejects_tiles_that_break_tpu_layout(pipeline):
 
     a, b = rand((256, 384)), rand((384, 192), 1)
     with pytest.raises(AutoKernelError, match="multiple of 128"):
-        autokernel.tpu(bad, pipeline=pipeline)(a, b)
-    unchecked = autokernel.tpu(bad, check_tiling=False, pipeline=pipeline)
+        autokernel.tpu(bad)(a, b)
+    unchecked = autokernel.tpu(bad, check_tiling=False)
     if jax.default_backend() == "tpu":
-        # Mosaic itself rejects the same tiles (grid: Pallas's BlockSpec check; manual: the DMA slice),
-        # so the pre-check matches real hardware.
+        # Mosaic itself rejects the same tiles (at the DMA slice), so the pre-check matches real hardware.
         with pytest.raises(Exception, match=r"divisible by 8 and 128|aligned to tiles"):
             unchecked(a, b)
     else:

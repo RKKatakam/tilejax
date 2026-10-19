@@ -107,32 +107,30 @@ def test_splash_attention_has_no_races():
     np.testing.assert_allclose(out, reference(q, k, v), atol=1e-4, rtol=1e-4)
 
 
-def test_reduction_masks_need_the_manual_pipeline():
-    kern = make_attention(1, 1, 256, 128, 128, 128, pipeline="grid")
-    with pytest.raises(AutoKernelError, match="need pipeline='manual'"):
-        kern.lower(*qkv(1, 1, 256, 128, jnp.float32))
+def test_reduction_mask_may_skip_every_step_of_a_tile():
+    """Tiles whose reduction runs zero steps still run the code around the loop, like the Python does."""
 
-
-def test_reduction_mask_that_empties_a_tile_is_rejected():
     @autokernel.tpu
-    def bad(x, y):
+    def first_rows_only(x, y):
         out = jnp.zeros((256, 256))
         for i in range(0, 256, 128):
             for j in range(0, 256, 128):
-                acc = jnp.zeros((128, 128))
+                acc = jnp.full((128, 128), 3.0)
                 for k in range(0, 256, 128):
                     if i > 0:
                         continue
                     acc += x[i : i + 128, k : k + 128] @ y[k : k + 128, j : j + 128]
-                out = out.at[i : i + 128, j : j + 128].set(acc)
+                out = out.at[i : i + 128, j : j + 128].set(acc * 2)
         return out
 
-    with pytest.raises(AutoKernelError, match="skips every step of the tile at i=128"):
-        bad.lower(rand((256, 256)), rand((256, 256), 1))
+    x, y = rand((256, 256)), rand((256, 256), 1)
+    first_rows_only.verify(x, y)
+    out = np.asarray(first_rows_only(x, y))
+    assert np.all(out[128:] == 6.0)  # the bottom tiles skip the whole reduction: init then epilogue
 
 
-def test_integer_indexing_by_batch_loop(pipeline):
-    @autokernel.tpu(pipeline=pipeline)
+def test_integer_indexing_by_batch_loop():
+    @autokernel.tpu
     def batched_matmul(x, y):
         out = jnp.zeros((3, 256, 256))
         for b in range(0, 3, 1):
@@ -148,8 +146,8 @@ def test_integer_indexing_by_batch_loop(pipeline):
     np.testing.assert_allclose(batched_matmul(x, y), jnp.matmul(x, y, precision="highest"), atol=1e-3, rtol=1e-3)
 
 
-def test_constant_integer_index(pipeline):
-    @autokernel.tpu(pipeline=pipeline)
+def test_constant_integer_index():
+    @autokernel.tpu
     def second_channel(x):
         out = jnp.zeros((256, 256))
         for i in range(0, 256, 128):
@@ -160,8 +158,8 @@ def test_constant_integer_index(pipeline):
     second_channel.verify(x)
 
 
-def test_transposed_matmul(pipeline):
-    @autokernel.tpu(pipeline=pipeline)
+def test_transposed_matmul():
+    @autokernel.tpu
     def gram(x):
         out = jnp.zeros((256, 256))
         for i in range(0, 256, 128):

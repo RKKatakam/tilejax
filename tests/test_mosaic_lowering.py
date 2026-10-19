@@ -1,23 +1,28 @@
-"""Cross-lower kernels to Mosaic for a TPU v5e, on any machine.
+"""Cross-lower kernels to Mosaic for real TPUs, on any machine.
 
 The TPU interpreter skips Pallas's Mosaic lowering, so these catch kernels that run in the interpreter
-but can't be compiled for real hardware (unsupported ops, DMAs, semaphores, dynamic loop bounds).
+but can't be compiled for hardware (unsupported ops, DMAs, semaphores, dynamic loop bounds, layouts).
 """
 
 import jax
 import jax.numpy as jnp
 import pytest
+import test_generality as gen
+from test_attention import make_attention
 from test_dense import matmul
 from test_masks import make_causal, make_masked_matmul
 
 import autokernel
 
-V5E = jax.sharding.AbstractDevice(device_kind="TPU v5 lite", num_cores=1, platform="tpu")
+DEVICES = {
+    "v5e": jax.sharding.AbstractDevice(device_kind="TPU v5 lite", num_cores=1, platform="tpu"),
+    "v5p": jax.sharding.AbstractDevice(device_kind="TPU v5", num_cores=2, platform="tpu"),
+}
 
 
-def lower_for_v5e(kernel, *specs):
+def lower_for(chip, kernel, *specs):
     entry = kernel.lower(*specs).entry
-    mesh = jax.sharding.AbstractMesh((1,), ("x",), abstract_device=V5E)
+    mesh = jax.sharding.AbstractMesh((1,), ("x",), abstract_device=DEVICES[chip])
     with jax.sharding.use_abstract_mesh(mesh):
         return jax.jit(lambda *xs: entry(*xs, interpret=False)).trace(*specs).lower(lowering_platforms=("tpu",))
 
@@ -30,61 +35,56 @@ def bf16(*shape):
     return jax.ShapeDtypeStruct(shape, jnp.bfloat16)
 
 
+def i32(*shape):
+    return jax.ShapeDtypeStruct(shape, jnp.int32)
+
+
 CASES = {
-    "dense": (lambda p: autokernel.tpu(matmul.fn, pipeline=p), (f32(256, 384), f32(384, 256))),
-    "causal-f32": (lambda p: make_causal(512, 256, 512, 128, 128, 128, jnp.float32, p), (f32(512, 256), f32(256, 512))),
-    "causal-bf16": (
-        lambda p: make_causal(512, 256, 512, 128, 128, 128, jnp.bfloat16, p),
-        (bf16(512, 256), bf16(256, 512)),
+    "dense": (matmul, (f32(256, 384), f32(384, 256))),
+    "dense-3-buffers": (autokernel.tpu(matmul.fn, buffers=3), (f32(256, 384), f32(384, 256))),
+    "causal-f32": (make_causal(512, 256, 512, 128, 128, 128, jnp.float32), (f32(512, 256), f32(256, 512))),
+    "causal-bf16": (make_causal(512, 256, 512, 128, 128, 128, jnp.bfloat16), (bf16(512, 256), bf16(256, 512))),
+    "prefill": (
+        make_masked_matmul(512, 256, 512, 128, 128, 128, lambda s: jnp.zeros(s), background_fill=False),
+        (f32(512, 256), f32(256, 512)),
     ),
+    "splash-attention": (make_attention(2, 2, 512, 128, 128, 128), (bf16(2, 2, 512, 128),) * 3),
+    "sliding-window": (make_attention(1, 2, 1024, 128, 128, 128, window=256), (bf16(1, 2, 1024, 128),) * 3),
+    "hoisted": (gen.scale_per_batch, (f32(4, 256, 256),)),
+    "two-outputs": (gen.matmul_and_relu, (f32(256, 256), f32(256, 256))),
+    "two-reductions": (gen.rmsnorm_matmul, (f32(gen.RM, gen.RK), f32(gen.RK, gen.RN))),
+    "nested-reduction": (gen.sum_of_matmuls, (f32(3, 256, 256), f32(3, 256, 256))),
+    "batched-matmul": (gen.bmm, (f32(4, 256, 256), f32(4, 256, 256))),
+    "smem-scalar-state": (gen.scaled_by_block_count, (f32(256, 512),)),
+    "runtime-reduction-mask": (gen.make_block_sparse(256, 512, 256, 128), (f32(256, 512), f32(512, 256), i32(2, 4))),
+    "runtime-tile-mask": (gen.make_masked_copy(), (f32(512, 256), jax.ShapeDtypeStruct((4, 2), jnp.bool_))),
 }
 
 
 @pytest.mark.parametrize("case", CASES)
-def test_lowers_to_mosaic(case, pipeline):
-    make, specs = CASES[case]
-    assert "tpu_custom_call" in lower_for_v5e(make(pipeline), *specs).as_text()
+def test_lowers_for_v5e(case):
+    kernel, specs = CASES[case]
+    assert "tpu_custom_call" in lower_for("v5e", kernel, *specs).as_text()
 
 
-def test_per_tile_operand_lowers_to_mosaic(pipeline):
-    @autokernel.tpu(pipeline=pipeline)
-    def linear(x, w, bias):
-        out = jnp.zeros((16, 256))
-        for i in range(0, 16, 8):
-            for j in range(0, 256, 128):
-                acc = jnp.zeros((8, 128))
-                for k in range(0, 256, 128):
-                    acc += x[i : i + 8, k : k + 128] @ w[k : k + 128, j : j + 128]
-                out = out.at[i : i + 8, j : j + 128].set(acc + bias[:, j : j + 128])
-        return out
-
-    assert "tpu_custom_call" in lower_for_v5e(linear, f32(16, 256), f32(256, 256), f32(1, 256)).as_text()
+@pytest.mark.parametrize("case", ["dense", "causal-f32", "splash-attention", "runtime-reduction-mask"])
+def test_lowers_split_across_two_tensorcores(case):
+    kernel, specs = CASES[case]
+    split = autokernel.tpu(kernel.fn, target="v5p")
+    assert split.lower(*specs).cores == 2
+    assert "tpu_custom_call" in lower_for("v5p", split, *specs).as_text()
 
 
 def _before_kernel(hlo):
     return hlo.split("tpu_custom_call")[0]
 
 
-def test_background_fill_drops_the_output_fill(pipeline):
-    kernel = make_masked_matmul(512, 256, 512, 128, 128, 128, lambda s: jnp.zeros(s), pipeline=pipeline)
-    hlo = lower_for_v5e(kernel, f32(512, 256), f32(256, 512)).as_text()
-    # No fill pass before the kernel: grid kernels alias an uninitialised buffer, manual ones write
-    # their output directly.
-    assert "broadcast_in_dim" not in _before_kernel(hlo)
-    assert ("AllocateBuffer" in hlo) == (pipeline == "grid")
+def test_background_fill_drops_the_output_fill():
+    kernel = make_masked_matmul(512, 256, 512, 128, 128, 128, lambda s: jnp.zeros(s))
+    hlo = lower_for("v5e", kernel, f32(512, 256), f32(256, 512)).as_text()
+    assert "broadcast_in_dim" not in _before_kernel(hlo)  # the kernel writes every tile itself
 
 
-def test_prefill_keeps_the_output_fill(pipeline):
-    kernel = make_masked_matmul(
-        512, 256, 512, 128, 128, 128, lambda s: jnp.zeros(s), background_fill=False, pipeline=pipeline
-    )
-    hlo = lower_for_v5e(kernel, f32(512, 256), f32(256, 512)).as_text()
-    assert "AllocateBuffer" not in hlo and "broadcast_in_dim" in _before_kernel(hlo)
-
-
-def test_splash_attention_lowers_to_mosaic():
-    from test_attention import make_attention
-
-    spec = bf16(2, 2, 512, 128)
-    hlo = lower_for_v5e(make_attention(2, 2, 512, 128, 128, 128), spec, spec, spec).as_text()
-    assert "tpu_custom_call" in hlo
+def test_prefill_keeps_the_output_fill():
+    kernel, specs = CASES["prefill"]
+    assert "broadcast_in_dim" in _before_kernel(lower_for("v5e", kernel, *specs).as_text())

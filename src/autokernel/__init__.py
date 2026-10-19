@@ -16,13 +16,13 @@ Write the tiling as ordinary Python loops and decorate it::
                 out = out.at[i:i + TM, j:j + TN].set(acc)
         return out
 
-Calling `matmul(x, y)` runs a generated `pl.pallas_call`; `matmul.source(x, y)` shows its code and
-`matmul.verify(x, y)` checks it against the Python loops.
+Calling `matmul(x, y)` runs a generated gridless Pallas kernel; `matmul.source(x, y)` shows its code
+and `matmul.verify(x, y)` checks it against the Python loops.
 """
 
 from .api import TpuKernel, tpu
-from .codegen import Lowered
 from .errors import AutoKernelError
+from .lowering import Lowered
 
 __all__ = ["AutoKernelError", "Lowered", "TpuKernel", "__version__", "tpu"]
-__version__ = "0.1.0"
+__version__ = "0.2.0"

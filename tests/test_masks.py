@@ -1,15 +1,15 @@
-"""Tile masks: skipped tiles, compacted grids and how skipped tiles get their value."""
+"""Tile masks: skipped tiles, and how skipped tiles get their value."""
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from helpers import rand
+from helpers import rand, run_checking_races
 
 import autokernel
 
 
-def make_causal(m, k, n, tm, tn, tk, dtype, pipeline="manual"):
+def make_causal(m, k, n, tm, tn, tk, dtype, **options):
     def causal(x, y):
         out = jnp.zeros((m, n), dtype)
         for i in range(0, m, tm):
@@ -24,7 +24,7 @@ def make_causal(m, k, n, tm, tn, tk, dtype, pipeline="manual"):
                 out = out.at[i : i + tm, j : j + tn].set(jnp.where(cols <= rows, acc, 0.0).astype(dtype))
         return out
 
-    return autokernel.tpu(causal, pipeline=pipeline)
+    return autokernel.tpu(causal, **options)
 
 
 def make_masked_matmul(m, k, n, tm, tn, tk, alloc, **options):
@@ -56,8 +56,8 @@ def make_masked_matmul(m, k, n, tm, tn, tk, alloc, **options):
     ],
 )
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
-def test_causal_mask_matches_tril(m, k, n, tm, tn, tk, dtype, pipeline):
-    kern = make_causal(m, k, n, tm, tn, tk, dtype, pipeline)
+def test_causal_mask_matches_tril(m, k, n, tm, tn, tk, dtype):
+    kern = make_causal(m, k, n, tm, tn, tk, dtype)
     x, y = rand((m, k), dtype=dtype), rand((k, n), 1, dtype=dtype)
     kern.verify(x, y)
     want = jnp.tril(jnp.dot(x, y, precision="highest", preferred_element_type=jnp.float32)).astype(dtype)
@@ -66,19 +66,16 @@ def test_causal_mask_matches_tril(m, k, n, tm, tn, tk, dtype, pipeline):
 
 
 @pytest.mark.parametrize("m, n, tm, tn", [(512, 512, 128, 128), (256, 1024, 128, 256), (1024, 256, 256, 256)])
-def test_causal_visits_only_active_tiles(m, n, tm, tn, pipeline):
-    lw = make_causal(m, 256, n, tm, tn, 128, jnp.float32, pipeline).lower(rand((m, 256)), rand((256, n), 1))
+def test_causal_visits_only_active_tiles(m, n, tm, tn):
+    lw = make_causal(m, 256, n, tm, tn, 128, jnp.float32).lower(rand((m, 256)), rand((256, n), 1))
     active = sum(j * tn <= i * tm + tm - 1 for i in range(m // tm) for j in range(n // tn))
-    assert (lw.active_tiles, lw.total_tiles, lw.steps) == (active, (m // tm) * (n // tn), active * 2)
-    if pipeline == "grid":
-        assert lw.grid == (active, 2)
-        assert "PrefetchScalarGridSpec" in lw.source and "input_output_aliases" in lw.source
-    else:
-        assert lw.grid == () and "input_output_aliases" not in lw.source  # the kernel writes every tile
+    assert (lw.tiles, lw.total_tiles, lw.steps) == (active, (m // tm) * (n // tn), active * 2)
+    assert lw.fill == ("background" if active < lw.total_tiles else None)  # skipped tiles get fill DMAs
+    assert "input_output_aliases" not in lw.source
 
 
-def test_if_and_continue_masks_without_reduction(pipeline):
-    @autokernel.tpu(pipeline=pipeline)
+def test_if_and_continue_masks_without_reduction():
+    @autokernel.tpu
     def tril_copy(x):
         out = jnp.zeros((512, 512))
         for i in range(0, 512, 128):
@@ -100,64 +97,46 @@ def test_if_and_continue_masks_without_reduction(pipeline):
 @pytest.mark.parametrize(
     "alloc, fill",
     [
-        (lambda s: jnp.full(s, -1.0), -1.0),  # the interpreter's empty buffer (zeros) can't fake this
+        (lambda s: jnp.full(s, -1.0), -1.0),
         (lambda s: jnp.ones(s), 1.0),
         (lambda s: jnp.full(s, fill_value=-jnp.inf), -np.inf),
         (lambda s: jnp.zeros(s) - 2.5, -2.5),  # found by following the jaxpr, not the call's name
     ],
 )
-def test_background_fill_writes_masked_tiles(alloc, fill, pipeline):
+def test_background_fill_writes_masked_tiles(alloc, fill):
     # 256x1024 with 128 tiles: 3 computed tiles and 13 constant ones, so the in-flight limit kicks in.
-    kern = make_masked_matmul(256, 256, 1024, 128, 128, 128, alloc, pipeline=pipeline)
+    kern = make_masked_matmul(256, 256, 1024, 128, 128, 128, alloc)
     x, y = rand((256, 256)), rand((256, 1024), 1)
     lw = kern.lower(x, y)
-    assert (lw.fill, lw.active_tiles, lw.total_tiles) == ("background", 3, 16)
-    assert "_fill_copy(c).start()" in lw.source
-    if pipeline == "grid":
-        assert "jax.lax.empty" in lw.source
+    assert (lw.fill, lw.tiles, lw.total_tiles) == ("background", 3, 16)
     out = np.asarray(kern(x, y))
     assert np.all(out[:128, 128:] == fill) and np.all(out[128:, 256:] == fill)
     kern.verify(x, y)
 
 
-def test_background_fill_has_no_races(pipeline):
-    from jax.experimental.pallas import tpu as pltpu
-
-    kern = make_masked_matmul(512, 256, 512, 128, 128, 128, lambda s: jnp.full(s, -1.0), pipeline=pipeline)
+@pytest.mark.parametrize("cores", [1, 2])
+def test_background_fill_has_no_races(cores):
+    kern = make_masked_matmul(512, 256, 512, 128, 128, 128, lambda s: jnp.full(s, -1.0), cores=cores)
     x, y = rand((512, 256)), rand((256, 512), 1)
-    params = pltpu.InterpretParams(detect_races=True, uninitialized_memory="nan")
-    out = kern.lower(x, y).entry(x, y, interpret=params).block_until_ready()
-    from jax._src.pallas.mosaic.interpret import interpret_pallas_call as interpreter
-
-    assert interpreter.races is not None and not interpreter.races.races_found
-    np.testing.assert_allclose(out, kern.reference(x, y), atol=1e-4, rtol=1e-4)
+    np.testing.assert_allclose(run_checking_races(kern, x, y), kern.reference(x, y), atol=1e-4, rtol=1e-4)
 
 
-def test_prefill_fallbacks(pipeline):
+def test_prefill_fallbacks():
     x, y = rand((256, 256)), rand((256, 1024), 1)
     # Opted out: the alias keeps the allocation, filled before the kernel.
-    off = make_masked_matmul(
-        256, 256, 1024, 128, 128, 128, lambda s: jnp.full(s, 2.0), background_fill=False, pipeline=pipeline
-    )
+    off = make_masked_matmul(256, 256, 1024, 128, 128, 128, lambda s: jnp.full(s, 2.0), background_fill=False)
     assert off.lower(x, y).fill == "prefill" and "input_output_aliases" in off.source(x, y)
     off.verify(x, y)
     # Not a constant: the compiler can't know the skipped tiles' value, so it keeps the prefill.
     ramp = make_masked_matmul(
-        256,
-        256,
-        1024,
-        128,
-        128,
-        128,
-        lambda s: jnp.arange(s[0] * s[1], dtype=jnp.float32).reshape(s),
-        pipeline=pipeline,
+        256, 256, 1024, 128, 128, 128, lambda s: jnp.arange(s[0] * s[1], dtype=jnp.float32).reshape(s)
     )
     assert ramp.lower(x, y).fill == "prefill"
     ramp.verify(x, y)
 
 
-def test_background_fill_without_reduction_and_full_dims(pipeline):
-    @autokernel.tpu(pipeline=pipeline)
+def test_background_fill_without_reduction_and_full_dims():
+    @autokernel.tpu
     def first_rows(x):
         out = jnp.full((256, 256), 7.0)
         for i in range(0, 256, 32):
