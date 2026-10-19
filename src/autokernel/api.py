@@ -7,10 +7,14 @@ instead; see `program.py`.
 from __future__ import annotations
 
 import ast
+import contextlib
+import copy
 import dataclasses
 import functools
+import inspect
+import threading
 import warnings
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
 
 import jax
@@ -27,7 +31,11 @@ from .lowering import Lowered, Options, lower
 
 __all__ = ["TpuKernel", "check_outputs", "tpu"]
 
-_Signature = tuple[tuple[tuple[int, ...], np.dtype], ...]
+_Signature = tuple[tuple[tuple[int, ...], np.dtype, bool], ...]
+
+
+def _weak_type(x: Any) -> bool:
+    return bool(getattr(getattr(x, "aval", x), "weak_type", False))
 
 
 def _spec(x: Any) -> jax.ShapeDtypeStruct:
@@ -37,16 +45,94 @@ def _spec(x: Any) -> jax.ShapeDtypeStruct:
         return jax.ShapeDtypeStruct((), jnp.int32)  # a runtime scalar
     if not hasattr(x, "shape") or not hasattr(x, "dtype"):
         raise AutoKernelError(f"kernel arguments must be arrays, got {type(x).__name__}")
-    return jax.ShapeDtypeStruct(tuple(x.shape), x.dtype)
+    shape = tuple(x.shape)
+    # A 0-d float mixes with tiles as its weak type says (`bf16_tile * s` stays bf16 for a weak `s`).
+    weak = shape == () and jnp.issubdtype(x.dtype, jnp.floating) and _weak_type(x)
+    return jax.ShapeDtypeStruct(shape, x.dtype, weak_type=weak)
 
 
 def _signature(args: tuple[Any, ...]) -> _Signature:
-    return tuple((tuple(s.shape), np.dtype(s.dtype)) for s in map(_spec, args))
+    return tuple((tuple(s.shape), np.dtype(s.dtype), bool(s.weak_type)) for s in map(_spec, args))
 
 
 def _concrete(args: tuple[Any, ...]) -> bool:
     """Do the arguments hold values (jax or numpy arrays), not tracers or specs?"""
     return all(not isinstance(a, (jax.core.Tracer, jax.ShapeDtypeStruct)) for a in args)
+
+
+def _typed(overrides: Mapping[str, Any]) -> tuple:
+    """Tuned constants as a cache key that tells `2` from `2.0`."""
+    return tuple((k, type(v), v) for k, v in sorted(overrides.items(), key=lambda kv: kv[0]))
+
+
+class _Same:
+    """A cache-key stand-in for an object compared by identity (a module, a function, an array)."""
+
+    __slots__ = ("obj",)
+
+    def __init__(self, obj: Any):
+        self.obj = obj
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _Same) and other.obj is self.obj
+
+    def __hash__(self) -> int:
+        return id(self.obj)
+
+
+_MISSING = object()
+_SMALL_TABLE = 4096  # NumPy arrays up to this size (mask tables) are compared by value, bigger ones by identity
+
+
+def _value_key(value: Any) -> Any:
+    """A hashable stand-in for the value of a constant a kernel reads: equal keys, the same kernel."""
+    if value is None or isinstance(value, (bool, int, float, complex, str, bytes, np.generic)):
+        return (type(value), repr(value))  # repr: 2 isn't 2.0, and nan is nan
+    if isinstance(value, np.dtype):
+        return (np.dtype, value.str)
+    if isinstance(value, (tuple, list)):
+        return (type(value), tuple(map(_value_key, value)))
+    if isinstance(value, np.ndarray) and value.size <= _SMALL_TABLE:
+        return (np.ndarray, value.shape, value.dtype.str, value.tobytes())
+    return _Same(value)
+
+
+def _is_outer_array(value: Any) -> bool:
+    """A global or closure value the kernel reads as an input array (rather than as a constant)."""
+    return isinstance(value, (jax.Array, np.ndarray)) and value.ndim >= 1
+
+
+def _free_names(nest: frontend.LoopNest) -> tuple[str, ...]:
+    """Names the nest's code reads that it doesn't bind: its module globals and closure variables."""
+    nodes = [n for s in nest.fdef.body for n in ast.walk(s) if isinstance(n, ast.Name)]
+    bound = {n.id for n in nodes if not isinstance(n.ctx, ast.Load)} | set(nest.params)
+    return tuple(dict.fromkeys(n.id for n in nodes if n.id not in bound))
+
+
+def _sliced_names(nest: frontend.LoopNest) -> set[str]:
+    """Names the tile body reads through slices or loop variables (`BIAS[i : i + T, :]`): if they are global
+    arrays, the kernel reads them as inputs, as a program's nests do."""
+    loop_vars = {lp.var for lp in nest.loops}
+    found = set()
+    for tree in [*nest.tile_statements(), *(st.value for st in nest.stores)]:
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Subscript) and isinstance(n.value, ast.Name):
+                dims = n.slice.elts if isinstance(n.slice, ast.Tuple) else [n.slice]
+                if any(isinstance(d, ast.Slice) or (isinstance(d, ast.Name) and d.id in loop_vars) for d in dims):
+                    found.add(n.value.id)
+    return found
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class _Context:
+    """What a kernel's code sees, fixed for every artefact derived from it (kernel, reference, batched and
+    per-shard kernels): the values of its globals and closure variables, and the nest with the global arrays
+    it reads as extra parameters."""
+
+    env: analysis.Environment
+    nest: frontend.LoopNest
+    outer: tuple[str, ...]  # global and closure arrays passed as inputs after the function's own
+    key: tuple
 
 
 _warned_interpreting = False
@@ -74,8 +160,11 @@ class TpuKernel:
     - `verify(*args)`: run both and raise if they disagree; returns the max abs error
     - `tuning(*args)`: every tuning candidate tried, with predicted (and measured) times
 
-    `args` for `lower`, `source` and `tuning` may be arrays or `jax.ShapeDtypeStruct`s. Kernels are
-    generated, and tuned, once per input signature (shapes and dtypes).
+    Every entry point takes the arguments positionally or by name. `args` for `lower`, `source` and
+    `tuning` may be arrays or `jax.ShapeDtypeStruct`s. Kernels are generated, and tuned, once per input
+    signature (shapes and dtypes) and per set of values of the module and closure constants the nest reads,
+    so changing such a constant gives a new kernel, as it would change what the Python computes. Global and
+    closure arrays the tile body reads through slices are inputs, read with their current values.
 
     Calls compose with `jax.jit`, `jax.vmap` (a batch runs as one kernel generated with an extra batch
     loop), forward- and reverse-mode differentiation, and inputs sharded over a mesh (each device runs a
@@ -100,20 +189,120 @@ class TpuKernel:
         self.verify_on_first_call = verify
         self.options = options or Options()
         self.backward = backward
-        self._lowered: dict[_Signature, Lowered] = {}
-        self._tuning: dict[_Signature, list[tune_lib.Candidate]] = {}
-        self._measured: set[_Signature] = set()
+        self._lock = threading.RLock()  # concurrent first calls generate (and tune) a kernel once
+        self._contexts: dict[tuple, _Context] = {}
+        self._lowered: dict[tuple, Lowered] = {}  # by (context, signature)
+        self._tuning: dict[tuple, list[tune_lib.Candidate]] = {}
+        self._measured: set[tuple] = set()
         self._compiled: dict[tuple, tuple[Lowered, Callable[..., Any], Callable[..., Any]]] = {}
-        self._verified: set[_Signature] = set()
-        self._reference: dict[tuple, Callable] = {}  # by tuned constants
-        self._batched: dict[tuple, TpuKernel | Exception] = {}  # (in_batched, size) -> kernel for jax.vmap
+        self._verified: set[tuple] = set()
+        self._reference: dict[tuple, Callable] = {}  # by context and tuned constants
+        self._batched: dict[tuple, TpuKernel | Exception] = {}  # (context, in_batched, size) -> kernel for jax.vmap
         self._local: dict[tuple, TpuKernel] = {}  # per-shard kernels for sharded inputs
         self._shard_plans: dict[tuple, sharding.ShardPlan] = {}
         self._warned: set[str] = set()
+        params = [inspect.Parameter(p, inspect.Parameter.POSITIONAL_OR_KEYWORD) for p in self.nest.params]
+        self._signature = inspect.Signature(params)
         if isinstance(fn, analysis.Environment):
             self.__name__ = self.__qualname__ = self.nest.fn_name
+            self._free: tuple[str, ...] = ()
+            self._sliced: set[str] = set()
+            self._fixed: _Context | None = _Context(fn, self.nest, (), ())
         else:
             functools.update_wrapper(self, fn)
+            with contextlib.suppress(TypeError, ValueError):  # a plain function: its defaults apply too
+                self._signature = inspect.signature(fn)
+            self._free = _free_names(self.nest)
+            self._sliced = _sliced_names(self.nest) & set(self._free)
+            self._fixed = None
+
+    # ------------------------------------------------------------------ arguments and contexts
+
+    def _bind(self, args: tuple[Any, ...], kwargs: Mapping[str, Any]) -> tuple[_Context, tuple[Any, ...]]:
+        """The context the kernel runs in now, and the kernel's inputs: the arguments bound to the function's
+        parameters (defaults filled in), then the global arrays the nest reads."""
+        params = self.nest.params
+        try:
+            bound = self._signature.bind(*args, **kwargs)
+        except TypeError as e:
+            raise AutoKernelError(
+                f"{self.__name__} takes {len(params)} arrays, got {len(args) + len(kwargs)}: {e}"
+            ) from None
+        bound.apply_defaults()
+        if set(bound.arguments) != set(params):
+            raise AutoKernelError(f"{self.__name__}'s parameters must be its arrays {params}")
+        inputs = tuple(bound.arguments[p] for p in params)
+        if self._fixed is not None:
+            return self._fixed, inputs
+        values = self._current_values()
+        outer = tuple(n for n in sorted(self._sliced) if _is_outer_array(values.get(n)))
+        key = (outer, tuple((n, _value_key(values.get(n, _MISSING))) for n in self._free if n not in outer))
+        ctx = self._contexts.get(key)
+        if ctx is None:
+            with self._lock:
+                ctx = self._contexts.get(key)
+                if ctx is None:
+                    ctx = self._contexts[key] = self._make_context(key, outer)
+        return ctx, (*inputs, *(values[n] for n in outer))
+
+    def _current_values(self) -> dict[str, Any]:
+        """The current values of the globals and closure variables the nest reads (unbound ones left out)."""
+        fn = self.fn
+        code = getattr(fn, "__code__", None)
+        if code is None:
+            names = analysis.user_globals(fn)
+            return {n: names[n] for n in self._free if n in names}
+        cells = dict(zip(code.co_freevars, fn.__closure__ or (), strict=True))
+        out = {}
+        for n in self._free:
+            if n in cells:
+                with contextlib.suppress(ValueError):  # an empty cell
+                    out[n] = cells[n].cell_contents
+            elif n in fn.__globals__:
+                out[n] = fn.__globals__[n]
+        return out
+
+    def _make_context(self, key: tuple, outer: tuple[str, ...]) -> _Context:
+        env = analysis.environment(self.fn)  # a snapshot: everything built for this context uses it
+        nest = self.nest
+        if outer:
+            fdef = copy.deepcopy(nest.fdef)
+            fdef.args.args += [ast.arg(n) for n in outer]
+            nest = frontend.parse_function(fdef, nest.fn_name, nest.first_line)
+        return _Context(env, nest, outer, key)
+
+    # ------------------------------------------------------------------ entry points
+
+    def lower(self, *args: Any, **kwargs: Any) -> Lowered:
+        return self._lower(*self._bind(args, kwargs))
+
+    def tuning(self, *args: Any, **kwargs: Any) -> list[tune_lib.Candidate]:
+        ctx, inputs = self._bind(args, kwargs)
+        self._lower(ctx, inputs)
+        return self._tuning.get((ctx.key, _signature(inputs)), [])
+
+    def source(self, *args: Any, **kwargs: Any) -> str:
+        return self.lower(*args, **kwargs).source
+
+    def reference(self, *args: Any, **kwargs: Any) -> Any:
+        """Run the Python loop nest with the kernel's `@` semantics: MXU dots accumulating in f32 / i32.
+
+        Plain JAX would round `bf16 @ bf16` to bf16 at every step and wrap `int8 @ int8`; the kernel keeps
+        the MXU's wide accumulator, so the reference does too.
+        """
+        return self._run_reference(*self._bind(args, kwargs))
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return self._call(*self._bind(args, kwargs))
+
+    def verify(self, *args: Any, rtol: float | None = None, atol: float | None = None, **kwargs: Any) -> float:
+        ctx, inputs = self._bind(args, kwargs)
+        return self._check(self._call(ctx, inputs), self._run_reference(ctx, inputs), rtol, atol)
+
+    def _check(self, got: Any, want: Any, rtol: float | None = None, atol: float | None = None) -> float:
+        return check_outputs(self.__name__, got, want, self.options.matmul_precision, rtol, atol)
+
+    # ------------------------------------------------------------------ building
 
     def _interpret_mode(self) -> Any:
         if self.interpret is None:
@@ -130,122 +319,150 @@ class TpuKernel:
             )
         return self.interpret
 
-    def lower(self, *args: Any) -> Lowered:
-        key = _signature(args)
-        if key not in self._lowered:
-            specs = [_spec(a) for a in args]
-            if self.options.tune:
-                self._tuning[key] = tune_lib.search(self.nest, self.fn, specs, self.options)
-                self._lowered[key] = self._tuning[key][0].lowered  # the cost model's pick
-            else:
-                self._lowered[key] = lower(self.nest, self.fn, specs, self.options)
-                if hardware.on_tpu() and cost_lib.overhead_bound(self._lowered[key].estimate):
-                    warnings.warn(
-                        f"autokernel: {self.__name__}'s steps are too small to hide their fixed per-step cost "
-                        f'({self._lowered[key].steps} steps); larger blocks would run faster: try tune="auto"',
-                        stacklevel=3,
-                    )
-        # Measuring needs real arrays on a real TPU: do it on the first call that has them.
-        measure = self.options.tune and self.options.autotune == "measure" and key not in self._measured
-        if measure and _concrete(args) and hardware.on_tpu():
-            self._measured.add(key)
-            arrays = tuple(jax.numpy.asarray(a) for a in args)
-            best = tune_lib.measure(self._tuning[key], arrays, self.options.measure_top)
-            if best is not None:
-                self._lowered[key] = best
-        return self._lowered[key]
+    def _lower(self, ctx: _Context, inputs: tuple[Any, ...]) -> Lowered:
+        key = (ctx.key, _signature(inputs))
+        options = self.options
+        # Measuring without tuned names still picks the buffer depth: the search then has one combination.
+        search = bool(options.tune) or options.autotune == "measure"
+        with self._lock:
+            if key not in self._lowered:
+                specs = [_spec(a) for a in inputs]
+                if search:
+                    self._tuning[key] = tune_lib.search(ctx.nest, ctx.env, specs, options)
+                    self._lowered[key] = self._tuning[key][0].lowered  # the cost model's pick
+                else:
+                    self._lowered[key] = lower(ctx.nest, ctx.env, specs, options)
+                    if hardware.on_tpu() and cost_lib.overhead_bound(self._lowered[key].estimate):
+                        warnings.warn(
+                            f"autokernel: {self.__name__}'s steps are too small to hide their fixed per-step cost "
+                            f'({self._lowered[key].steps} steps); larger blocks would run faster: try tune="auto"',
+                            stacklevel=4,
+                        )
+            # Measuring needs real arrays on a real TPU: do it on the first call that has them.
+            measure = search and options.autotune == "measure" and key not in self._measured
+            if measure and _concrete(inputs) and hardware.on_tpu():
+                self._measured.add(key)
+                arrays = tuple(jax.numpy.asarray(a) for a in inputs)
+                best = tune_lib.measure(self._tuning[key], arrays, options.measure_top)
+                if best is not None:
+                    self._lowered[key] = best
+            return self._lowered[key]
 
-    def tuning(self, *args: Any) -> list[tune_lib.Candidate]:
-        self.lower(*args)
-        return self._tuning.get(_signature(args), [])
-
-    def source(self, *args: Any) -> str:
-        return self.lower(*args).source
-
-    def reference(self, *args: Any) -> Any:
-        """Run the Python loop nest with the kernel's `@` semantics: MXU dots accumulating in f32 / i32.
-
-        Plain JAX would round `bf16 @ bf16` to bf16 at every step and wrap `int8 @ int8`; the kernel keeps
-        the MXU's wide accumulator, so the reference does too.
-        """
+    def _run_reference(self, ctx: _Context, inputs: tuple[Any, ...]) -> Any:
         # A tuned kernel runs with the tuned constants: so must the loops it is compared with.
-        overrides = self.lower(*args).overrides if self.options.tune else {}
-        key = tuple(sorted(overrides.items()))
+        overrides = self._lower(ctx, inputs).overrides
+        key = (ctx.key, _typed(overrides))
         reference = self._reference.get(key)
         if reference is None:
-            reference = self._reference[key] = self._build_reference(overrides)
+            with self._lock:
+                reference = self._reference.get(key)
+                if reference is None:
+                    reference = self._reference[key] = self._build_reference(ctx, overrides)
         if self.options.matmul_precision == "default":
-            return reference(*args)
+            return reference(*inputs)
         with jax.default_matmul_precision("highest"):
-            return reference(*args)
+            return reference(*inputs)
 
-    def _build_reference(self, overrides: dict[str, Any]) -> Callable:
-        fdef = mxu.rewrite_matmuls(reference_lib.traceable_masks(self.nest))
+    def _build_reference(self, ctx: _Context, overrides: dict[str, Any]) -> Callable:
+        fdef = mxu.rewrite_matmuls(reference_lib.traceable_masks(ctx.nest))
         fdef.decorator_list = []
         module = ast.Module(body=[fdef], type_ignores=[])
-        ast.increment_lineno(module, self.nest.first_line - 1)
-        env = analysis.environment(self.fn)
-        namespace = dict(env.names)
+        ast.increment_lineno(module, ctx.nest.first_line - 1)
+        namespace = dict(ctx.env.names)
         namespace.update(overrides)
         namespace.update(mxu.helpers(self.options.matmul_precision))
         namespace.update(reference_lib.helpers())
-        exec(compile(module, env.filename, "exec"), namespace)
-        return namespace[self.nest.fn_name]
+        exec(compile(module, ctx.env.filename, "exec"), namespace)
+        return namespace[ctx.nest.fn_name]
 
-    def __call__(self, *args: Any) -> Any:
-        lowered = self.lower(*args)
+    def _call(self, ctx: _Context, inputs: tuple[Any, ...]) -> Any:
+        lowered = self._lower(ctx, inputs)
         if lowered.scalars:  # runtime indices whose values are known now: check them against the inputs
-            known = {p: a for p, a in zip(self.nest.params, args, strict=True) if p in lowered.scalars}
+            known = {p: a for p, a in zip(ctx.nest.params, inputs, strict=True) if p in lowered.scalars}
             lowered.check_indices(known)  # traced ones: a checkify check (the kernel clamps them)
-        key = _signature(args)
-        shard_plan = self._shard_plan(lowered, args)
-        ckey = (key, shard_plan.key if shard_plan is not None else None)
-        compiled = self._compiled.get(ckey)
-        if compiled is None or compiled[0] is not lowered:  # first call, or measuring changed the pick
-            if shard_plan is None:
-                forward = jax.jit(functools.partial(lowered.entry, interpret=self._interpret_mode()))
-                reference = self.reference
-            else:  # each device runs its shard's kernel, and differentiates its shard's loops
-                local = self._local_kernel(lowered, shard_plan)
-                forward = sharding.run(shard_plan, local, self.nest.returns_tuple)
-                reference = sharding.run(shard_plan, local.reference, self.nest.returns_tuple)
-            entry = autodiff.differentiable(forward, reference, self.backward, vmap_rule=self._vmap_rule)
-            # jit: one cached trace of the wrappers rather than one per eager call
-            compiled = self._compiled[ckey] = (lowered, jax.jit(entry), reference)
-        out = compiled[1](*args)
-        if self.verify_on_first_call and key not in self._verified and _concrete(args):
-            self._verified.add(key)
-            self._check(out, compiled[2](*args))
+        key = (ctx.key, _signature(inputs))
+        with self._lock:
+            shard_plan = self._shard_plan(ctx, lowered, inputs)
+            ckey = (key, shard_plan.key if shard_plan is not None else None)
+            compiled = self._compiled.get(ckey)
+            if compiled is None or compiled[0] is not lowered:  # first call, or measuring changed the pick
+                if shard_plan is None:
+                    forward = jax.jit(functools.partial(lowered.entry, interpret=self._interpret_mode()))
+                    reference = functools.partial(self._reference_of, ctx)
+                else:  # each device runs its shard's kernel, and differentiates its shard's loops
+                    local = self._local_kernel(ctx, lowered, shard_plan)
+                    if local is None:  # nothing is split: every device runs this kernel on gathered inputs
+                        run, run_reference = self._runner(ctx), functools.partial(self._reference_of, ctx)
+                    else:
+                        run, run_reference = local, local.reference
+                    forward = sharding.run(shard_plan, run, self.nest.returns_tuple)
+                    reference = sharding.run(shard_plan, run_reference, self.nest.returns_tuple)
+                backward = self._backward(ctx)
+                vmap_rule = functools.partial(self._vmap_rule, ctx)
+                entry = autodiff.differentiable(forward, reference, backward, vmap_rule=vmap_rule)
+                # jit: one cached trace of the wrappers rather than one per eager call
+                compiled = self._compiled[ckey] = (lowered, jax.jit(entry), reference)
+        out = compiled[1](*inputs)
+        if self.verify_on_first_call and key not in self._verified and _concrete(inputs):
+            self._check(out, compiled[2](*inputs))
+            self._verified.add(key)  # only once it agrees: a mismatch is reported on every call
         return out
+
+    def _runner(self, ctx: _Context) -> Callable[..., Any]:
+        return lambda *inputs: self._call(ctx, inputs)
+
+    def _reference_of(self, ctx: _Context, *inputs: Any) -> Any:
+        return self._run_reference(ctx, inputs)
+
+    def _backward(self, ctx: _Context) -> Callable | None:
+        """The user's `backward` for the kernel's inputs: no gradients for the global arrays it also reads."""
+        if self.backward is None or not ctx.outer:
+            return self.backward
+        user, backward = len(self.nest.params), self.backward
+
+        def with_outer(*args: Any) -> Any:
+            grads = backward(*args[:user], args[-1])
+            grads = tuple(grads) if isinstance(grads, (tuple, list)) else (grads,)
+            return (*grads, *(None for _ in ctx.outer))
+
+        return with_outer
 
     # ------------------------------------------------------------------ jax.vmap
 
-    def _vmap_rule(self, axis_size: int, in_batched: list[bool], *args: Any) -> tuple[Any, Any]:
+    def _vmap_rule(self, ctx: _Context, axis_size: int, in_batched: list[bool], *args: Any) -> tuple[Any, Any]:
         """custom_vmap rule: one kernel over the whole batch (`batching.batched_nest`), or one call per batch
         element when the nest can't be batched that way."""
-        kernel = self._batched_kernel(tuple(in_batched), axis_size, args)
-        out = kernel(*args) if kernel is not None else batching.sequential(self, in_batched, args)
+        kernel = self._batched_kernel(ctx, tuple(in_batched), axis_size, args)
+        if kernel is not None:
+            out = kernel(*args)
+        else:
+            out = batching.sequential(self._runner(ctx), in_batched, args)
         return out, jax.tree.map(lambda _: True, out)
 
-    def _batched_kernel(self, in_batched: tuple[bool, ...], size: int, args: tuple[Any, ...]) -> TpuKernel | None:
-        for p, a, b in zip(self.nest.params, args, in_batched, strict=True):
+    def _batched_kernel(
+        self, ctx: _Context, in_batched: tuple[bool, ...], size: int, args: tuple[Any, ...]
+    ) -> TpuKernel | None:
+        for p, a, b in zip(ctx.nest.params, args, in_batched, strict=True):
             if b and analysis.is_scalar_spec(jax.ShapeDtypeStruct(tuple(a.shape)[1:], a.dtype)):
                 self._warn_sequential(f"its runtime scalar `{p}` is batched")
                 return None
-        bkey = (in_batched, size)
-        kernel = self._batched.get(bkey)
-        if kernel is None:
-            try:
-                nest = batching.batched_nest(self.nest, in_batched, size)
-            except batching.BatchingError as e:
-                self._batched[bkey] = e
-                self._warn_sequential(str(e))
-                return None
-            env = analysis.environment(self.fn)
-            names = {**env.names, batching.ALLOC: batching.batched_alloc}
-            kernel = self._batched[bkey] = TpuKernel(
-                analysis.Environment(names, env.filename), nest=nest, interpret=self.interpret, options=self.options
-            )
+        bkey = (ctx.key, in_batched, size)
+        with self._lock:
+            kernel = self._batched.get(bkey)
+            if kernel is None:
+                try:
+                    nest = batching.batched_nest(ctx.nest, in_batched, size)
+                except batching.BatchingError as e:
+                    self._batched[bkey] = e
+                    self._warn_sequential(str(e))
+                    return None
+                names = {**ctx.env.names, batching.ALLOC: batching.batched_alloc}
+                kernel = self._batched[bkey] = TpuKernel(
+                    analysis.Environment(names, ctx.env.filename),
+                    nest=nest,
+                    interpret=self.interpret,
+                    options=self.options,
+                )
         if isinstance(kernel, Exception):
             return None
         try:
@@ -266,7 +483,7 @@ class TpuKernel:
 
     # ------------------------------------------------------------------ sharded inputs
 
-    def _shard_plan(self, lowered: Lowered, args: tuple[Any, ...]) -> sharding.ShardPlan | None:
+    def _shard_plan(self, ctx: _Context, lowered: Lowered, args: tuple[Any, ...]) -> sharding.ShardPlan | None:
         """How to run on `args` when some are sharded over a mesh (None when none is)."""
         found = sharding.find_mesh(args)
         if found is None or lowered.plan is None:
@@ -277,33 +494,29 @@ class TpuKernel:
         shard_plan = self._shard_plans[key] = sharding.plan(lowered.plan.spec, *found)
         if shard_plan.loops:
             try:  # the per-shard kernel must exist for the per-shard shapes
-                self._local_kernel(lowered, shard_plan).lower(*sharding.local_specs(shard_plan, args))
+                local = self._local_kernel(ctx, lowered, shard_plan)
+                assert local is not None
+                local.lower(*sharding.local_specs(shard_plan, args))
             except AutoKernelError as e:
                 shard_plan = sharding.gather_all(lowered.plan.spec, shard_plan, f"its per-shard kernel fails: {e}")
                 self._shard_plans[key] = shard_plan
         return shard_plan
 
-    def _local_kernel(self, lowered: Lowered, shard_plan: sharding.ShardPlan) -> TpuKernel:
-        """The kernel each device runs on its shards (this kernel itself when nothing is split)."""
+    def _local_kernel(self, ctx: _Context, lowered: Lowered, shard_plan: sharding.ShardPlan) -> TpuKernel | None:
+        """The kernel each device runs on its shards (None when nothing is split: this kernel itself)."""
         if not shard_plan.loops:
-            return self
+            return None
         key = (id(lowered), shard_plan.loops)
         kernel = self._local.get(key)
         if kernel is None:
             nest, extra = sharding.local_nest(lowered.plan.spec, shard_plan)
-            env = analysis.environment(self.fn)
-            names = {**env.names, **lowered.overrides, **extra}
-            options = dataclasses.replace(self.options, tune=())  # the shard's kernel keeps the tuned tiles
+            names = {**ctx.env.names, **lowered.overrides, **extra}
+            # The shard's kernel keeps the tuned tiles and buffer depth: nothing to search or measure.
+            options = dataclasses.replace(self.options, tune=(), autotune="model", buffers=lowered.buffers)
             kernel = self._local[key] = TpuKernel(
-                analysis.Environment(names, env.filename), nest=nest, interpret=self.interpret, options=options
+                analysis.Environment(names, ctx.env.filename), nest=nest, interpret=self.interpret, options=options
             )
         return kernel
-
-    def verify(self, *args: Any, rtol: float | None = None, atol: float | None = None) -> float:
-        return self._check(self(*args), self.reference(*args), rtol, atol)
-
-    def _check(self, got: Any, want: Any, rtol: float | None = None, atol: float | None = None) -> float:
-        return check_outputs(self.__name__, got, want, self.options.matmul_precision, rtol, atol)
 
 
 def check_outputs(
@@ -400,13 +613,15 @@ def tpu(
             combination is tried; invalid ones (misaligned tiles, too much VMEM) are dropped and the rest
             ranked by a cost model built from the TPU's specs and JAX's cost analysis.
         autotune: "model" picks the best predicted candidate; "measure" also times the best eight block
-            sizes on the TPU on the first call with concrete arrays, then 2 and 3 buffers for the winner.
+            sizes on the TPU on the first call with concrete arrays, then 2 and 3 buffers for the winner
+            (without `tune`, just the 2 and 3 buffers of the kernel as written).
         buffers: VMEM slots per streamed input (2 = double buffering). Default: 3 where they fit in VMEM,
             else 2; `autotune="measure"` tries both.
         target: the TPU to plan for when not running on one, e.g. "v5e" (default) or "v5p".
         cores: TensorCores to split the work across (default: all of the target's, 2 on v4 and v5p).
         check_tiling: reject tiles that break TPU (8, 128) layout rules before Mosaic does.
-        vmem_limit_bytes: Mosaic's scoped-VMEM limit; by default sized from the kernel's estimated use.
+        vmem_limit_bytes: Mosaic's scoped-VMEM limit; by default the target chip's (`Hardware.vmem_limit`,
+            90% of its VMEM), not the kernel's estimated use, which must fit in 75% of it.
         matmul_precision: "highest" (default) makes f32 `@` a full-precision multi-pass MXU matmul;
             "default" uses Mosaic's faster single bf16 pass (verify then uses looser tolerances).
         background_fill: with a static tile mask, write the skipped tiles' constant value with async DMAs
@@ -442,6 +657,12 @@ def tpu(
       other way are gathered first, with a one-time warning. Under `jax.jit` with `Auto` mesh axes the
       kernel can't see the sharding and XLA runs it on gathered inputs.
     """
+    if isinstance(tune, Mapping):
+        for name, values in tune.items():
+            if not isinstance(values, (str, Iterable)):
+                raise AutoKernelError(
+                    f"tune[{name!r}] must be 'auto' or a sequence of candidate values, got {values!r}"
+                )
     options = Options(
         check_tiling=check_tiling,
         vmem_limit_bytes=vmem_limit_bytes,

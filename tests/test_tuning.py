@@ -1,7 +1,6 @@
 """Hardware targets, the cost model, and block-size tuning."""
 
 import itertools
-import time
 
 import jax
 import jax.numpy as jnp
@@ -376,14 +375,17 @@ def two_reductions(x, y, z, w):
 
 
 def test_four_names_of_eight_values_are_searched_quickly(monkeypatch):
-    """8^4 = 4096 combinations: planning them all takes ~12 s; the descent plans under 300 in under a second."""
+    """8^4 = 4096 combinations: planning them all takes ~12 s; the descent plans under 300 (about 0.8 s on a
+    laptop). Counted in plans rather than timed, so a slow machine doesn't fail it."""
+    plans = []
+    real_plan = tune_lib.plan
+    monkeypatch.setattr(tune_lib, "plan", lambda *a, **k: plans.append(a[4]) or real_plan(*a, **k))
     lanes = (128, 256, 512, 768, 1024, 1536, 2048, 3072)
     tune = {"TA": (16, 32, 64, 128, 256, 512, 1024, 2048), "TB": lanes, "T1": lanes, "T2": lanes}
     specs = [bf16(R12, R12)] * 4
-    start = time.perf_counter()
     best, planned = search_best(two_reductions, specs, tune, monkeypatch, tune_lib.EXHAUSTIVE_MAX)
-    assert time.perf_counter() - start < 6  # about 0.8 s on a laptop
     assert len(planned) < 300 and best.overrides == {"T1": 2048, "T2": 2048, "TA": 1024, "TB": 768}
+    assert len(plans) <= len(planned) + 1  # each combination planned once, plus the one built
 
 
 def test_blocks_bigger_than_one_that_does_not_fit_are_not_planned(monkeypatch):
