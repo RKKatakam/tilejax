@@ -471,7 +471,7 @@ def test_generator_reuses_its_compiled_functions(tiny_bf16):
     generator = Generator(tiny_bf16, 1, 128, 3)
     first, _ = generator(prompts)
     again, timings = generator(prompts)
-    assert first.tolist() == again.tolist() and generator.max_len == 256 and timings.prefill_ms > 0
+    assert first.tolist() == again.tolist() and generator.max_len == 512 and timings.prefill_ms > 0
     assert generator.mega and not Generator(tiny_bf16, 64, 128, 3).mega
 
 
