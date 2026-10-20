@@ -19,11 +19,21 @@ kernel for a **TPU v5e**, and tunes its schedule on the hardware. The scope is d
   it from a profiler trace, read its `jax.named_scope` regions (`profiling.py`), and let the bottleneck
   pick the next schedules. Don't add cost models, disk caches or search options; make the profile say what
   to do instead.
-- **The examples are the spec**: matmul, causal matmul, causal attention (checked against JAX's splash
-  attention), RMSNorm fused with a projection (checked against plain JAX), and a whole attention block
-  (attention, RMSNorm, feed-forward) in one kernel (checked against splash + XLA, and NumPy), and a whole
-  decoder-only transformer from those kernels (examples/transformer.py: per layer, a fused RMSNorm + QKV
-  projection, then attention + output projection + residual + RMSNorm + FFN + residual in one kernel). A feature earns its place by making one of them better or by a new example that needs it.
+- **The examples are the spec**: every block of a modern decoder, each checked against an independent
+  reference (float64 NumPy) and the strongest JAX baseline (XLA, splash, megablox, paged attention):
+  - basics: matmul, causal matmul, causal attention, RMSNorm + projection, a fused attention block, a
+    transformer (`transformer.py`);
+  - Qwen: fused RMSNorm + QKV + QK-norm + RoPE, GQA attention (sliding window, output gate), SwiGLU
+    (`qwen3.py`, `gqa_attention.py`, `swiglu.py`), whole dense and MoE models with KV-cache decoding
+    (`qwen3_models.py`);
+  - DeepSeek-V3 / Kimi K2: MLA prefill (`mla.py`), absorbed MLA decode, whole models (`deepseek.py`);
+  - MoE: routers, dropless grouped SwiGLU experts over runtime masks and windows, shared experts (`moe.py`);
+  - linear attention: chunked Gated DeltaNet and KDA (`linear_attention.py`, `linear_attention_layer.py`),
+    hybrid Qwen3-Next / Kimi Linear models (`hybrid_layers.py`, `hybrid_models.py`);
+  - decoding: GQA (contiguous, paged) and MLA attention over KV caches with per-sequence lengths
+    (`decode.py`, `kv_cache.py`, `decode_model.py`), a whole decode step as one kernel with cross-layer
+    prefetch (`decode_megakernel.py`), a stack of layers in one kernel (`layer_stack.py`).
+  A feature earns its place by making one of them better or by a new example that needs it.
 
 ## The pipeline
 
