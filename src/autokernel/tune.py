@@ -204,18 +204,29 @@ def _smaller(kernel: Kernel, signature: Signature, config: Config) -> list[Confi
     return found + [c for _, c in sorted(near, key=lambda n: n[0])]
 
 
-def random_inputs(signature: Signature, seed: int = 0) -> list[jax.Array]:
-    """Inputs of these shapes and dtypes to tune on: normal floats, small integers, random booleans."""
+def random_inputs(signature: Signature, bounds: dict[int, int] | None = None, seed: int = 0) -> list[jax.Array]:
+    """Inputs of these shapes and dtypes to tune on: normal floats, small integers, random booleans; the
+    inputs `bounds` names (index arrays) from 0 to their bound."""
     keys = jax.random.split(jax.random.key(seed), len(signature))
     inputs = []
-    for key, (shape, dtype) in zip(keys, signature, strict=True):
-        if jnp.issubdtype(dtype, jnp.floating):
+    for i, (key, (shape, dtype)) in enumerate(zip(keys, signature, strict=True)):
+        if bounds and i in bounds:
+            inputs.append(jax.random.randint(key, shape, 0, bounds[i] + 1).astype(dtype))
+        elif jnp.issubdtype(dtype, jnp.floating):
             inputs.append(jax.random.normal(key, shape, jnp.float32).astype(dtype))
         elif dtype == np.bool_:
             inputs.append(jax.random.bernoulli(key, 0.5, shape))
         else:
             inputs.append(jax.random.randint(key, shape, -8, 8).astype(dtype))
     return inputs
+
+
+def _index_bounds(kernel: Kernel, signature: Signature, start: Config) -> dict[int, int]:
+    """For each index array, the bound of the values to tune on: the furthest any loop goes (sequence
+    lengths up to a cache's size, expert offsets up to the rows, ...)."""
+    plan, _ = kernel.build(signature, start.tunable)
+    furthest = max(r.start + r.count * r.step for r in plan.loops)
+    return {index.param: furthest for index in plan.indices}
 
 
 def _reference_config(kernel: Kernel, signature: Signature, start: Config) -> Any:
@@ -278,7 +289,10 @@ def tune(kernel: Kernel, signature: Signature, arrays: Sequence[Any] | None = No
         return Tuning(Trial(start))
 
     def run() -> Tuning:
-        inputs = list(arrays) if _concrete(arrays) else random_inputs(signature)  # type: ignore[arg-type]
+        if _concrete(arrays):
+            inputs = list(arrays)  # type: ignore[arg-type]
+        else:
+            inputs = random_inputs(signature, _index_bounds(kernel, signature, start))
         args = [_reference_config(kernel, signature, start)] if start.tunable is not None else []
         want = kernel.reference(*inputs, *args)
         return search(

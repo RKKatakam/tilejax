@@ -418,8 +418,10 @@ class _Planner:
             return self._checked(Window(None, start, stop - start), dim, text, index)
         if isinstance(index, ast.Name) and index.id in self.ranges:
             return self._checked(Window(index.id, 0, None), dim, text, index)
-        if loop_vars:
-            raise self.error(usage, index)
+        computed = reads(index) & assigned(self.nest.tile)
+        if loop_vars or computed:
+            more = f": `{sorted(computed)[0]}` is computed by the tile code" if computed else ""
+            raise self.error(f"{usage}, or an element of an index array written in place (`w[ids[e], :]`){more}", index)
         return self._checked(Window(None, self._int(index, text), None), dim, text, index)
 
     def _int(self, node: ast.expr, text: str) -> int:

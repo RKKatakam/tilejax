@@ -289,3 +289,19 @@ def test_tuning_runs_on_the_callers_inputs(monkeypatch):
     traced = make_kernel(DECODE)
     jax.jit(traced)(cache, lengths)  # traced: tuned on random inputs of these shapes
     assert len(seen) == 2 and seen[1][1].shape == (4,)
+    assert seen[1][1].min() >= 0 and seen[1][1].max() <= 512  # lengths up to the cache's size, as the loop goes
+
+
+def test_an_element_named_first_cant_place_a_window():
+    kernel = make_kernel(
+        """
+        def f(x, ids):
+            out = jnp.zeros((256, 128))
+            for i in range(0, 256, 128):
+                row = ids[i // 128]
+                out = out.at[i : i + 128, :].set(x[row, :, :])
+            return out
+        """
+    )
+    with pytest.raises(KernelError, match=r"written in place .* `row` is computed by the tile code"):
+        kernel.lower(rand((4, 128, 128)), i32(0, 1))
