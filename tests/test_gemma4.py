@@ -658,13 +658,20 @@ def test_megakernel_lowers_for_v5e(batch):
 
 @pytest.mark.tpu
 def test_model_at_e2b_sizes_natively_matches_the_reference():
-    config = Config(**{**E2B.__dict__, "layers": 7, "kv_shared_layers": 2, "layer_types": (*E2B.layer_types[:6], FULL)})
+    # E2B's layer sizes, 7 layers (sliding, full, KV-shared sliding and full): prefill against the plain-JAX
+    # reference; both decode paths' greedy tokens against the reference's logits on the same prefixes.
+    types = (*E2B.layer_types[:5], SLIDING, FULL)
+    config = Config(**{**E2B.__dict__, "layers": 7, "kv_shared_layers": 2, "layer_types": types})
     params = init_params(config, seed=0)
     ids = jax.random.randint(jax.random.key(1), (2, 512), 0, config.vocab)
-    ours = jax.jit(forward)(params, ids)
-    want = jax.jit(reference_forward)(params, ids)
-    assert _relative_rms(ours, want) < 3e-2
+    assert _relative_rms(jax.jit(forward)(params, ids), jax.jit(reference_forward)(params, ids)) < 3e-2
     x, _ = jax.jit(prefill_hidden)(params, ids)
     assert x.shape == (2, 512, config.d_model)
-    tokens, _ = generate(params, ids, 8)
-    assert tokens.shape == (2, 8)
+    prompts = ids[:, :384]
+    for mega in (True, False):
+        tokens, _ = generate(params, prompts, 8, mega=mega)
+        sequence = jnp.pad(jnp.concatenate([prompts, tokens], axis=1), [(0, 0), (0, 512 - 392)])
+        want = np.asarray(jax.jit(reference_forward)(params, sequence)[:, 383:391])
+        chosen = np.take_along_axis(want, np.asarray(tokens)[..., None], -1)[..., 0]
+        # Each token is the reference's argmax on the same prefix, or within bf16 noise of it.
+        assert (want.max(-1) - chosen < 0.05 * np.abs(want).max()).all(), (mega, tokens, want.argmax(-1))
