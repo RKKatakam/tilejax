@@ -31,12 +31,14 @@ from gemma4 import (
     forward,
     generate,
     init_params,
+    layer_weights,
     load,
     prefill,
     prefill_hidden,
     read_safetensors,
     reference_forward,
     rope_tables,
+    stack_shapes,
 )
 from gemma4_kernels import (
     AttentionTiles,
@@ -105,7 +107,8 @@ def numpy_model(tokens, params):
     ple = (_rms(context, params["ple_norm"]) + token_part) / np.sqrt(2)
     positions = np.arange(n)
     kv = {}
-    for i, p in enumerate(params["layers"]):
+    for i in range(c.layers):
+        p = layer_weights(params, i)
         dh, theta, fraction = c.rope(i)
         h = _rms(x, p["attn_norm"])
         q = _rope(_rms((h @ f64(p["w_q"])).reshape(n, c.heads, dh), p["q_norm"]), positions, theta, fraction)
@@ -141,14 +144,15 @@ def _relative_rms(got, want):
 
 
 def _qkv_inputs(dh, rows, seed=0, d=256, heads=2):
+    """Rows x (rows, d), and stacks of two layers' weights: the kernels must read slot 1 of each."""
     keys = jax.random.split(jax.random.key(seed), 8)
-    x = jax.random.normal(keys[0], (1, rows, d), B16)
-    gamma = (1 + 0.1 * jax.random.normal(keys[1], (1, d))).astype(B16)
+    x = jax.random.normal(keys[0], (rows, d), B16)
+    gamma = (1 + 0.1 * jax.random.normal(keys[1], (2, 1, d))).astype(B16)
     w_q, w_k, w_v = (
-        (jax.random.normal(k, (d, n)) * d**-0.5).astype(B16)
+        (jax.random.normal(k, (2, d, n)) * d**-0.5).astype(B16)
         for k, n in zip(keys[2:5], (heads * dh, dh, dh), strict=True)
     )
-    q_norm, k_norm = ((1 + 0.1 * jax.random.normal(k, (1, dh))).astype(B16) for k in keys[5:7])
+    q_norm, k_norm = ((1 + 0.1 * jax.random.normal(k, (2, 1, dh))).astype(B16) for k in keys[5:7])
     positions = jax.random.randint(keys[7], (rows,), 0, 3000)
     return x, gamma, w_q, w_k, w_v, q_norm, k_norm, positions
 
@@ -159,18 +163,19 @@ def test_qkv_kernels_match_numpy(dh, theta, fraction):
     x, gamma, w_q, w_k, w_v, q_norm, k_norm, positions = _qkv_inputs(dh, 256)
     cos, sin = rope_tables(positions, dh, theta, fraction)
     tiles = QkvTiles(rows=128, block_d=128)
-    args = (x, gamma, w_q, w_k, w_v, q_norm, k_norm, cos, sin, tiles)
+    slots = jnp.array([1, 1, 1], I32)
+    args = (x, slots, gamma, w_q, w_k, w_v, q_norm, k_norm, cos, sin, tiles)
     q, k, v = run_checking_races(qkv_projection, *args)
-    h = _rms(f64(x[0]), gamma)
-    want_q = _rope(_rms((h @ f64(w_q)).reshape(256, 2, dh), q_norm), positions, theta, fraction)
-    want_k = _rope(_rms((h @ f64(w_k)).reshape(256, 1, dh), k_norm), positions, theta, fraction)
-    _close(q[0], want_q.reshape(256, -1), 2e-2)
-    _close(k[0], want_k.reshape(256, -1), 2e-2)
-    _close(v[0], _rms(h @ f64(w_v)), 2e-2)
+    h = _rms(f64(x), gamma[1])
+    want_q = _rope(_rms((h @ f64(w_q[1])).reshape(256, 2, dh), q_norm[1]), positions, theta, fraction)
+    want_k = _rope(_rms((h @ f64(w_k[1])).reshape(256, 1, dh), k_norm[1]), positions, theta, fraction)
+    _close(q, want_q.reshape(256, -1), 2e-2)
+    _close(k, want_k.reshape(256, -1), 2e-2)
+    _close(v, _rms(h @ f64(w_v[1])), 2e-2)
     assert qkv_projection.verify(*args) == 0.0
-    q_only = run_checking_races(q_projection, x, gamma, w_q, q_norm, cos, sin, tiles)
-    np.testing.assert_array_equal(f64(q_only), f64(q))
-    assert q_projection.verify(x, gamma, w_q, q_norm, cos, sin, tiles) == 0.0
+    q_args = (x, slots[:2], gamma, w_q, q_norm, cos, sin, tiles)
+    np.testing.assert_array_equal(f64(run_checking_races(q_projection, *q_args)), f64(q))
+    assert q_projection.verify(*q_args) == 0.0
 
 
 @pytest.mark.parametrize("window", [None, 128])
@@ -199,42 +204,45 @@ def test_attention_kernel_matches_numpy(window):
 
 
 def _post_inputs(m, d=256, a=512, f=512, p=128, seed=0):
+    """Rows, attention output, every layer's per-layer inputs (2, m, p), and stacks of two layers' weights."""
     keys = iter(jax.random.split(jax.random.key(seed), 16))
 
     def normal(shape, scale=1.0):
         return (jax.random.normal(next(keys), shape) * scale).astype(B16)
 
     def norm():
-        return (1 + 0.1 * jax.random.normal(next(keys), (1, d))).astype(B16)
+        return (1 + 0.1 * jax.random.normal(next(keys), (2, 1, d))).astype(B16)
 
     return (
         normal((m, d)),
         normal((m, a)),
-        normal((m, p)),
-        normal((a, d), a**-0.5),
+        normal((2, m, p)),
+        normal((2, a, d), a**-0.5),
         norm(),
         norm(),
-        normal((d, f), d**-0.5),
-        normal((d, f), d**-0.5),
-        normal((f, d), f**-0.5),
+        normal((2, d, f), d**-0.5),
+        normal((2, d, f), d**-0.5),
+        normal((2, f, d), f**-0.5),
         norm(),
-        normal((d, p), d**-0.5),
-        normal((p, d), p**-0.5),
+        normal((2, d, p), d**-0.5),
+        normal((2, p, d), p**-0.5),
         norm(),
-        jnp.full((1, d), 0.75, B16),
+        jnp.full((2, 1, d), 0.75, B16),
     )
 
 
 @pytest.mark.parametrize("rows", [256, 8])
 def test_post_attention_kernel_matches_numpy(rows):
-    args = _post_inputs(rows)
-    x, attn, ple, wo, n1, n2, wg, wu, wd, n3, wpg, wpp, n4, scale = map(f64, args)
+    x, attn, ple, *weights = _post_inputs(rows)
+    slots = jnp.array([1, 0, 1], I32)  # layer 1, its Wo in slot 0, its MLP in slot 1
+    args = (x, attn, ple, slots, *weights)
+    wo, n1, n2, wg, wu, wd, n3, wpg, wpp, n4, scale = (f64(w[s]) for w, s in zip(weights, [0] + [1] * 10, strict=True))
     tiles = PostTiles(rows=128, block_a=256, block_f=256)
     out = run_checking_races(post_attention, *args, tiles)
-    h = x + _rms(attn @ wo, n1)
+    h = f64(x) + _rms(f64(attn) @ wo, n1)
     m = _rms(h, n2)
     h = h + _rms((_gelu(m @ wg) * (m @ wu)) @ wd, n3)
-    want = (h + _rms((_gelu(h @ wpg) * ple) @ wpp, n4)) * scale
+    want = (h + _rms((_gelu(h @ wpg) * f64(ple[1])) @ wpp, n4)) * scale
     _close(out, want, 2e-2)
     assert post_attention.verify(*args, tiles) == 0.0
     assert [phase.range.var for phase in post_attention.lower(*args, tiles).plan.phases] == ["a", "f"]
@@ -422,7 +430,8 @@ def _to_hf(params):
         "w_ple_proj": "per_layer_projection.weight",
         "post_ple_norm": "post_per_layer_input_norm.weight",
     }
-    for i, layer in enumerate(params["layers"]):
+    for i in range(c.layers):
+        layer = layer_weights(params, i)
         for ours, theirs in names.items():
             if ours in layer:
                 w = layer[ours]
@@ -487,7 +496,7 @@ def test_load_reads_and_packs_a_checkpoint(tmp_path, tiny_bf16):
         assert loaded["config"] == TINY
         same = jax.tree.map(lambda a, b: bool((np.asarray(a) == np.asarray(b)).all()), loaded, tiny_bf16)
         assert all(jax.tree.leaves(same))
-        assert set(loaded["layers"][3]) == set(tiny_bf16["layers"][3])  # no k/v weights on shared layers
+        assert loaded["w"]["w_k_s"].shape[0] == 2  # k / v weights of the non-shared sliding layers only
 
 
 def test_embedding_multiplier_is_rounded_to_bf16():
@@ -509,38 +518,39 @@ def _b16(*shape):
     return spec(*shape, dtype=B16)
 
 
+def _stack(name, config=E2B):
+    """A spec of one of E2B's weight stacks."""
+    counts = {"s": len(config.q_layers("s")), "f": len(config.q_layers("f"))}
+    kind = name.rsplit("_", 1)[1]
+    if name.startswith(("w_k", "w_v", "k_norm")):
+        n = len(config.kv_layers(kind))
+    elif name.startswith(("w_gate", "w_up", "w_down")):
+        n = len(config.mlp_layers(kind))
+    elif kind in counts and not name.startswith("w_ple"):
+        n = counts[kind]
+    else:
+        n = config.layers
+    return _b16(n, *stack_shapes(config)[name])
+
+
 @pytest.mark.parametrize("rows", [1, 8, 64, 256, 2048])  # decode batches; a 2048-token prefill
-@pytest.mark.parametrize("dh", [256, 512])
-def test_projection_and_post_attention_kernels_lower_for_v5e(rows, dh):
-    d, h, p = E2B.d_model, E2B.heads, E2B.ple_dim
+@pytest.mark.parametrize("kind", ["s", "f"])
+def test_projection_and_post_attention_kernels_lower_for_v5e(rows, kind):
+    d, p = E2B.d_model, E2B.ple_dim
+    dh = E2B.head_dim if kind == "s" else E2B.global_head_dim
     rope = spec(rows, dh)
-    _lowers(
-        qkv_projection,
-        _b16(1, rows, d),
-        _b16(1, d),
-        _b16(d, h * dh),
-        *[_b16(d, dh)] * 2,
-        *[_b16(1, dh)] * 2,
-        rope,
-        rope,
-    )
-    _lowers(q_projection, _b16(1, rows, d), _b16(1, d), _b16(d, h * dh), _b16(1, dh), rope, rope)
-    norm = _b16(1, d)
-    for f in (6144, 12288):
-        weights = (
-            _b16(h * dh, d),
-            norm,
-            norm,
-            _b16(d, f),
-            _b16(d, f),
-            _b16(f, d),
-            norm,
-            _b16(d, p),
-            _b16(p, d),
-            norm,
-            norm,
+    slots = spec(3, dtype=I32)
+    q_weights = (_stack("attn_norm"), _stack(f"w_q_{kind}"))
+    kv_weights = (_stack(f"w_k_{kind}"), _stack(f"w_v_{kind}"), _stack(f"q_norm_{kind}"), _stack(f"k_norm_{kind}"))
+    _lowers(qkv_projection, _b16(rows, d), slots, *q_weights, *kv_weights, rope, rope)
+    _lowers(q_projection, _b16(rows, d), spec(2, dtype=I32), *q_weights, _stack(f"q_norm_{kind}"), rope, rope)
+    for width in ("n", "w"):
+        weights = (_stack(f"wo_{kind}"), _stack("post_attn_norm"), _stack("pre_ffn_norm"))
+        weights += tuple(_stack(f"{name}_{width}") for name in ("w_gate", "w_up", "w_down"))
+        weights += tuple(
+            _stack(n) for n in ("post_ffn_norm", "w_ple_gate", "w_ple_proj", "post_ple_norm", "layer_scale")
         )
-        _lowers(post_attention, _b16(rows, d), _b16(rows, h * dh), _b16(rows, p), *weights)
+        _lowers(post_attention, _b16(rows, d), _b16(rows, 8 * dh), _b16(E2B.layers, rows, p), slots, *weights)
 
 
 @pytest.mark.parametrize(("batch", "seq"), [(1, 2048), (64, 128)])

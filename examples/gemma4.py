@@ -148,6 +148,36 @@ class Config:
         """Positions a sliding layer's cache holds: the window (or every position, if fewer)."""
         return min(self.window, max_len)
 
+    # Weights are stored in stacks (`stack_layers`): attention weights per kind ("s" sliding, "f" full),
+    # k / v weights per kind for the non-shared layers, MLP weights per width ("n" narrow, "w" wide), the
+    # rest per layer. A layer's slots say where its weights are in their stacks.
+
+    def kind(self, layer: int) -> str:
+        return "f" if self.is_full(layer) else "s"
+
+    def width(self, layer: int) -> str:
+        return "w" if self.ffn_of(layer) != self.ffn else "n"
+
+    def q_layers(self, kind: str) -> list[int]:
+        return [i for i in range(self.layers) if self.kind(i) == kind]
+
+    def kv_layers(self, kind: str) -> list[int]:
+        return [i for i in range(self.first_shared) if self.kind(i) == kind]
+
+    def mlp_layers(self, width: str) -> list[int]:
+        return [i for i in range(self.layers) if self.width(i) == width]
+
+    def q_slot(self, layer: int) -> int:
+        """Where a layer's q, q-norm and output-projection weights are in its kind's stacks."""
+        return self.q_layers(self.kind(layer)).index(layer)
+
+    def kv_slot(self, layer: int) -> int:
+        """Where the k / v weights (and the cache) a layer attends with are in its kind's stacks."""
+        return self.kv_layers(self.kind(layer)).index(self.kv_layer(layer))
+
+    def mlp_slot(self, layer: int) -> int:
+        return self.mlp_layers(self.width(layer)).index(layer)
+
 
 jax.tree_util.register_static(Config)
 
@@ -236,39 +266,94 @@ def _t(x: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(np.asarray(x).T)
 
 
+def stack_shapes(config: Config) -> dict[str, tuple[int, ...]]:
+    """Each weight stack's per-layer shape."""
+    c, d, p = config, config.d_model, config.ple_dim
+    shapes = {name: (1, d) for name in PER_LAYER_NORMS}
+    shapes |= {"w_ple_gate": (d, p), "w_ple_proj": (p, d)}
+    for kind, dh in (("s", c.head_dim), ("f", c.global_head_dim)):
+        hd, kd = c.heads * dh, c.kv_heads * dh
+        shapes |= {f"w_q_{kind}": (d, hd), f"q_norm_{kind}": (1, dh), f"wo_{kind}": (hd, d)}
+        shapes |= {f"w_k_{kind}": (d, kd), f"w_v_{kind}": (d, kd), f"k_norm_{kind}": (1, dh)}
+    for width, f in (("n", c.ffn), ("w", 2 * c.ffn)):
+        shapes |= {f"w_gate_{width}": (d, f), f"w_up_{width}": (d, f), f"w_down_{width}": (f, d)}
+    return shapes
+
+
+PER_LAYER_NORMS = ("attn_norm", "post_attn_norm", "pre_ffn_norm", "post_ffn_norm", "post_ple_norm", "layer_scale")
+
+
+def stack_layers(config: Config, layers: list[dict[str, Any]], xp: Any = jnp) -> dict[str, Any]:
+    """Per-layer weights (dicts of `layer_weights`' names) as the stacks the kernels read: {name: (n, ...)}.
+    A stack no layer uses (no full-attention layers, say) holds one block of zeros, which is never read.
+    `xp`: jnp, or np to stack on the host."""
+    c = config
+    groups = {name: list(range(c.layers)) for name in (*PER_LAYER_NORMS, "w_ple_gate", "w_ple_proj")}
+    for kind in ("s", "f"):
+        groups |= {f"{name}_{kind}": c.q_layers(kind) for name in ("w_q", "q_norm", "wo")}
+        groups |= {f"{name}_{kind}": c.kv_layers(kind) for name in ("w_k", "w_v", "k_norm")}
+    for width in ("n", "w"):
+        groups |= {f"{name}_{width}": c.mlp_layers(width) for name in ("w_gate", "w_up", "w_down")}
+    dtype = layers[0]["w_q"].dtype
+    stacks = {}
+    for name, members in groups.items():
+        base = name if name in PER_LAYER_NORMS or name.startswith("w_ple") else name.rsplit("_", 1)[0]
+        if members:
+            stacks[name] = xp.stack([xp.asarray(layers[i][base]).astype(dtype) for i in members])
+        else:
+            stacks[name] = xp.zeros((1, *stack_shapes(c)[name]), dtype)
+    return stacks
+
+
+def layer_weights(params: dict[str, Any], layer: int) -> dict[str, jax.Array]:
+    """Layer `layer`'s weights out of the stacks, by name: norms (1, D) (and q_norm, k_norm (1, dh)),
+    the layer scalar as a (1, D) row, w_q (D, H * dh), w_k, w_v (D, Hkv * dh) (non-shared layers), wo (H *
+    dh, D), w_gate, w_up (D, F), w_down (F, D), w_ple_gate (D, P), w_ple_proj (P, D)."""
+    c: Config = params["config"]
+    w = params["w"]
+    out = {name: w[name][layer] for name in (*PER_LAYER_NORMS, "w_ple_gate", "w_ple_proj")}
+    kind, width = c.kind(layer), c.width(layer)
+    out |= {name: w[f"{name}_{kind}"][c.q_slot(layer)] for name in ("w_q", "q_norm", "wo")}
+    if not c.is_shared(layer):
+        out |= {name: w[f"{name}_{kind}"][c.kv_slot(layer)] for name in ("w_k", "w_v", "k_norm")}
+    out |= {name: w[f"{name}_{width}"][c.mlp_slot(layer)] for name in ("w_gate", "w_up", "w_down")}
+    return out
+
+
 def pack(tensors: dict[str, np.ndarray], config: Config) -> dict[str, Any]:
-    """Hugging Face's text weights (names after `model.language_model.`) in the kernels' layouts, on the
-    device."""
+    """Hugging Face's text weights (names after `model.language_model.`) in the kernels' layouts (each
+    weight stack built on the host once, then put on the device)."""
     put = jax.device_put
     layers = []
     for i in range(config.layers):
 
         def w(name: str) -> np.ndarray:
-            return tensors[f"layers.{i}.{name}"]  # noqa: B023 (used at once)
+            return np.asarray(tensors[f"layers.{i}.{name}"])  # noqa: B023 (used at once)
 
         layer = {
-            "attn_norm": put(_row(w("input_layernorm.weight"))),
-            "w_q": put(_t(w("self_attn.q_proj.weight"))),
-            "q_norm": put(_row(w("self_attn.q_norm.weight"))),
-            "wo": put(_t(w("self_attn.o_proj.weight"))),
-            "post_attn_norm": put(_row(w("post_attention_layernorm.weight"))),
-            "pre_ffn_norm": put(_row(w("pre_feedforward_layernorm.weight"))),
-            "w_gate": put(_t(w("mlp.gate_proj.weight"))),
-            "w_up": put(_t(w("mlp.up_proj.weight"))),
-            "w_down": put(_t(w("mlp.down_proj.weight"))),
-            "post_ffn_norm": put(_row(w("post_feedforward_layernorm.weight"))),
-            "w_ple_gate": put(_t(w("per_layer_input_gate.weight"))),
-            "w_ple_proj": put(_t(w("per_layer_projection.weight"))),
-            "post_ple_norm": put(_row(w("post_per_layer_input_norm.weight"))),
-            "layer_scale": put(np.full((1, config.d_model), np.asarray(w("layer_scalar")).reshape(()))),
+            "attn_norm": _row(w("input_layernorm.weight")),
+            "w_q": w("self_attn.q_proj.weight").T,  # views: copied once, into the stacks
+            "q_norm": _row(w("self_attn.q_norm.weight")),
+            "wo": w("self_attn.o_proj.weight").T,
+            "post_attn_norm": _row(w("post_attention_layernorm.weight")),
+            "pre_ffn_norm": _row(w("pre_feedforward_layernorm.weight")),
+            "w_gate": w("mlp.gate_proj.weight").T,
+            "w_up": w("mlp.up_proj.weight").T,
+            "w_down": w("mlp.down_proj.weight").T,
+            "post_ffn_norm": _row(w("post_feedforward_layernorm.weight")),
+            "w_ple_gate": w("per_layer_input_gate.weight").T,
+            "w_ple_proj": w("per_layer_projection.weight").T,
+            "post_ple_norm": _row(w("post_per_layer_input_norm.weight")),
+            "layer_scale": np.full((1, config.d_model), w("layer_scalar").reshape(())),
         }
         if not config.is_shared(i):
             layer |= {
-                "w_k": put(_t(w("self_attn.k_proj.weight"))),
-                "w_v": put(_t(w("self_attn.v_proj.weight"))),
-                "k_norm": put(_row(w("self_attn.k_norm.weight"))),
+                "w_k": w("self_attn.k_proj.weight").T,
+                "w_v": w("self_attn.v_proj.weight").T,
+                "k_norm": _row(w("self_attn.k_norm.weight")),
             }
         layers.append(layer)
+    stacks = {name: put(stack) for name, stack in stack_layers(config, layers, np).items()}
     return {
         "config": config,
         "embed": put(tensors["embed_tokens.weight"]),
@@ -276,7 +361,7 @@ def pack(tensors: dict[str, np.ndarray], config: Config) -> dict[str, Any]:
         "ple_proj": put(_t(tensors["per_layer_model_projection.weight"])),
         "ple_norm": put(_row(tensors["per_layer_projection_norm.weight"])),
         "final_norm": put(_row(tensors["norm.weight"])),
-        "layers": layers,
+        "w": stacks,
     }
 
 
@@ -331,7 +416,7 @@ def init_params(config: Config, seed: int = 0, dtype: Any = B16) -> dict[str, An
         "ple_proj": normal((d, c.layers * p), d**-0.5),
         "ple_norm": norm(p),
         "final_norm": norm(d),
-        "layers": layers,
+        "w": stack_layers(c, layers),
     }
 
 
@@ -415,7 +500,8 @@ def reference_forward(params: dict[str, Any], ids: jax.Array) -> jax.Array:
     ple = per_layer_inputs(params, ids, x)
     positions = jnp.arange(s)
     kv = {}
-    for i, layer in enumerate(params["layers"]):
+    for i in range(c.layers):
+        layer = layer_weights(params, i)
         dh, theta, fraction = c.rope(i)
         cos, sin = rope_tables(positions, dh, theta, fraction)
         n = _rms(x, layer["attn_norm"]).astype(dtype)
@@ -453,18 +539,28 @@ def _tables(config: Config, positions: jax.Array) -> dict[str, tuple[jax.Array, 
     return {kind: rope_tables(positions, *config.rope(layer)) for kind, layer in first.items()}
 
 
-def _post_attention(x: jax.Array, attn: jax.Array, ple: jax.Array, layer: dict[str, Any], tiles: Tiles) -> jax.Array:
-    names = ("wo", "post_attn_norm", "pre_ffn_norm", "w_gate", "w_up", "w_down", "post_ffn_norm")
-    names += ("w_ple_gate", "w_ple_proj", "post_ple_norm", "layer_scale")
-    return _call(post_attention, x, attn, ple, *(layer[n] for n in names), tiles=tiles.post)
+def _post_attention(x: jax.Array, attn: jax.Array, ple: jax.Array, params: dict, layer: int, tiles: Tiles):
+    """`post_attention` for layer `layer`: rows x (M, D), attn (M, H * dh), ple (L, M, P)."""
+    c: Config = params["config"]
+    w, kind, width = params["w"], c.kind(layer), c.width(layer)
+    slots = jnp.array([layer, c.q_slot(layer), c.mlp_slot(layer)], I32)
+    weights = (w[f"wo_{kind}"], w["post_attn_norm"], w["pre_ffn_norm"])
+    weights += tuple(w[f"{name}_{width}"] for name in ("w_gate", "w_up", "w_down"))
+    weights += tuple(w[name] for name in ("post_ffn_norm", "w_ple_gate", "w_ple_proj", "post_ple_norm", "layer_scale"))
+    return _call(post_attention, x, attn, ple, slots, *weights, tiles=tiles.post)
 
 
-def _projections(x: jax.Array, layer: dict[str, Any], shared: bool, cos: jax.Array, sin: jax.Array, tiles: Tiles):
-    """q (and k, v unless `shared`) of rows x (1, M, D) whose RoPE tables are cos, sin (M, dh)."""
-    if shared:
-        return _call(q_projection, x, layer["attn_norm"], layer["w_q"], layer["q_norm"], cos, sin, tiles=tiles.qkv)
-    weights = (layer["attn_norm"], layer["w_q"], layer["w_k"], layer["w_v"], layer["q_norm"], layer["k_norm"])
-    return _call(qkv_projection, x, *weights, cos, sin, tiles=tiles.qkv)
+def _projections(x: jax.Array, params: dict, layer: int, cos: jax.Array, sin: jax.Array, tiles: Tiles):
+    """q (and k, v on a non-shared layer) of rows x (M, D) whose RoPE tables are cos, sin (M, dh)."""
+    c: Config = params["config"]
+    w, kind = params["w"], c.kind(layer)
+    if c.is_shared(layer):
+        slots = jnp.array([layer, c.q_slot(layer)], I32)
+        args = (x, slots, w["attn_norm"], w[f"w_q_{kind}"], w[f"q_norm_{kind}"], cos, sin)
+        return _call(q_projection, *args, tiles=tiles.qkv)
+    slots = jnp.array([layer, c.q_slot(layer), c.kv_slot(layer)], I32)
+    weights = tuple(w[f"{name}_{kind}"] for name in ("w_q", "w_k", "w_v", "q_norm", "k_norm"))
+    return _call(qkv_projection, x, slots, w["attn_norm"], *weights, cos, sin, tiles=tiles.qkv)
 
 
 def prefill_hidden(params: dict[str, Any], ids: jax.Array, tiles: Tiles = Tiles()) -> tuple[jax.Array, dict]:
@@ -476,22 +572,22 @@ def prefill_hidden(params: dict[str, Any], ids: jax.Array, tiles: Tiles = Tiles(
     ids = jnp.pad(ids, [(0, 0), (0, s - length)])
     m = b * s
     e = embed_tokens(params, ids)
-    ple = per_layer_inputs(params, ids, e).reshape(m, c.layers, c.ple_dim)
+    ple = per_layer_inputs(params, ids, e).reshape(m, c.layers, c.ple_dim).transpose(1, 0, 2)
     positions = jnp.tile(jnp.arange(s), b)  # each row's position: the tokens are one sequence of B * S rows
     tables = _tables(c, positions)
     x = e.reshape(m, c.d_model)
     kv = {}
-    for i, layer in enumerate(params["layers"]):
+    for i in range(c.layers):
         dh = c.dh(i)
         cos, sin = tables[c.layer_types[i]]
-        out = _projections(x[None], layer, c.is_shared(i), cos, sin, tiles)
+        out = _projections(x, params, i, cos, sin, tiles)
         q = out if c.is_shared(i) else out[0]
         if not c.is_shared(i):
             kv[i] = (out[1].reshape(b, s, -1), out[2].reshape(b, s, -1))
         k, v = kv[c.kv_layer(i)]
         attention = make_attention(dh, None if c.is_full(i) else c.window)
         attn = _call(attention, q.reshape(b, s, -1), k, v, tiles=tiles.attention)
-        x = _post_attention(x, attn.reshape(m, -1), ple[:, i, :], layer, tiles)
+        x = _post_attention(x, attn.reshape(m, -1), ple, params, i, tiles)
     kv = {i: (k[:, :length], v[:, :length]) for i, (k, v) in kv.items()}
     return x.reshape(b, s, c.d_model)[:, :length], kv
 
@@ -564,25 +660,25 @@ def decode_hidden(
     c: Config = params["config"]
     b = tokens.shape[0]
     e = embed_tokens(params, tokens)
-    ple = per_layer_inputs(params, tokens, e)
+    ple = per_layer_inputs(params, tokens, e).transpose(1, 0, 2)
     tables = _tables(c, lengths)
     rows = jnp.arange(b)
     x, caches = e, list(caches)
-    for i, layer in enumerate(params["layers"]):
+    for i in range(c.layers):
         dh, full = c.dh(i), c.is_full(i)
         cos, sin = tables[c.layer_types[i]]
-        out = _projections(x[None], layer, c.is_shared(i), cos, sin, tiles)
+        out = _projections(x, params, i, cos, sin, tiles)
         q = out if c.is_shared(i) else out[0]
         if not c.is_shared(i):
             cache = caches[i]
             slot = lengths if full else lengths % cache["k"].shape[1]
-            k_cache = cache["k"].at[rows, slot].set(out[1][0], mode="drop")
-            v_cache = cache["v"].at[rows, slot].set(out[2][0], mode="drop")
+            k_cache = cache["k"].at[rows, slot].set(out[1], mode="drop")
+            v_cache = cache["v"].at[rows, slot].set(out[2], mode="drop")
             caches[i] = {"k": k_cache, "v": v_cache}
         cache = caches[c.kv_layer(i)]
         seen = lengths + 1 if full else jnp.minimum(lengths + 1, cache["k"].shape[1])
         attn = _call(gqa_decode, q.reshape(b, 1, c.heads, dh), cache["k"], cache["v"], seen, tiles=tiles.decode)
-        x = _post_attention(x, attn.reshape(b, -1), ple[:, i, :], layer, tiles)
+        x = _post_attention(x, attn.reshape(b, -1), ple, params, i, tiles)
     return x, caches
 
 

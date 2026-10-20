@@ -162,59 +162,59 @@ def first_max(s, c, best, best_index):
 
 
 @autokernel.kernel
-def qkv_projection(x, gamma, w_q, w_k, w_v, q_norm, k_norm, cos, sin, tiles=QkvTiles()):
-    """q, k, v of a layer's input x (B, S, D): input RMSNorm, projections, the per-head norms (q, k with
-    their (1, dh) weights, v without), RoPE with the rows' (S, dh) tables. Heads are blocks of columns."""
-    B, S, D = x.shape
-    HD, KD, Dh = w_q.shape[1], w_k.shape[1], cos.shape[1]
-    tm, td = min(tiles.rows, S), min(tiles.block_d, D)
+def qkv_projection(x, slots, gamma, w_q, w_k, w_v, q_norm, k_norm, cos, sin, tiles=QkvTiles()):
+    """q, k, v of a layer's input rows x (M, D): input RMSNorm, projections, the per-head norms (q's and k's
+    with their weights, v's without), RoPE with the rows' (M, dh) tables. Heads are blocks of columns.
+    Weights are stacks, the layer's picked by `slots` [layer, q slot, kv slot] (an index array): gamma (L,
+    1, D), w_q (Nq, D, H * dh), q_norm (Nq, 1, dh), w_k and w_v (Nk, D, Hkv * dh), k_norm (Nk, 1, dh)."""
+    M, D = x.shape
+    HD, KD, Dh = w_q.shape[2], w_k.shape[2], cos.shape[1]
+    tm, td = min(tiles.rows, M), min(tiles.block_d, D)
     dtype = x.dtype
-    q = jnp.zeros((B, S, HD), dtype)
-    k = jnp.zeros((B, S, KD), dtype)
-    v = jnp.zeros((B, S, KD), dtype)
-    for b in range(B):
-        for i in range(0, S, tm):
-            acc_q = jnp.zeros((tm, HD), jnp.float32)  # (x * w_in) @ w_q, ...
-            acc_k = jnp.zeros((tm, KD), jnp.float32)
-            acc_v = jnp.zeros((tm, KD), jnp.float32)
-            sum_sq = jnp.zeros((tm, LANES), jnp.float32)  # each row's sum of squares, lane-wide
-            for d in range(0, D, td):
-                xd = x[b, i : i + tm, d : d + td]
-                sum_sq += sum_squares(xd)
-                xg = scale_columns(xd, gamma[0:1, d : d + td])
-                acc_q += xg @ w_q[d : d + td, :]
-                acc_k += xg @ w_k[d : d + td, :]
-                acc_v += xg @ w_v[d : d + td, :]
-            inv_rms = jax.lax.rsqrt(sum_sq / D + EPS)
-            cos_t, sin_t = cos[i : i + tm, :], sin[i : i + tm, :]
-            q_t = head_rope(head_norm(acc_q * widen(inv_rms, HD), q_norm[0:1, :], Dh), cos_t, sin_t)
-            k_t = head_rope(head_norm(acc_k * widen(inv_rms, KD), k_norm[0:1, :], Dh), cos_t, sin_t)
-            v_t = head_norm(acc_v * widen(inv_rms, KD), None, Dh)
-            q = q.at[b, i : i + tm, :].set(q_t.astype(dtype))
-            k = k.at[b, i : i + tm, :].set(k_t.astype(dtype))
-            v = v.at[b, i : i + tm, :].set(v_t.astype(dtype))
+    q = jnp.zeros((M, HD), dtype)
+    k = jnp.zeros((M, KD), dtype)
+    v = jnp.zeros((M, KD), dtype)
+    for i in range(0, M, tm):
+        acc_q = jnp.zeros((tm, HD), jnp.float32)  # (x * w_in) @ w_q, ...
+        acc_k = jnp.zeros((tm, KD), jnp.float32)
+        acc_v = jnp.zeros((tm, KD), jnp.float32)
+        sum_sq = jnp.zeros((tm, LANES), jnp.float32)  # each row's sum of squares, lane-wide
+        for d in range(0, D, td):
+            xd = x[i : i + tm, d : d + td]
+            sum_sq += sum_squares(xd)
+            xg = scale_columns(xd, gamma[slots[0], :, d : d + td])
+            acc_q += xg @ w_q[slots[1], d : d + td, :]
+            acc_k += xg @ w_k[slots[2], d : d + td, :]
+            acc_v += xg @ w_v[slots[2], d : d + td, :]
+        inv_rms = jax.lax.rsqrt(sum_sq / D + EPS)
+        cos_t, sin_t = cos[i : i + tm, :], sin[i : i + tm, :]
+        q_t = head_rope(head_norm(acc_q * widen(inv_rms, HD), q_norm[slots[1], :, :], Dh), cos_t, sin_t)
+        k_t = head_rope(head_norm(acc_k * widen(inv_rms, KD), k_norm[slots[2], :, :], Dh), cos_t, sin_t)
+        v_t = head_norm(acc_v * widen(inv_rms, KD), None, Dh)
+        q = q.at[i : i + tm, :].set(q_t.astype(dtype))
+        k = k.at[i : i + tm, :].set(k_t.astype(dtype))
+        v = v.at[i : i + tm, :].set(v_t.astype(dtype))
     return q, k, v
 
 
 @autokernel.kernel
-def q_projection(x, gamma, w_q, q_norm, cos, sin, tiles=QkvTiles()):
-    """`qkv_projection` for a KV-shared layer: q only."""
-    B, S, D = x.shape
-    HD, Dh = w_q.shape[1], cos.shape[1]
-    tm, td = min(tiles.rows, S), min(tiles.block_d, D)
+def q_projection(x, slots, gamma, w_q, q_norm, cos, sin, tiles=QkvTiles()):
+    """`qkv_projection` for a KV-shared layer: q only (`slots` [layer, q slot])."""
+    M, D = x.shape
+    HD, Dh = w_q.shape[2], cos.shape[1]
+    tm, td = min(tiles.rows, M), min(tiles.block_d, D)
     dtype = x.dtype
-    q = jnp.zeros((B, S, HD), dtype)
-    for b in range(B):
-        for i in range(0, S, tm):
-            acc_q = jnp.zeros((tm, HD), jnp.float32)
-            sum_sq = jnp.zeros((tm, LANES), jnp.float32)
-            for d in range(0, D, td):
-                xd = x[b, i : i + tm, d : d + td]
-                sum_sq += sum_squares(xd)
-                acc_q += scale_columns(xd, gamma[0:1, d : d + td]) @ w_q[d : d + td, :]
-            inv_rms = jax.lax.rsqrt(sum_sq / D + EPS)
-            q_t = head_norm(acc_q * widen(inv_rms, HD), q_norm[0:1, :], Dh)
-            q = q.at[b, i : i + tm, :].set(head_rope(q_t, cos[i : i + tm, :], sin[i : i + tm, :]).astype(dtype))
+    q = jnp.zeros((M, HD), dtype)
+    for i in range(0, M, tm):
+        acc_q = jnp.zeros((tm, HD), jnp.float32)
+        sum_sq = jnp.zeros((tm, LANES), jnp.float32)
+        for d in range(0, D, td):
+            xd = x[i : i + tm, d : d + td]
+            sum_sq += sum_squares(xd)
+            acc_q += scale_columns(xd, gamma[slots[0], :, d : d + td]) @ w_q[slots[1], d : d + td, :]
+        inv_rms = jax.lax.rsqrt(sum_sq / D + EPS)
+        q_t = head_norm(acc_q * widen(inv_rms, HD), q_norm[slots[1], :, :], Dh)
+        q = q.at[i : i + tm, :].set(head_rope(q_t, cos[i : i + tm, :], sin[i : i + tm, :]).astype(dtype))
     return q
 
 
@@ -255,6 +255,7 @@ def post_attention(
     x,
     attn,
     ple,
+    slots,
     wo,
     post_attn_norm,
     pre_ffn_norm,
@@ -269,26 +270,28 @@ def post_attention(
     tiles=PostTiles(),
 ):
     """The rest of a layer on rows: x (M, D) the residual stream, attn (M, H * dh) the attention output, ple
-    (M, P) the layer's per-layer input; norms (1, D), layer_scale (1, D) the layer scalar. (M, D)."""
+    (L, M, P) every layer's per-layer inputs. Weights are stacks, the layer's picked by `slots` [layer, q
+    slot, MLP slot]: wo (Nq, H * dh, D); w_gate, w_up (Nm, D, F), w_down (Nm, F, D); per layer: norms and
+    the layer scalar (L, 1, D), w_ple_gate (L, D, P), w_ple_proj (L, P, D). (M, D)."""
     M, D = x.shape
-    A, F = attn.shape[1], w_up.shape[1]
+    A, F = attn.shape[1], w_up.shape[2]
     tm, ba, bf = min(tiles.rows, M), min(tiles.block_a, A), min(tiles.block_f, F)
     dtype = x.dtype
     out = jnp.zeros((M, D), dtype)
     for i in range(0, M, tm):
         proj = jnp.zeros((tm, D), jnp.float32)
         for a in range(0, A, ba):  # phase 1: the output projection, ba rows of Wo per step
-            proj += attn[i : i + tm, a : a + ba] @ wo[a : a + ba, :]
-        h = x[i : i + tm, :].astype(jnp.float32) + rms(proj, post_attn_norm[0:1, :])
-        normed = rms(h, pre_ffn_norm[0:1, :]).astype(dtype)
+            proj += attn[i : i + tm, a : a + ba] @ wo[slots[1], a : a + ba, :]
+        h = x[i : i + tm, :].astype(jnp.float32) + rms(proj, post_attn_norm[slots[0], :, :])
+        normed = rms(h, pre_ffn_norm[slots[0], :, :]).astype(dtype)
         y = jnp.zeros((tm, D), jnp.float32)
         for f in range(0, F, bf):  # phase 2: the GELU MLP, bf hidden units per step
-            hidden = gelu(normed @ w_gate[:, f : f + bf]) * (normed @ w_up[:, f : f + bf])
-            y += hidden.astype(dtype) @ w_down[f : f + bf, :]
-        h = h + rms(y, post_ffn_norm[0:1, :])
-        gate = gelu(h.astype(dtype) @ w_ple_gate[:, :]) * ple[i : i + tm, :].astype(jnp.float32)
-        p = gate.astype(dtype) @ w_ple_proj[:, :]
-        h = (h + rms(p, post_ple_norm[0:1, :])) * layer_scale[0:1, :].astype(jnp.float32)
+            hidden = gelu(normed @ w_gate[slots[2], :, f : f + bf]) * (normed @ w_up[slots[2], :, f : f + bf])
+            y += hidden.astype(dtype) @ w_down[slots[2], f : f + bf, :]
+        h = h + rms(y, post_ffn_norm[slots[0], :, :])
+        gate = gelu(h.astype(dtype) @ w_ple_gate[slots[0], :, :]) * ple[slots[0], i : i + tm, :].astype(jnp.float32)
+        p = gate.astype(dtype) @ w_ple_proj[slots[0], :, :]
+        h = (h + rms(p, post_ple_norm[slots[0], :, :])) * layer_scale[slots[0], :, :].astype(jnp.float32)
         out = out.at[i : i + tm, :].set(h.astype(dtype))
     return out
 
