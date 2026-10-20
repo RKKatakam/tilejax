@@ -1,6 +1,6 @@
 [project]
 name = "autokernel"
-version = "0.3.0"
+version = "0.4.0"
 description = "Compile Python tile loop nests into Pallas TPU kernels"
 readme = "README.md"
 requires-python = ">=3.12"

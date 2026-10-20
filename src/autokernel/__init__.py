@@ -45,4 +45,4 @@ __all__ = [
 try:
     __version__ = _metadata.version("autokernel")
 except _metadata.PackageNotFoundError:  # running from a source tree that isn't installed
-    __version__ = "0.3.0"
+    __version__ = "0.4.0"
