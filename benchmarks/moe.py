@@ -41,14 +41,16 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent.parent / "examples"))
 from moe import (
     CONFIGS,
+    DECODE_TOKENS,
     MoeConfig,
     baseline,
     baseline_experts,
     baseline_params,
     combine,
+    combine_rows,
+    decode_call,
     dispatch,
     experts_call,
-    finish,
     gather,
     gmm_down,
     gmm_swiglu,
@@ -57,11 +59,14 @@ from moe import (
     megablox_tiling,
     moe_layer,
     moe_layer_ragged,
+    one_hot,
     ragged_rows,
     rmsnorm,
     route,
     route_tokens,
-    shared_experts,
+    shared_combine,
+    slot_ranks,
+    slot_rows,
 )
 from timing import require_tpu, time_ms
 
@@ -74,7 +79,7 @@ RUNS = [  # config, token counts (decode: 8-64 tokens; prefill: 4096-16384)
 SMALL = MoeConfig(256, 8, 2, 256, shared=1, scoring="sigmoid", n_group=4, topk_group=2, scale=2.5)
 DENSE_TOKENS = 64  # every expert on every token only for decode batches
 MEGABLOX_TILINGS = [(tm, cap) for tm in (128, 256, 512) for cap in (512, 2048)]  # rows, k and n blocks up to cap
-PARTS = ("router", "dispatch", "gather", "experts", "combine", "shared")
+PARTS = ("router", "dispatch", "gather", "experts", "regather", "finish")
 
 
 def _time_or_inf(fn: Any, *args: Any, runs: int) -> float:
@@ -146,14 +151,43 @@ def measure_groups(x: jax.Array, params: dict[str, Any], config: MoeConfig) -> i
     return min(seconds, key=seconds.get)
 
 
+def lax_router(x: jax.Array, params: dict[str, Any], config: MoeConfig) -> tuple[jax.Array, jax.Array]:
+    """moe.py's former router, for reference: XLA's RMSNorm and f32 router, `jax.lax.top_k` (twice more for
+    group-limited routing)."""
+    logits = jnp.dot(rmsnorm(x, params["norm"]).astype(jnp.float32), params["router"], precision="highest")
+    scores = jax.nn.softmax(logits, axis=-1) if config.scoring == "softmax" else jax.nn.sigmoid(logits)
+    choice = scores if config.scoring == "softmax" else scores + params["bias"]
+    if config.n_group > 1:
+        t, e = choice.shape
+        groups = choice.reshape(t, config.n_group, e // config.n_group)
+        _, best = jax.lax.top_k(jnp.sum(jax.lax.top_k(groups, 2)[0], axis=-1), config.topk_group)
+        kept = jnp.any(best[:, :, None] == jnp.arange(config.n_group), axis=1)
+        choice = jnp.where(jnp.repeat(kept, e // config.n_group, axis=1), choice, -jnp.inf)
+    _, ids = jax.lax.top_k(choice, config.top_k)
+    return ids, jnp.take_along_axis(scores, ids, axis=1)
+
+
 def breakdown(x: jax.Array, params: dict[str, Any], config: MoeConfig, group: int) -> dict[str, float]:
-    """autokernel's layer part by part, each jitted and timed on its own inputs, ms."""
+    """autokernel's layer part by part, each jitted and timed on its own inputs, ms: for decode, the routing
+    (XLA), the per-expert counts and weights ("dispatch") and the one kernel ("experts"); for prefill, also
+    the row gathers into the experts' rows ("gather") and back into slot-major rows ("regather"), and
+    the end of the layer ("finish": `combine_rows` or `shared_combine`)."""
     e = config.experts
-    bias_args = (params["router"], params["bias"])
+    parts = dict.fromkeys(PARTS, 0.0)
+    xla_router = time_ms(jax.jit(lambda x: lax_router(x, params, config)), x, runs=10)
+    if x.shape[0] <= DECODE_TOKENS:
+        kernel, args = decode_call(x, params, config)
+        bias_args = (params["router"], params["bias"])
+        parts["router"] = time_ms(jax.jit(lambda x: route(rmsnorm(x, params["norm"]), *bias_args, config)), x, runs=10)
+        parts["dispatch"] = time_ms(jax.jit(lambda x: decode_call(x, params, config)[1][5:]), x, runs=10)
+        parts["dispatch"] = max(parts["dispatch"] - parts["router"], 0.0)  # (it routes too)
+        parts["experts"] = time_ms(jax.jit(kernel), *args, runs=10)
+        print("  autokernel's layer, part by part (ms): " + ", ".join(f"{p} {parts[p]:.3f}" for p in PARTS))
+        print(f"    for reference: the former router (lax.top_k) {xla_router:.3f}")
+        return parts
     normed, ids, weights = route_tokens(x, params, config)
     kernel, inputs, pos = experts_call(normed, ids, params, config, group)
     y = kernel(*inputs)
-    routed = combine(y, pos, weights)
 
     def indices(ids):  # the dispatch's index arrays (XLA drops the row gather of nothing)
         _, inputs, pos = experts_call(jnp.zeros((ids.shape[0], 128), x.dtype), ids, params, config, group)
@@ -162,31 +196,36 @@ def breakdown(x: jax.Array, params: dict[str, Any], config: MoeConfig, group: in
     def rows(normed, ids):
         return experts_call(normed, ids, params, config, group)[1][0]
 
-    def end(y, pos, weights, x):
-        out = combine(y, pos, weights)
-        return out.astype(x.dtype) if config.shared else finish(x, out, params, config)
-
-    parts = {
+    rows_back = slot_rows(y, pos)
+    parts |= {
         "router": time_ms(jax.jit(lambda x: route_tokens(x, params, config)), x, runs=10),
         "dispatch": time_ms(jax.jit(indices), ids, runs=10),
         "gather": time_ms(jax.jit(rows), normed, ids, runs=10),
         "experts": time_ms(jax.jit(kernel), *inputs, runs=10),
-        "combine": time_ms(jax.jit(end), y, pos, weights, x, runs=10),
-        "shared": 0.0,
+        "regather": time_ms(jax.jit(slot_rows), y, pos, runs=10),
     }
     parts["gather"] = max(parts["gather"] - parts["dispatch"], 0.0)  # (`rows` computes the indices too)
+    w = weights.T[:, :, None]
     if config.shared:
         s = params["shared"]
-        args = (x, params["norm"], s["w_gate"], s["w_up"], s["w_down"], routed.astype(x.dtype))
-        parts["shared"] = time_ms(jax.jit(shared_experts), *args, runs=10)
-    xla_router = time_ms(jax.jit(lambda x: route(rmsnorm(x, params["norm"]), *bias_args, config)), x, runs=10)
+        args = (x, params["norm"], s["w_gate"], s["w_up"], s["w_down"], rows_back, w)
+        parts["finish"] = time_ms(jax.jit(shared_combine), *args, runs=10)
+    else:
+        parts["finish"] = time_ms(jax.jit(combine_rows), x, rows_back, w, runs=10)
+
+    def xla_combine(y, pos, weights, x):  # the former combine: one XLA fusion of the gather and the sum
+        return (x.astype(jnp.float32) + combine(y, pos, weights)).astype(x.dtype)
+
+    old_combine = time_ms(jax.jit(xla_combine), y, pos, weights, x, runs=10)
     old = time_ms(jax.jit(sorted_dispatch, static_argnums=(1, 2, 3)), ids, e, 1, ragged_rows(ids.size), runs=10)
+    ranks = time_ms(jax.jit(lambda ids: slot_ranks(ids, one_hot(ids, e))), ids, runs=10)
     unpadded = jax.jit(lambda ids: vars(dispatch(ids, e, 1, ragged_rows(ids.size))))
     new = time_ms(unpadded, ids, runs=10)
     print("  autokernel's layer, part by part (ms): " + ", ".join(f"{p} {parts[p]:.3f}" for p in PARTS))
     print(
-        f"    for reference: XLA rmsnorm + f32 router + top-k {xla_router:.3f}; unpadded dispatch: "
-        f"sort + scatters {old:.3f}, moe.py's {new:.3f}"
+        f"    for reference: the former router (XLA, lax.top_k) {xla_router:.3f}; unpadded dispatch: sort + "
+        f"scatters {old:.3f}, moe.py's {new:.3f} (of which ranks {ranks:.3f}); the former combine (XLA gather "
+        f"+ sum, + residual) {old_combine:.3f}"
     )
     return parts
 
@@ -219,7 +258,8 @@ def run(config: MoeConfig, name: str, tokens: int) -> dict[str, Any]:
     print(f"{name}: {config}, {tokens} tokens ({chosen} of {e} experts chosen, {tokens * k / e:.0f} rows each): ms")
 
     # Tune autokernel's kernels on this routing, eagerly (under jit they would tune on random index arrays).
-    group = measure_groups(x, params, config)
+    decode = tokens <= DECODE_TOKENS  # (moe_layer: one kernel, no groups)
+    group = 0 if decode else measure_groups(x, params, config)
     moe_layer(x, params, config, group)
     moe_layer_ragged(x, params, config)
     parts = breakdown(x, params, config, group)
@@ -227,8 +267,11 @@ def run(config: MoeConfig, name: str, tokens: int) -> dict[str, Any]:
     def show(label: str, ms: float, layer: bool) -> None:
         print(f"  {'layer:' if layer else 'experts alone:':<15}{label:<34} {ms:8.3f}  ({rate(ms, layer)})")
 
-    # The routed experts alone.
-    kernel, inputs, _ = experts_call(normed, ids, params, config, group)
+    # The routed experts alone (for decode, autokernel's is the whole layer's kernel, shared experts included).
+    if decode:
+        kernel, inputs = decode_call(x, params, config)
+    else:
+        kernel, inputs, _ = experts_call(normed, ids, params, config, group)
     ours_experts = time_ms(jax.jit(kernel), *inputs, runs=10)
     ragged = jax.jit(lambda xs, wg, wu, wd, s, n: gmm_down(gmm_swiglu(xs, wg, wu, s, n), wd, s, n))
     ragged_args = (xs, params["w_gate"], params["w_up"], params["w_down"], disp.starts, disp.ends)
@@ -240,7 +283,7 @@ def run(config: MoeConfig, name: str, tokens: int) -> dict[str, Any]:
         (_time_or_inf(experts, xs, bparams, disp.counts, config, "megablox", tiling, runs=10), label)
         for label, tiling in tilings
     )
-    show(f"autokernel {kernel.nest.name} ({group})", ours_experts, False)
+    show(f"autokernel {kernel.nest.name}" + ("" if decode else f" ({group})"), ours_experts, False)
     show("autokernel ragged", ours_ragged_experts, False)
     show("ragged_dot", ragged_dot_experts, False)
     show(f"megablox ({megablox_name})", megablox_experts, False)
@@ -255,7 +298,7 @@ def run(config: MoeConfig, name: str, tokens: int) -> dict[str, Any]:
     megablox = min(_time_or_inf(baseline(config, "megablox", t), x, bparams, runs=10) for _, t in tilings)
     dense = time_ms(baseline(config, "dense"), x, bparams, runs=10) if not prefill else float("nan")
     want = ragged_dot_fn(x, bparams)
-    same = same_routing(x, params, config)
+    same = np.ones(tokens, bool) if decode else same_routing(x, params, config)
     ours_out, ragged_out = ours_fn(x, params, config, group), ours_ragged_fn(x, params, config)
     diffs = (max_diff(ours_out, want, same), max_diff(ragged_out, want, same))
     show(f"autokernel ({kernel.nest.name})", ours, True)
@@ -272,11 +315,17 @@ def run(config: MoeConfig, name: str, tokens: int) -> dict[str, Any]:
         f"over the {same.sum()} of {tokens} tokens routed as XLA's router does)"
     )
     h = jax.ShapeDtypeStruct((rows, f), jnp.bfloat16)
+    print(f"  {kernel.nest.name}:", kernel.lower(*inputs).config)
     print("  gmm_swiglu:", gmm_swiglu.lower(*ragged_args[:3], disp.starts, disp.ends).config)
     print("  gmm_down:  ", gmm_down.lower(h, params["w_down"], disp.starts, disp.ends).config)
-    if config.shared:
-        s = params["shared"]
-        print("  shared:    ", shared_experts.lower(x, params["norm"], s["w_gate"], s["w_up"], s["w_down"], x).config)
+    if not decode:
+        rows_back, w = jax.ShapeDtypeStruct((k, tokens, d), x.dtype), jax.ShapeDtypeStruct((k, tokens, 1), jnp.float32)
+        if config.shared:
+            s = params["shared"]
+            end = shared_combine.lower(x, params["norm"], s["w_gate"], s["w_up"], s["w_down"], rows_back, w)
+        else:
+            end = combine_rows.lower(x, rows_back, w)
+        print(f"  {end.plan.nest.name}:", end.config)
     return {
         "name": name,
         "tokens": tokens,
@@ -314,7 +363,7 @@ def main() -> None:
         ex, ly = row["experts"], row["layer"]
         best_base = min(ly[2], ly[3], ly[4] if not np.isnan(ly[4]) else float("inf"))
         print(
-            f"{row['name']:<18} {row['tokens']:<6} {row['group']:<5} | "
+            f"{row['name']:<18} {row['tokens']:<6} {row['group'] or '-':<5} | "
             f"{ex[0]:13.3f} {ex[1]:7.3f} {ex[2]:10.3f} {ex[3]:8.3f} | "
             f"{ly[0]:11.3f} {ly[1]:7.3f} {ly[2]:10.3f} {ly[3]:8.3f} {ly[4]:7.3f} | "
             f"{best_base / min(ly[0], ly[1]):6.2f}x  {row['rate']}"
@@ -325,7 +374,7 @@ def main() -> None:
     for row in summary:
         parts = row["parts"]
         print(
-            f"{row['name']:<18} {row['tokens']:<6} {row['group']:<5} | "
+            f"{row['name']:<18} {row['tokens']:<6} {row['group'] or '-':<5} | "
             + " ".join(f"{parts[p]:8.3f}" for p in PARTS)
             + f" | {sum(parts.values()):8.3f} {row['layer'][0]:8.3f}"
         )

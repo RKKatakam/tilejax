@@ -12,37 +12,47 @@ without an auxiliary loss), first keeping only the `topk_group` best of `n_group
 group scored by its two best experts), and scale the renormalized weights by `routed_scaling_factor`; they
 add shared experts that every token goes through.
 
-The layer, `moe_layer`, is four kernels and some XLA between them:
+The layer, `moe_layer`, for prefill: three kernels and some XLA between them.
 
 1. `norm_router`: RMSNorm and the router logits in one pass over x. The logits are f32 from the bf16
    normalized rows: the f32 router is split into two bf16 matrices (`split_router`, hi + lo), so two MXU
-   passes give the f32 product to ~2^-17 (XLA's f32 `HIGHEST` dot takes six).
-2. Routing and dispatch in XLA, without scatters or gathers of single elements (with them, the glue
-   around the experts cost more than the experts at 4096 tokens on a v5e). The chosen experts are a
-   one-hot (tokens, k, experts) mask: its sums are the rows per expert, a cumulative
-   sum over tokens ranks each (token, slot) among its expert's, and each slot's row is its expert's first
-   row plus its rank, all elementwise and reductions. The rows' tokens (the inverse map) come from one
-   sort of an int32 key per slot, read as windows: each block of rows of one expert is a slice of the
-   sorted tokens. The tokens' normalized rows are then gathered into the experts' rows: a row gather, which
-   costs ~10-20 ns a row on a v5e (from the time padded layouts added to whole layers), so the layouts keep
-   the rows gathered few.
+   passes give the f32 product to ~2^-17 (XLA's f32 `HIGHEST` dot takes six). The top-k (`top_k`) is k
+   max-reductions over each token's scores and group-limited routing (`best_groups`) a max, a second max
+   and a rank by comparisons: with `jax.lax.top_k` the router took 1.9 ms at 4096 tokens with DeepSeek-V3's
+   groups on a v5e (0.25 ms with Qwen3's plain top-k).
+2. Dispatch in XLA, without scatters or gathers of single elements (with them, the glue around the
+   experts cost more than the experts at 4096 tokens on a v5e). The chosen experts are a one-hot (tokens,
+   k, experts) mask: its sums are the rows per expert, a cumulative sum over tokens (`counts_before`,
+   lower-triangular matmuls on the MXU) ranks each (token, slot) among its expert's, and each slot's row
+   is its expert's first row plus its rank. The rows' tokens (the inverse map) come from one sort of an
+   int32 key per slot, read as windows: each block of rows of one expert is a slice of the sorted tokens.
+   The tokens' normalized rows are then gathered into the experts' rows: an XLA row gather, ~25-30 ns a row
+   on a v5e (the DMAs it issues, not bandwidth), so the layouts keep the rows gathered few.
 3. The routed experts: one grouped SwiGLU kernel over the experts' rows (below).
-4. The combine: each token's weighted sum of its k expert rows, a row gather and a sum that XLA fuses with
-   the residual; with shared experts, `shared_experts` (one kernel: RMSNorm, the shared SwiGLU, the
-   residual and the routed sum).
+4. The combine: each (token, slot)'s expert row gathered back slot-major (k, tokens, d_model) (`slot_rows`,
+   one plain row gather), then one kernel ends the layer reading those rows a slot per step:
+   `combine_rows` (x + the weighted rows) or `shared_combine` (also the shared experts' SwiGLU of
+   rmsnorm(x), a phase over their hidden units). XLA's fused gather-and-sum cost 1.5-2.5x the plain gather.
+
+For decode (up to `DECODE_TOKENS` tokens) every row gather and kernel launch is overhead next to reading
+the chosen experts' weights, so the layer is the routing in XLA (as the baselines route) and one kernel,
+`moe_decode` / `moe_decode_shared`: a step per expert some token chose (a runtime mask on its token
+count), every token through it, weighted by its routing weight (zero for the tokens that didn't choose
+it); then the shared experts; RMSNorm and the residual around them. Computing all tokens with each expert
+costs T flops per weight byte, which a v5e hides under the weights' reads while T is under ~200.
 
 The grouped kernels. Every step reads a whole block of an expert's weights for the rows of a tile: G flops
 per weight byte for G rows, so prefill wants G >= ~256 on a v5e (197 TFLOP/s, 819 GB/s), decode wants G
 about the tokens (an expert gets at most a row per token), and fine-grained experts (DeepSeek-V3, Kimi K2:
 ~85-128 rows each at 4096 tokens) want G about their rows, or padding wastes up to half the MXU work.
 
-- `expert_ffn` (decode: G < 128): each expert's rows padded to a multiple of G, so every tile of G rows
-  belongs to one expert; `tile_expert` (an index array, in SMEM) says which, -1 past the used rows. A tile
-  is a feed-forward layer of its own: its reduction loop walks blocks of the expert's hidden units,
-  streaming `W_gate[e][:, f]`, `W_up[e][:, f]` and `W_down[e][f, :]` (runtime windows), with SwiGLU between
-  the matmuls, so the hidden activations never go to HBM. Its mask (`tile_expert[i // G] < 0`) is a
-  runtime mask: unused tiles take one empty step, and an expert without tokens has no tile, so its weights
-  are never read. A step reads only the experts some token chose: decode stays bandwidth bound.
+- `expert_ffn` (G < 128, or `expert_inputs`' layout for callers that dispatch themselves): each expert's
+  rows padded to a multiple of G, so every tile of G rows belongs to one expert; `tile_expert` (an index
+  array, in SMEM) says which, -1 past the used rows. A tile is a feed-forward layer of its own: its
+  reduction loop walks blocks of the expert's hidden units, streaming `W_gate[e][:, f]`, `W_up[e][:, f]`
+  and `W_down[e][f, :]` (runtime windows), with SwiGLU between the matmuls, so the hidden activations never
+  go to HBM. Its mask (`tile_expert[i // G] < 0`) is a runtime mask: unused tiles take one empty step, and
+  an expert without tokens has no tile, so its weights are never read.
 - `expert_ffn_blocks` (prefill: G >= 128): the same tiles, but their rows come from a layout padded only
   to G/8 rows per expert, as 8 runtime windows of G/8 rows (`tile_blocks`): the row gather writes the
   slots plus at most G/8 - 1 rows per expert instead of up to G - 1 (for Kimi K2 at 4096 tokens and
@@ -77,6 +87,7 @@ SUBLANES = 16  # bf16 rows per (16, 128) VMEM tile: the smallest group size
 GROUPS = (16, 32, 64)  # `expert_ffn`'s group sizes (decode)
 BLOCK_GROUPS = (128, 256, 384, 512, 768, 1024)  # `expert_ffn_blocks`' group sizes (prefill)
 BLOCKS = 8  # row windows per tile of `expert_ffn_blocks`
+DECODE_TOKENS = 64  # up to this many tokens, `moe_layer` is `moe_decode`: every token through each chosen expert
 
 
 @dataclass(frozen=True)
@@ -286,6 +297,115 @@ def shared_experts(x, gamma, w_gate, w_up, w_down, routed, tiles=SharedTiles()):
     return out
 
 
+@autokernel.tunable
+class CombineTiles:
+    """Tokens per tile."""
+
+    rows: int = autokernel.choice(128, 256, 512, 1024, 2048, default=512)
+
+
+@autokernel.kernel
+def combine_rows(x, rows, weights, tiles=CombineTiles()):
+    """The end of a layer without shared experts: x + sum_s weights[s] * rows[s] on (tokens, d_model) rows,
+    rows (k, T, d_model) each slot's expert output, weights (k, T, 1) f32; a step per slot."""
+    K, T, D = rows.shape
+    tm = min(tiles.rows, T)
+    dtype = x.dtype
+    out = jnp.zeros((T, D), dtype)
+    for i in range(0, T, tm):
+        acc = jnp.zeros((tm, D), jnp.float32)
+        for s in range(K):
+            acc += weights[s, i : i + tm, :] * rows[s, i : i + tm, :].astype(jnp.float32)
+        out = out.at[i : i + tm, :].set((x[i : i + tm, :].astype(jnp.float32) + acc).astype(dtype))
+    return out
+
+
+@autokernel.kernel
+def shared_combine(x, gamma, w_gate, w_up, w_down, rows, weights, tiles=SharedTiles()):
+    """The end of a layer with shared experts: x + the shared experts' SwiGLU of rmsnorm(x) (a phase over
+    their hidden units) + sum_s weights[s] * rows[s] (a phase over the slots), as `combine_rows`."""
+    K, T, D = rows.shape
+    F = w_gate.shape[1]
+    tm, bf = min(tiles.rows, T), min(tiles.block_f, F)
+    dtype = x.dtype
+    out = jnp.zeros((T, D), dtype)
+    for i in range(0, T, tm):
+        resid = x[i : i + tm, :].astype(jnp.float32)
+        normed = resid * jax.lax.rsqrt(jnp.mean(resid * resid, axis=1, keepdims=True) + EPS) * gamma[0:1, :]
+        normed = normed.astype(dtype)
+        y = jnp.zeros((tm, D), jnp.float32)
+        for f in range(0, F, bf):  # the shared hidden units, bf per step, streaming the weights
+            g = normed @ w_gate[:, f : f + bf]
+            u = normed @ w_up[:, f : f + bf]
+            y += (jax.nn.silu(g) * u).astype(dtype) @ w_down[f : f + bf, :]
+        for s in range(K):  # the routed experts' rows, a slot per step
+            y += weights[s, i : i + tm, :] * rows[s, i : i + tm, :].astype(jnp.float32)
+        out = out.at[i : i + tm, :].set((x[i : i + tm, :].astype(jnp.float32) + y).astype(dtype))
+    return out
+
+
+@autokernel.tunable
+class DecodeTiles:
+    """Shared hidden units per step."""
+
+    block_f: int = autokernel.choice(256, 512, 1024, 2048, 4096, default=1024)
+
+
+@autokernel.kernel
+def moe_decode(x, gamma, w_gate, w_up, w_down, counts, weights):
+    """A whole MoE layer for a few tokens, without shared experts: x + sum_e weights[e] * expert_e(
+    rmsnorm(x)), a step per expert some token chose (`counts[e] > 0`: a runtime mask), every token through it
+    (weights (E, T, 1) f32: zero for the tokens that didn't choose it)."""
+    T, D = x.shape
+    E = w_gate.shape[0]
+    dtype = x.dtype
+    out = jnp.zeros((T, D), dtype)
+    for i in range(0, T, T):
+        resid = x[i : i + T, :].astype(jnp.float32)
+        normed = resid * jax.lax.rsqrt(jnp.mean(resid * resid, axis=1, keepdims=True) + EPS) * gamma[0:1, :]
+        normed = normed.astype(dtype)
+        acc = jnp.zeros((T, D), jnp.float32)
+        for e in range(E):
+            if counts[e] == 0:  # no token chose it: decided when the kernel runs, its weights never read
+                continue
+            g = normed @ w_gate[e, :, :]
+            u = normed @ w_up[e, :, :]
+            y = (jax.nn.silu(g) * u).astype(dtype) @ w_down[e, :, :]
+            acc += weights[e, :, :] * y.astype(dtype).astype(jnp.float32)
+        out = out.at[i : i + T, :].set((resid + acc).astype(dtype))
+    return out
+
+
+@autokernel.kernel
+def moe_decode_shared(x, gamma, w_gate, w_up, w_down, counts, weights, s_gate, s_up, s_down, tiles=DecodeTiles()):
+    """`moe_decode` with shared experts (s_gate, s_up, s_down): a phase over the routed experts some token
+    chose, then one over the shared experts' hidden units."""
+    T, D = x.shape
+    E = w_gate.shape[0]
+    F = s_gate.shape[1]
+    bf = min(tiles.block_f, F)
+    dtype = x.dtype
+    out = jnp.zeros((T, D), dtype)
+    for i in range(0, T, T):
+        resid = x[i : i + T, :].astype(jnp.float32)
+        normed = resid * jax.lax.rsqrt(jnp.mean(resid * resid, axis=1, keepdims=True) + EPS) * gamma[0:1, :]
+        normed = normed.astype(dtype)
+        acc = jnp.zeros((T, D), jnp.float32)
+        for e in range(E):
+            if counts[e] == 0:  # no token chose it: decided when the kernel runs, its weights never read
+                continue
+            g = normed @ w_gate[e, :, :]
+            u = normed @ w_up[e, :, :]
+            y = (jax.nn.silu(g) * u).astype(dtype) @ w_down[e, :, :]
+            acc += weights[e, :, :] * y.astype(dtype).astype(jnp.float32)
+        for f in range(0, F, bf):  # the shared experts' hidden units, bf per step
+            g = normed @ s_gate[:, f : f + bf]
+            u = normed @ s_up[:, f : f + bf]
+            acc += (jax.nn.silu(g) * u).astype(dtype) @ s_down[f : f + bf, :]
+        out = out.at[i : i + T, :].set((resid + acc).astype(dtype))
+    return out
+
+
 # --------------------------------------------------------------------------- routing
 
 
@@ -306,6 +426,33 @@ def one_hot(ids: jax.Array, experts: int) -> jax.Array:
     return ids[:, :, None] == jnp.arange(experts, dtype=jnp.int32)
 
 
+def top_k(values: jax.Array, k: int) -> jax.Array:
+    """The indices of the k largest of each row (T, n), largest first, ties to the lower index (as
+    `jax.lax.top_k`), int32: k max-reductions over the row, each masking the one before (cheaper on a TPU
+    than `jax.lax.top_k` for k of a few)."""
+    lane = jnp.arange(values.shape[-1], dtype=jnp.int32)
+    ids = []
+    for _ in range(k):
+        ids.append(jnp.argmax(values, axis=-1).astype(jnp.int32))
+        values = jnp.where(lane == ids[-1][..., None], -jnp.inf, values)
+    return jnp.stack(ids, axis=-1)
+
+
+def best_groups(choice: jax.Array, n_group: int, topk_group: int) -> jax.Array:
+    """Group-limited routing: (T, experts) bool, the experts of each token's `topk_group` best of `n_group`
+    groups, a group scored by its two best experts. Reductions and a rank by comparisons, no top-k."""
+    t, e = choice.shape
+    groups = choice.reshape(t, n_group, e // n_group)
+    lane = jnp.arange(e // n_group, dtype=jnp.int32)
+    first = jnp.argmax(groups, axis=-1)[..., None]
+    second = jnp.max(jnp.where(lane == first, -jnp.inf, groups), axis=-1)
+    score = jnp.max(groups, axis=-1) + second  # (T, n_group)
+    g = jnp.arange(n_group)
+    beats = (score[:, None, :] > score[:, :, None]) | ((score[:, None, :] == score[:, :, None]) & (g < g[:, None]))
+    kept = jnp.sum(beats, axis=-1) < topk_group  # groups fewer than topk_group others beat (top_k's ties)
+    return jnp.repeat(kept, e // n_group, axis=1)
+
+
 def route_logits(logits: jax.Array, bias: jax.Array, config: MoeConfig) -> tuple[jax.Array, jax.Array]:
     """Each token's experts (T, top_k) int32 and their weights (T, top_k) f32, from f32 logits (T, experts)."""
     if config.scoring == "softmax":
@@ -315,14 +462,8 @@ def route_logits(logits: jax.Array, bias: jax.Array, config: MoeConfig) -> tuple
         scores = jax.nn.sigmoid(logits)
         choice = scores + bias  # the bias steers the choice only, not the weights
     if config.n_group > 1:
-        t, e = choice.shape
-        groups = choice.reshape(t, config.n_group, e // config.n_group)
-        group_scores = jnp.sum(jax.lax.top_k(groups, 2)[0], axis=-1)  # each group: its two best experts
-        _, best = jax.lax.top_k(group_scores, config.topk_group)
-        kept = jnp.any(best[:, :, None] == jnp.arange(config.n_group)[None, None, :], axis=1)
-        choice = jnp.where(jnp.repeat(kept, e // config.n_group, axis=1), choice, -jnp.inf)
-    _, ids = jax.lax.top_k(choice, config.top_k)
-    ids = ids.astype(jnp.int32)
+        choice = jnp.where(best_groups(choice, config.n_group, config.topk_group), choice, -jnp.inf)
+    ids = top_k(choice, config.top_k)
     # Each slot's score: a masked sum over the experts rather than a gather of T * k scalars.
     weights = jnp.sum(jnp.where(one_hot(ids, logits.shape[1]), scores[:, None, :], 0.0), axis=2)
     if config.normalize:
@@ -369,11 +510,25 @@ class Dispatch:
     ends: jax.Array  # (E,) the end of each expert's rows, padding included
 
 
-def _ranks(ids: jax.Array, hot: jax.Array) -> tuple[jax.Array, jax.Array]:
+def counts_before(per_token: jax.Array, block: int = 256) -> jax.Array:
+    """The exclusive cumulative sum over tokens of small counts (T, E) int32, on the MXU: within blocks of
+    `block` tokens a lower-triangular matmul (0/1 bf16, exact in f32), then each block's offset."""
+    t, e = per_token.shape
+    block = min(block, -(-t // 8) * 8)
+    padded = -(-t // block) * block
+    counts = jnp.pad(per_token, ((0, padded - t), (0, 0))).reshape(-1, block, e)
+    strictly_lower = jnp.tri(block, k=-1, dtype=jnp.bfloat16)  # [i, j]: j < i
+    within = jnp.einsum("ij,bje->bie", strictly_lower, counts.astype(jnp.bfloat16), preferred_element_type=jnp.float32)
+    totals = jnp.sum(counts, axis=1)
+    offsets = jnp.cumsum(totals, axis=0) - totals  # (blocks, E): few rows
+    return (within.astype(jnp.int32) + offsets[:, None, :]).reshape(padded, e)[:t]
+
+
+def slot_ranks(ids: jax.Array, hot: jax.Array) -> tuple[jax.Array, jax.Array]:
     """Each slot's rank among its expert's slots in (token, slot) order (T, k), and the slots per expert (E,):
     a cumulative sum over tokens of the one-hot mask, no sort."""
     per_token = jnp.sum(hot, axis=1, dtype=jnp.int32)  # (T, E): 0 or 1 from a router
-    before = jnp.cumsum(per_token, axis=0, dtype=jnp.int32) - per_token  # the expert's slots of earlier tokens
+    before = counts_before(per_token)  # the expert's slots of earlier tokens
     k = ids.shape[1]
     earlier = jnp.tril(jnp.ones((k, k), bool), -1)  # [s, s']: s' < s (a token choosing an expert twice)
     repeats = jnp.sum((ids[:, :, None] == ids[:, None, :]) & earlier, axis=2, dtype=jnp.int32)
@@ -409,7 +564,7 @@ def dispatch(ids: jax.Array, experts: int, group: int, rows: int) -> Dispatch:
     """Lay the (token, slot) pairs out by expert, in token order, each expert's rows starting at a multiple of
     `group` (1: no padding), in a layout of `rows` rows."""
     hot = one_hot(ids, experts)
-    rank, counts = _ranks(ids, hot)
+    rank, counts = slot_ranks(ids, hot)
     padded = -(-counts // group) * group
     ends = jnp.cumsum(padded, dtype=jnp.int32)
     starts = ends - padded
@@ -473,6 +628,23 @@ def finish(x: jax.Array, routed: jax.Array, params: dict[str, Any], config: MoeC
     return shared_experts(x, params["norm"], s["w_gate"], s["w_up"], s["w_down"], routed.astype(x.dtype))
 
 
+def slot_rows(y: jax.Array, pos: jax.Array) -> jax.Array:
+    """Each (token, slot)'s row of the experts' output, slot-major (k, T, d_model): one row gather (indices
+    in range, so XLA's plain clamping gather), read by `combine_rows` / `shared_combine` a slot at a time."""
+    tokens, k = pos.shape
+    return jnp.take(y, pos.T.reshape(-1), axis=0, mode="clip").reshape(k, tokens, y.shape[1])
+
+
+def finish_rows(x: jax.Array, y: jax.Array, pos: jax.Array, weights: jax.Array, params: dict[str, Any], config):
+    """The end of the layer from the experts' output y and each slot's row in it: `shared_combine` (residual,
+    shared experts and the routed sum, one kernel) or `combine_rows`."""
+    rows, w = slot_rows(y, pos), weights.T[:, :, None]
+    if not config.shared:
+        return combine_rows(x, rows, w)
+    s = params["shared"]
+    return shared_combine(x, params["norm"], s["w_gate"], s["w_up"], s["w_down"], rows, w)
+
+
 # --------------------------------------------------------------------------- the layer
 
 
@@ -495,15 +667,33 @@ def group_candidates(tokens: int, config: MoeConfig) -> tuple[int, ...]:
 
 def experts_call(normed: jax.Array, ids: jax.Array, params: dict[str, Any], config: MoeConfig, group: int):
     """The routed experts' kernel for tiles of `group` rows, its inputs, and the row of each (token, slot) in
-    its output: `expert_ffn` on rows padded to `group` (decode), `expert_ffn_blocks` from 128 rows."""
+    its output: `expert_ffn` on rows padded to `group` (decode), `expert_ffn_blocks` from 128 rows. (The
+    rows past an expert's are clamped gathers of real rows: their outputs are never read.)"""
     weights = (params["w_gate"], params["w_up"], params["w_down"])
     if group < BLOCK_GROUPS[0]:
         rows = capacity(ids.size, config.experts, group)
         d = dispatch(ids, config.experts, group, rows)
-        return expert_ffn, (gather(normed, d.src), *weights, tile_experts(d, group, rows)), d.pos
+        xs = jnp.take(normed, d.src, axis=0, mode="clip")
+        return expert_ffn, (xs, *weights, tile_experts(d, group, rows)), d.pos
     b = block_dispatch(ids, config.experts, group)
-    xs = gather(normed, b.src).reshape(-1, group // BLOCKS, normed.shape[1])
+    xs = jnp.take(normed, b.src, axis=0, mode="clip").reshape(-1, group // BLOCKS, normed.shape[1])
     return expert_ffn_blocks, (xs, *weights, b.tile_expert, b.tile_blocks), b.pos
+
+
+def decode_call(x: jax.Array, params: dict[str, Any], config: MoeConfig) -> tuple[autokernel.Kernel, tuple]:
+    """The kernel of a decode layer (`moe_decode`, or `moe_decode_shared`) and its inputs: routing in XLA
+    (fused RMSNorm and f32 router, as the baselines'), then each expert's token count and each token's
+    weight for it, (E, T, 1)."""
+    normed = rmsnorm(x, params["norm"])
+    ids, weights = route(normed, params["router"], params["bias"], config)
+    hot = one_hot(ids, config.experts)
+    counts = jnp.sum(hot, axis=(0, 1), dtype=jnp.int32)
+    expert_weights = jnp.sum(jnp.where(hot, weights[:, :, None], 0.0), axis=1).T[:, :, None]
+    args = (x, params["norm"], params["w_gate"], params["w_up"], params["w_down"], counts, expert_weights)
+    if not config.shared:
+        return moe_decode, args
+    s = params["shared"]
+    return moe_decode_shared, (*args, s["w_gate"], s["w_up"], s["w_down"])
 
 
 def expert_inputs(x: jax.Array, params: dict[str, Any], config: MoeConfig, group: int) -> tuple[Any, ...]:
@@ -519,21 +709,25 @@ def expert_inputs(x: jax.Array, params: dict[str, Any], config: MoeConfig, group
 
 
 def moe_layer(x: jax.Array, params: dict[str, Any], config: MoeConfig, group: int | None = None) -> jax.Array:
-    """x + MoE(rmsnorm(x)) for x (tokens, d_model): `norm_router`, the dispatch, the experts' kernel for tiles
-    of `group` rows (`default_group` unless given; `choose_group` measures) and the combine."""
+    """x + MoE(rmsnorm(x)) for x (tokens, d_model). Up to `DECODE_TOKENS` tokens: one kernel after the
+    routing (`decode_call`). More: `norm_router`, the dispatch, the experts' kernel for tiles of `group`
+    rows (`default_group` unless given; `choose_group` measures), the combine (`finish_rows`)."""
+    if x.shape[0] <= DECODE_TOKENS:
+        kernel, args = decode_call(x, params, config)
+        return kernel(*args)
     group = group or default_group(x.shape[0])
     normed, ids, weights = route_tokens(x, params, config)
     kernel, inputs, pos = experts_call(normed, ids, params, config, group)
-    return finish(x, combine(kernel(*inputs), pos, weights), params, config)
+    return finish_rows(x, kernel(*inputs), pos, weights, params, config)
 
 
 def moe_layer_ragged(x: jax.Array, params: dict[str, Any], config: MoeConfig) -> jax.Array:
     """The same with autokernel's megablox-style `gmm_swiglu` and `gmm_down` on unpadded rows."""
     normed, ids, weights = route_tokens(x, params, config)
     d = dispatch(ids, config.experts, 1, ragged_rows(ids.size))
-    h = gmm_swiglu(gather(normed, d.src), params["w_gate"], params["w_up"], d.starts, d.ends)
+    h = gmm_swiglu(jnp.take(normed, d.src, axis=0, mode="clip"), params["w_gate"], params["w_up"], d.starts, d.ends)
     y = gmm_down(h, params["w_down"], d.starts, d.ends)
-    return finish(x, combine(y, d.pos, weights), params, config)
+    return finish_rows(x, y, d.pos, weights, params, config)
 
 
 def choose_group(x: jax.Array, params: dict[str, Any], config: MoeConfig) -> int:
@@ -552,14 +746,20 @@ def choose_group(x: jax.Array, params: dict[str, Any], config: MoeConfig) -> int
 
 
 def experts_specs(config: MoeConfig, tokens: int, group: int) -> tuple[autokernel.Kernel, tuple[Any, ...]]:
-    """The experts' kernel `moe_layer` runs for `tokens` tokens and tiles of `group` rows, and its input specs
-    (for lowering it, or timing it from a profile)."""
+    """The experts' kernel `moe_layer` runs for `tokens` tokens and tiles of `group` rows (for decode, the
+    layer's one kernel), and its input specs (for lowering it, or timing it from a profile)."""
     d, e, f = config.d_model, config.experts, config.ffn
 
     def spec(*shape: int, dtype: Any = jnp.bfloat16) -> jax.ShapeDtypeStruct:
         return jax.ShapeDtypeStruct(shape, dtype)
 
     weights = (spec(e, d, f), spec(e, d, f), spec(e, f, d))
+    if tokens <= DECODE_TOKENS:
+        args = (spec(tokens, d), spec(1, d), *weights, spec(e, dtype=jnp.int32), spec(e, tokens, 1, dtype=jnp.float32))
+        if not config.shared:
+            return moe_decode, args
+        fs = config.shared_ffn
+        return moe_decode_shared, (*args, spec(d, fs), spec(d, fs), spec(fs, d))
     slots = tokens * config.top_k
     tiles = capacity(slots, e, group) // group
     if group < BLOCK_GROUPS[0]:

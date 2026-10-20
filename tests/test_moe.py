@@ -10,6 +10,8 @@ from helpers import f64, lower_for_v5e, rand, run_checking_races, spec
 from moe import (
     BLOCKS,
     CONFIGS,
+    CombineTiles,
+    DecodeTiles,
     ExpertTiles,
     GmmTiles,
     MoeConfig,
@@ -17,9 +19,13 @@ from moe import (
     SharedTiles,
     baseline,
     baseline_params,
+    best_groups,
     block_dispatch,
     capacity,
     choose_group,
+    combine_rows,
+    counts_before,
+    decode_call,
     default_group,
     dispatch,
     expert_ffn,
@@ -32,6 +38,8 @@ from moe import (
     group_candidates,
     init_params,
     megablox_tiling,
+    moe_decode,
+    moe_decode_shared,
     moe_layer,
     moe_layer_ragged,
     norm_router,
@@ -39,9 +47,11 @@ from moe import (
     rmsnorm,
     route,
     route_tokens,
+    shared_combine,
     shared_experts,
     split_router,
     tile_experts,
+    top_k,
 )
 
 SIGMOID = MoeConfig(256, 8, 2, 256, shared=1, scoring="sigmoid", n_group=4, topk_group=2, scale=2.5)
@@ -147,6 +157,24 @@ def test_routers_choose_and_weigh_experts_as_numpy(config):
     if config.n_group > 1:  # every expert chosen is in one of the token's best groups
         per_group = config.experts // config.n_group
         assert all(len(set(row)) <= config.topk_group for row in np.asarray(ids) // per_group)
+
+
+def test_top_k_and_best_groups_choose_as_lax_top_k_with_ties():
+    # Few distinct values: many ties, which both break toward the lower index.
+    values = jax.random.randint(jax.random.key(0), (64, 32), 0, 6).astype(jnp.float32)
+    np.testing.assert_array_equal(np.asarray(top_k(values, 5)), np.asarray(jax.lax.top_k(values, 5)[1]))
+    groups = values.reshape(64, 8, 4)
+    scores = jnp.sum(jax.lax.top_k(groups, 2)[0], axis=-1)
+    best = jax.lax.top_k(scores, 3)[1]
+    want = jnp.repeat(jnp.any(best[:, :, None] == jnp.arange(8), axis=1), 4, axis=1)
+    np.testing.assert_array_equal(np.asarray(best_groups(values, 8, 3)), np.asarray(want))
+
+
+def test_counts_before_is_an_exclusive_cumulative_sum():
+    counts = jax.random.randint(jax.random.key(1), (300, 7), 0, 3)  # 300 tokens: blocks of 256 and a partial one
+    want = np.cumsum(np.asarray(counts), axis=0) - np.asarray(counts)
+    np.testing.assert_array_equal(np.asarray(counts_before(counts)), want)
+    np.testing.assert_array_equal(np.asarray(counts_before(counts[:5])), want[:5])
 
 
 # --------------------------------------------------------------------------- dispatch
@@ -337,6 +365,47 @@ def test_shared_experts_against_numpy():
     shared_experts.verify(*args)
 
 
+@pytest.mark.parametrize("shared", [False, True])
+def test_combine_kernels_against_numpy(shared):
+    k, t, d, f = 3, 256, 256, 512
+    x, rows = rand((t, d), 0, jnp.bfloat16), rand((k, t, d), 1, jnp.bfloat16)
+    weights = jax.random.uniform(jax.random.key(2), (k, t, 1))
+    want = f64(x) + np.sum(f64(weights) * f64(rows), axis=0)
+    if shared:
+        gamma = (1 + 0.1 * rand((1, d), 2)).astype(jnp.bfloat16)
+        w_gate, w_up = rand((d, f), 3, jnp.bfloat16) / 16, rand((d, f), 4, jnp.bfloat16) / 16
+        w_down = rand((f, d), 5, jnp.bfloat16) / 23
+        kernel, args = (
+            shared_combine,
+            (x, gamma, w_gate, w_up, w_down, rows, weights, SharedTiles(rows=128, block_f=256)),
+        )
+        xf = f64(x)
+        want += _swiglu(xf / np.sqrt(np.mean(xf * xf, 1, keepdims=True) + 1e-6) * f64(gamma), w_gate, w_up, w_down)
+    else:
+        kernel, args = combine_rows, (x, rows, weights, CombineTiles(rows=128))
+    out = run_checking_races(kernel, *args)
+    np.testing.assert_allclose(f64(out), want, rtol=2e-2, atol=2e-2 * np.abs(want).max())
+    kernel.verify(*args)
+
+
+@pytest.mark.parametrize(("config", "tokens"), [(SOFTMAX, 8), (SIGMOID, 64)])
+def test_decode_kernels_run_each_chosen_expert_once_against_numpy(config, tokens):
+    params = init_params(config)
+    x = rand((tokens, config.d_model), 9, jnp.bfloat16)
+    kernel, args = decode_call(x, params, config)
+    assert kernel is (moe_decode_shared if config.shared else moe_decode)
+    if config.shared:
+        args = (*args, DecodeTiles(block_f=128))
+    out = run_checking_races(kernel, *args)
+    want = _moe(x, params, config)
+    np.testing.assert_allclose(f64(out), want, rtol=2e-2, atol=3e-2 * np.abs(want).max())
+    kernel.verify(*args)
+    # A step per expert some token chose (its weights read once), and the shared experts' blocks.
+    counts = args[5]
+    shared = config.shared_ffn // 128 if config.shared else 0
+    assert len(_steps(kernel.lower(*args), counts)) == int(np.sum(np.asarray(counts) > 0)) + shared
+
+
 # --------------------------------------------------------------------------- whole layers
 
 
@@ -452,6 +521,26 @@ def test_grouped_matmuls_lower_for_v5e(name, tokens, tm, tn):
     for kernel, specs in ((gmm_swiglu, up + groups), (gmm_down, down + groups)):
         lowered = kernel.lower(*specs, tiles)
         assert "tpu_custom_call" in lower_for_v5e(lowered, *specs)
+
+
+@pytest.mark.parametrize(("name", "tokens"), [("kimi-k2-small", 64), ("deepseek-v2-lite", 64), ("qwen3-30b-a3b", 8)])
+def test_decode_kernels_lower_for_v5e(name, tokens):
+    kernel, specs = experts_specs(CONFIGS[name], tokens, 16)
+    lowered = kernel.lower(*specs)
+    assert lowered.schedule.runtime and lowered.vmem_bytes < 96 * 2**20
+    assert "tpu_custom_call" in lower_for_v5e(lowered, *specs)
+
+
+@pytest.mark.parametrize(("tokens", "k", "shared"), [(4096, 8, 0), (16384, 6, 2816)])
+def test_combine_kernels_lower_for_v5e(tokens, k, shared):
+    rows = [spec(k, tokens, 2048, dtype=jnp.bfloat16), spec(k, tokens, 1)]
+    x = spec(tokens, 2048, dtype=jnp.bfloat16)
+    if shared:
+        weights = [spec(1, 2048), spec(2048, shared), spec(2048, shared), spec(shared, 2048)]
+        kernel, specs = shared_combine, [x, *(spec(*w.shape, dtype=jnp.bfloat16) for w in weights), *rows]
+    else:
+        kernel, specs = combine_rows, [x, *rows]
+    assert "tpu_custom_call" in lower_for_v5e(kernel.lower(*specs), *specs)
 
 
 def test_shared_experts_lower_for_v5e():
