@@ -1,6 +1,16 @@
-"""Causal matmul, tril(x @ y), skipping every tile above the diagonal.
+"""Causal matmul, `tril(x @ y)`, skipping every output tile above the diagonal.
 
-Run with `uv run python examples/causal_matmul.py`. Without a TPU it runs in the Pallas TPU interpreter.
+Output tiles fall into three groups:
+
+    . . . .     above the diagonal: skipped by the mask; the kernel writes them with the zeros of jnp.zeros
+    \\ . . .     on it: computed, then the entries above the diagonal zeroed by jnp.where
+    # \\ . .     below it: computed
+    # # \\ .
+
+autokernel evaluates the mask for every tile when it builds the kernel, so the kernel's step loop visits
+only the tiles that run; the skipped ones cost one DMA each, overlapping the compute.
+
+Run with `uv run python examples/causal_matmul.py`; without a TPU it runs in the Pallas TPU interpreter.
 """
 
 import jax
@@ -8,46 +18,36 @@ import jax.numpy as jnp
 
 import autokernel
 
-# out = tril(x @ y): every entry with col > row is zero.
-#
-# Output tiles fall into three groups relative to the diagonal:
-#
-#   . . . .     above: all zero -> `continue`, the tile keeps the zeros from jnp.zeros
-#   \ . . .     on:    computed, then entries with col > row zeroed by the jnp.where
-#   # \ . .     below: computed, the jnp.where keeps everything
-#   # # \ .
-#
-# autokernel evaluates the `if` for every tile at trace time and the kernel loops over only the tiles
-# that survive, so skipped tiles cost no math, no copies and no steps; their zeros are written by
-# async DMAs that overlap the compute.
-M, K, N = 1024, 1024, 1024
-TILE_M, TILE_N, TILE_K = 256, 256, 256
 
+def make_causal_matmul(tm: int = 512, tn: int = 512, tk: int = 512) -> autokernel.Kernel:
+    """`tril(x @ y)` for square x and y, in (tm, tn) output tiles summing (tk)-deep products."""
 
-@autokernel.tpu
-def causal_matmul(x, y):
-    out = jnp.zeros((M, N))
-    for i in range(0, M, TILE_M):
-        for j in range(0, N, TILE_N):
-            if j > i + TILE_M - 1:  # every entry of this tile is above the diagonal
-                continue
-            acc = jnp.zeros((TILE_M, TILE_N))
-            for k in range(0, K, TILE_K):
-                acc += x[i : i + TILE_M, k : k + TILE_K] @ y[k : k + TILE_K, j : j + TILE_N]
-            rows = i + jax.lax.broadcasted_iota(jnp.int32, (TILE_M, TILE_N), 0)
-            cols = j + jax.lax.broadcasted_iota(jnp.int32, (TILE_M, TILE_N), 1)
-            out = out.at[i : i + TILE_M, j : j + TILE_N].set(jnp.where(cols <= rows, acc, 0.0))
-    return out
+    @autokernel.kernel
+    def causal_matmul(x, y):
+        M, K = x.shape
+        N = y.shape[1]
+        dtype = x.dtype
+        out = jnp.zeros((M, N), dtype)
+        for i in range(0, M, tm):
+            for j in range(0, N, tn):
+                if j > i + tm - 1:  # the whole tile is above the diagonal
+                    continue
+                acc = jnp.zeros((tm, tn), jnp.float32)
+                for k in range(0, K, tk):
+                    acc += x[i : i + tm, k : k + tk] @ y[k : k + tk, j : j + tn]
+                rows = i + jax.lax.broadcasted_iota(jnp.int32, (tm, tn), 0)
+                cols = j + jax.lax.broadcasted_iota(jnp.int32, (tm, tn), 1)
+                out = out.at[i : i + tm, j : j + tn].set(jnp.where(cols <= rows, acc, 0.0).astype(dtype))
+        return out
+
+    return causal_matmul
 
 
 if __name__ == "__main__":
-    x = jax.random.normal(jax.random.PRNGKey(0), (M, K))
-    y = jax.random.normal(jax.random.PRNGKey(1), (K, N))
-
-    print(causal_matmul.source(x, y))
+    causal_matmul = make_causal_matmul(256, 256, 256)
+    x = jax.random.normal(jax.random.key(0), (1024, 1024), jnp.bfloat16)
+    y = jax.random.normal(jax.random.key(1), (1024, 1024), jnp.bfloat16)
     lowered = causal_matmul.lower(x, y)
-    print(f"computing {lowered.tiles} of {lowered.total_tiles} output tiles")
-
-    ref = jnp.tril(jnp.dot(x, y, precision="highest"))
-    print("max diff vs tril(jnp.dot):", jnp.max(jnp.abs(causal_matmul(x, y) - ref)))
-    print("max diff vs Python loops:", causal_matmul.verify(x, y))
+    print(lowered.source)
+    print(f"computes {lowered.tiles} of {lowered.total_tiles} output tiles")
+    print("max |kernel - loop nest|:", causal_matmul.verify(x, y))

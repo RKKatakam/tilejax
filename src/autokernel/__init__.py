@@ -1,68 +1,46 @@
-"""autokernel: compile Python tile loop nests into Pallas TPU kernels.
+"""autokernel: write a TPU v5e kernel as Python loops over tiles; get a gridless Pallas kernel.
 
-Write the tiling as ordinary Python loops and decorate it::
-
-    import jax.numpy as jnp
-    import autokernel
-
-    @autokernel.tpu
-    def matmul(x, y):
-        out = jnp.zeros((M, N))
-        for i in range(0, M, TM):
-            for j in range(0, N, TN):
-                acc = jnp.zeros((TM, TN))
-                for k in range(0, K, TK):
-                    acc += x[i:i + TM, k:k + TK] @ y[k:k + TK, j:j + TN]
-                out = out.at[i:i + TM, j:j + TN].set(acc)
-        return out
-
-Calling `matmul(x, y)` runs a generated gridless Pallas kernel; `matmul.source(x, y)` shows its code
-and `matmul.verify(x, y)` checks it against the Python loops.
-
-A function with several tile loop nests mixed with ordinary JAX code and Python control flow (a whole
-model) becomes a `TpuProgram`: every nest is its own kernel, and the code around them runs as JAX.
+- `@autokernel.kernel` compiles a loop nest over output tiles (see README.md); call the result like the
+  function: it runs the generated kernel (in the Pallas TPU interpreter off-TPU).
+- `kernel.source(*inputs)` is the generated Pallas source; `kernel.verify(*inputs)` checks the kernel
+  against the loop nest run as plain JAX.
+- `autokernel.profile(kernel, *inputs)` says where the time goes on a v5e, from `jax.named_scope` trace
+  regions; `autokernel.optimize(kernel, *inputs)` chooses the kernel's buffering from them.
 """
 
-import tomllib as _tomllib
-from importlib import metadata as _metadata
-from pathlib import Path as _Path
+from __future__ import annotations
 
-from .api import TpuKernel, tpu
-from .errors import AutoKernelError
-from .fusion import FusedLowered
-from .lowering import Lowered
-from .profiling import KernelProfile, Profile, enable_profiling, profile
-from .program import ProgramLowered, ProgramNest, TpuProgram
-from .tiles import tile
+from typing import Any
+
+from . import profiling
+from .api import Kernel, Lowered, kernel
+from .errors import KernelError
+from .pipeline import Pipeline
+from .profiling import KernelProfile, Optimization, enable_profiling
 
 __all__ = [
-    "AutoKernelError",
-    "FusedLowered",
+    "Kernel",
+    "KernelError",
     "KernelProfile",
     "Lowered",
-    "Profile",
-    "ProgramLowered",
-    "ProgramNest",
-    "TpuKernel",
-    "TpuProgram",
-    "__version__",
+    "Optimization",
+    "Pipeline",
     "enable_profiling",
+    "kernel",
+    "optimize",
     "profile",
-    "tile",
-    "tpu",
 ]
-_PYPROJECT = _Path(__file__).resolve().parents[2] / "pyproject.toml"
+
+__version__ = "0.6.0"
 
 
-def _source_version() -> str:
-    """The version in the source tree's pyproject.toml (running from a checkout that isn't installed)."""
-    try:
-        return _tomllib.loads(_PYPROJECT.read_text())["project"]["version"]
-    except (OSError, KeyError, ValueError):
-        return "0+unknown"
+def profile(kernel: Kernel, *inputs: Any, runs: int = 5) -> KernelProfile:
+    """Where `kernel`'s time goes on a TPU v5e for these inputs: device time, input waits, compute, output
+    waits and the tile code's own `jax.named_scope`s. Call `enable_profiling()` first for the breakdown."""
+    return profiling.profile(kernel, inputs, runs=runs)
 
 
-try:
-    __version__ = _metadata.version("autokernel")
-except _metadata.PackageNotFoundError:  # running from a source tree that isn't installed
-    __version__ = _source_version()
+def optimize(kernel: Kernel, *inputs: Any, runs: int = 5) -> Optimization:
+    """Choose `kernel`'s buffering for inputs like these from its profiles on a TPU v5e (needs
+    `enable_profiling()`); the kernel uses it from then on."""
+    return profiling.optimize(kernel, inputs, runs=runs)

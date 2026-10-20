@@ -1,11 +1,11 @@
 [project]
 name = "autokernel"
-version = "0.4.0"
-description = "Compile Python tile loop nests into Pallas TPU kernels"
+version = "0.6.0"
+description = "Compile Python tile loops into gridless Pallas kernels for TPU v5e"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "jax>=0.11.2,<0.12",  # uses jax._src internals (Pallas TPU interpreter, cost analysis)
+    "jax>=0.11.2,<0.12",  # uses jax._src internals (the Pallas TPU interpreter, weak types)
     "numpy>=2.1",
 ]
 keywords = ["jax", "pallas", "tpu", "compiler", "kernels"]
@@ -37,25 +37,24 @@ packages = ["src/autokernel"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = ["-ra", "--strict-markers"]
+markers = [
+    "tpu: needs a TPU v5e (skipped elsewhere)",
+    "cpu: simulates hardware behaviour in the interpreter (skipped on a TPU)",
+]
 filterwarnings = [
     "error",
-    # Expected off-TPU: kernels run in the Pallas TPU interpreter.
-    "ignore:autokernel. no TPU found:UserWarning",
     # TPU VMs without transparent hugepages (e.g. Colab): JAX warns at import; harmless for tests.
     "ignore:.*[Tt]ransparent hugepages:UserWarning",
-    # Tests use small blocks on purpose; on a TPU autokernel suggests tuning them.
-    "ignore:autokernel. .*too small to hide:UserWarning",
 ]
 
 [tool.ruff]
 line-length = 120
 target-version = "py312"
-extend-exclude = [".venv"]
+extend-exclude = [".venv", "*.md"]  # Markdown code blocks keep their aligned comments
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
 ignore = [
-    "B023",  # closures over loop variables are intentional in the generated-code helpers
     "RUF001",  # en dashes and similar in prose are fine
     "SIM108",  # ternaries aren't always clearer
 ]
@@ -63,18 +62,13 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "examples/*" = ["E402"]
 "benchmarks/*" = ["E402"]
+"tests/test_parse.py" = ["B007", "F841"]  # kernel functions that are parsed, never run
 
 [tool.coverage.run]
 source = ["autokernel"]
-branch = false
-# The sharding tests run pytest in a child process (JAX fixes its device count when it starts): measure it too.
-patch = ["subprocess"]
-parallel = true
+branch = true
 
 [tool.coverage.report]
 show_missing = true
 skip_covered = true
-exclude_also = [
-    "if TYPE_CHECKING:",
-    "raise AssertionError\\(.*analysis bug",
-]
+fail_under = 100

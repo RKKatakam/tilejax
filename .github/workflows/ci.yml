@@ -16,7 +16,9 @@ jobs:
       - run: uv sync --locked
       - run: uv run ruff check .
       - run: uv run ruff format --check .
-      # On CPU: kernels run in the Pallas TPU interpreter, and are cross-lowered to Mosaic for a v5e.
-      - run: uv run pytest
-      - run: uv run python examples/tiled_matmul.py
+      # On CPU: kernels run in the Pallas TPU interpreter and are cross-lowered to Mosaic for a v5e.
+      # Coverage must be 100% (lines and branches; see pyproject.toml).
+      - run: uv run pytest --cov=autokernel
+      - run: uv run python examples/matmul.py
       - run: uv run python examples/causal_matmul.py
+      - run: uv run python examples/causal_attention.py

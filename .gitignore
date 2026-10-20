@@ -21,3 +21,6 @@ dumps/
 # Coverage data
 .coverage
 .coverage.*
+
+# TPU runs
+tpu-run.txt
