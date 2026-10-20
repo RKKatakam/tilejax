@@ -421,12 +421,9 @@ def test_prefill_and_decode_natively_match_the_baselines():
     params = init_params(config)
     plain = baseline_params(params)
     prompts = jax.random.randint(jax.random.key(1), (2, 2048), 0, config.vocab)
-    # Plain JAX's f32 router matmul is one bf16 pass on a TPU (ours is accurate to 2^-17): at full precision,
-    # both route the same tokens to the same experts.
-    with jax.default_matmul_precision("highest"):
-        theirs, their_cache, lengths = baseline_prefill()(prompts, plain, 2304)
-        token = jnp.argmax(theirs, axis=-1).astype(I32)[:, None]
-        their_step, _, _ = baseline_decode_step()(token, jax.tree.map(jnp.copy, their_cache), lengths, plain)
+    theirs, their_cache, lengths = baseline_prefill()(prompts, plain, 2304)
+    token = jnp.argmax(theirs, axis=-1).astype(I32)[:, None]
+    their_step, _, _ = baseline_decode_step()(token, jax.tree.map(jnp.copy, their_cache), lengths, plain)
     for form in ("folded", "factored"):
         packed = pack(params, decode=form)
         ours, cache, lengths = prefill(prompts, packed, max_len=2304)

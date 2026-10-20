@@ -478,11 +478,12 @@ def route(normed: jax.Array, w_router: jax.Array, bias: jax.Array, config: MoeCo
 
 
 def route_tokens(x: jax.Array, params: dict[str, Any], config: MoeConfig) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """rmsnorm(x), each token's experts and their weights: `norm_router`, then `route_logits`. (Its logits
-    and XLA's f32 ones differ by rounding, so a token at a near tie between two experts may take the other.)"""
-    split = params.get("router_split") or split_router(params["router"])
-    normed, logits = norm_router(x, params["norm"], *split)
-    return normed, *route_logits(logits, params["bias"], config)
+    """rmsnorm(x), each token's experts and their weights, as the baselines route (XLA's RMSNorm and f32
+    router). (`norm_router` fuses the two, but rounds the normalized rows an ulp apart from XLA: a token at a
+    near tie then takes another expert, and the model's outputs drift from the reference model's: on a v5e,
+    DeepSeek-like prefill logits correlated 0.975 with the baseline's. So routing stays XLA's.)"""
+    normed = rmsnorm(x, params["norm"])
+    return normed, *route(normed, params["router"], params["bias"], config)
 
 
 # --------------------------------------------------------------------------- dispatch and combine
