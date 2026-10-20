@@ -339,12 +339,9 @@ def _qkv_call(config: ModelConfig, x: tuple[int, ...], positions: int) -> Kernel
 
 
 def _experts_call(config: ModelConfig, tokens: int, group: int | None) -> KernelCall:
-    m = config.moe
     group = group or moe.default_group(tokens)
-    rows = moe.capacity(tokens * m.top_k, m.experts, group)
-    specs = _specs((rows, m.d_model), (m.experts, m.d_model, m.ffn), (m.experts, m.d_model, m.ffn))
-    specs += _specs((m.experts, m.ffn, m.d_model)) + _specs((rows // group,), dtype=jnp.int32)
-    return KernelCall("moe", f"experts (group {group})", moe.expert_ffn, specs)
+    kernel, specs = moe.experts_specs(config.moe, tokens, group)
+    return KernelCall("moe", f"experts (group {group})", kernel, specs)
 
 
 def _logits_call(config: ModelConfig, rows: int) -> KernelCall:
