@@ -1050,14 +1050,17 @@ class _TileCode:
         if (
             update is not None
             and update.output in plan.carried
-            and update.output not in self.renamed
             and set().union(*(reads(i) for i in update.index)) <= scalars
-        ):  # `a = a.at[index].set(v)` of a carried value in its VMEM buffer: store just that part
+        ):  # `a = a.at[index].set(v)` of a carried value: store just that part of its VMEM buffer
             ref, index = gen.refs[update.output], ", ".join(ast.unparse(self._expr(i)) for i in update.index)
             value = _parse_expr(
                 f"jnp.broadcast_to(VALUE, {ref}.at[{index}].shape).astype({ref}.dtype)", VALUE=self._expr(update.value)
             )
-            return [_parse_stmt(f"{ref}[{index}] = VALUE", VALUE=value)]
+            stores = []
+            if update.output in self.renamed:  # a value on its way, in a local: into the buffer first
+                local = self.renamed.pop(update.output)
+                stores.append(_parse_stmt(f"{ref}[...] = jnp.broadcast_to({local}, {ref}.shape).astype({ref}.dtype)"))
+            return [*stores, _parse_stmt(f"{ref}[{index}] = VALUE", VALUE=value)]
         types_ = plan.assigned_types.get(id(stmt), {})
         original = stmt
         if isinstance(stmt, ast.AugAssign):  # `a op= b` is `a = a op b` (arrays are immutable)

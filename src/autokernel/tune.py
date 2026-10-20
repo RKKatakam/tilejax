@@ -262,7 +262,7 @@ def _measure(kernel: Kernel, signature: Signature, config: Config, inputs: Seque
 
     try:
         for name, g, w in zip(kernel.nest.outputs, _outputs(got), _outputs(want), strict=True):
-            compare(f"output {name!r}", g, w)
+            compare(f"output {name!r}", g, w, inputs=tuple(dtype for _, dtype in signature))
     except AssertionError as e:
         return Trial(config, error=f"wrong result: {e}")
     return Trial(config, profiling.measure(lowered, inputs, RUNS))

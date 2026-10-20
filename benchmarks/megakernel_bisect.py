@@ -32,7 +32,7 @@ def largest(a: jnp.ndarray, b: jnp.ndarray) -> float:
 
 def main() -> None:
     tiles = MegaTiles(block_d=256, block_kv=256, block_a=512, block_f=512, block_v=1024)
-    for layers, d, h, hkv, ffn in [(1, 256, 2, 1, 512), (1, 2048, 16, 8, 6144)]:
+    for layers, d, h, hkv, ffn in [(2, 256, 2, 1, 512), (2, 2048, 16, 8, 6144)]:
         config = Config(layers=layers, d_model=d, heads=h, kv_heads=hkv, ffn=ffn, vocab=2048)
         params = init_params(config, seed=0)
         for s_max in (4096, 5120, 6144, 7168, 8192):

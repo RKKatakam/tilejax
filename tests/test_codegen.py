@@ -797,3 +797,22 @@ def test_a_helpers_generator_expressions_read_globals_too():
     x = rand((16, 128))
     np.testing.assert_allclose(f64(run_checking_races(kernel, x)), 4 * f64(x), rtol=1e-6)
     assert "def double_it(v):" in kernel.source(x)
+
+
+def test_a_value_the_tile_updates_part_of_lives_in_vmem():
+    # Mosaic can't update part of a value in registers: a value updated in place is kept in VMEM.
+    kernel = make_kernel(
+        """
+        def f(x):
+            out = jnp.zeros((2, 8, 128))
+            for i in range(0, 8, 8):
+                acc = jnp.zeros((2, 8, 128))
+                acc = acc.at[0].set(x[i : i + 8, :])
+                out = out.at[:, i : i + 8, :].set(acc)
+            return out
+        """
+    )
+    x = rand((8, 128))
+    out = check(kernel, x)
+    np.testing.assert_allclose(f64(out[0]), f64(x)) and np.testing.assert_allclose(f64(out[1]), 0.0)
+    assert "acc_ref[0] = " in kernel.source(x)

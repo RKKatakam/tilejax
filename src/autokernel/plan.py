@@ -41,7 +41,7 @@ from jax._src import source_info_util
 from . import mxu, v5e
 from .errors import KernelError
 from .parse import Loop, Nest
-from .tilecode import assigned, element_reads, first_reads, flatten, reads
+from .tilecode import as_store, assigned, element_reads, first_reads, flatten, reads
 
 __all__ = [
     "Carried",
@@ -306,7 +306,10 @@ class _Planner:
         output_tiles = {name: self._output_tile(name, *outputs[name], parallel) for name in self.nest.outputs}
         self._check_reads_before_assignment()
         sequence = _Sequence(phases, segments, repeats)
-        carried_names = sequence.carried() - set(self.nest.outputs)
+        # Values the tile code updates part of (`a = a.at[k].set(v)`) live in VMEM too: Mosaic can't update
+        # part of a value in registers (no scatter, no dynamic_update_slice), only store into a buffer.
+        updated = {store.output for stmt in flatten(self.nest.tile) if (store := as_store(stmt))}
+        carried_names = (sequence.carried() | updated) - set(self.nest.outputs)
         scopes = self._scopes()
         types = _TypeTrace(self, operands, reads_, carried_names, sequence).run()
         for name in self.nest.outputs:
@@ -945,7 +948,7 @@ class _TypeTrace:
             segments = [label for label, _ in self.regions if label.startswith("seg")]
             kept = next(
                 (t for t in (self._last(b, name) for b in bodies) if t is not None),
-                next((t for t in (self._last(s, name) for s in reversed(segments)) if t is not None), None),
+                next((t for t in (self._last(s, name) for s in [*reversed(segments), _LAST]) if t is not None), None),
             )
             node = self._assignment(name)
             if kept is None or not kept.shape:

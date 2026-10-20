@@ -150,8 +150,9 @@ class Kernel:
             arrays = (*arrays, tunable if tunable is not None else self.lower(*arrays).config.tunable)
         got, want = self(*arrays), self.reference(*arrays)
         got, want = (got, want) if isinstance(got, tuple) else ((got,), (want,))
+        dtypes = tuple(dtype for _, dtype in self.signature(*arrays[: len(self.nest.params)]))
         errors = [
-            compare(f"{self.nest.name} output {name!r}", g, w, rtol, atol)
+            compare(f"{self.nest.name} output {name!r}", g, w, rtol, atol, dtypes)
             for name, g, w in zip(self.nest.outputs, got, want, strict=True)
         ]
         return max(errors)
@@ -257,14 +258,24 @@ def _load(source: str, filename: str, entry: str) -> Callable[..., Any]:
     return namespace[entry]
 
 
-def compare(what: str, got: Any, want: Any, rtol: float | None = None, atol: float | None = None) -> float:
+def compare(
+    what: str,
+    got: Any,
+    want: Any,
+    rtol: float | None = None,
+    atol: float | None = None,
+    inputs: tuple[Any, ...] = (),
+) -> float:
     """The largest absolute difference between `got` and `want`; AssertionError if they disagree beyond
-    `rtol` and `atol` (default: exact for integers, 1e-4 for f32, 2e-2 of the largest value for 16-bit)."""
+    `rtol` and `atol` (default: exact for integers, 1e-4 for f32, 2e-2 of the largest value for 16-bit, also
+    for an f32 result computed from 16-bit inputs, the dtypes `inputs`: Mosaic and XLA may round its 16-bit
+    intermediates one ulp apart)."""
     g, w = np.asarray(got, np.float64), np.asarray(want, np.float64)
     dtype = np.dtype(want.dtype)
+    narrow = any(jnp.issubdtype(d, jnp.floating) and np.dtype(d).itemsize <= 2 for d in inputs)
     if not jnp.issubdtype(dtype, jnp.inexact):
         default = 0.0
-    elif dtype.itemsize <= 2:
+    elif dtype.itemsize <= 2 or narrow:
         default = 2e-2
     else:
         default = 1e-4
