@@ -85,6 +85,7 @@ from gemma4_kernels import (
 B16, F32, I32 = jnp.bfloat16, jnp.float32, jnp.int32
 EPS = 1e-6
 LANES = 128
+PREFILL_CHUNK = 8192  # tokens per prefill chunk
 SLIDING, FULL = "sliding_attention", "full_attention"
 E2B_TYPES = tuple(FULL if layer % 5 == 4 else SLIDING for layer in range(35))
 
@@ -540,9 +541,16 @@ def prefill(
     params: dict[str, Any], ids: jax.Array, lengths: jax.Array, max_len: int, tiles: Tiles = Tiles()
 ) -> tuple[jax.Array, list[dict[str, jax.Array]], jax.Array]:
     """Prompts ids (B, S), prompt b being its first lengths[b] tokens (the rest padding): the logits (B, V)
-    at each prompt's last token, the KV caches (`empty_caches`' shapes) and the lengths."""
+    at each prompt's last token, the KV caches (`empty_caches`' shapes) and the lengths. Big batches run in
+    chunks of about PREFILL_CHUNK tokens (all their activations and per-layer inputs at once would take
+    gigabytes; a chunk's row tiles are plenty to keep the kernels busy)."""
     c: Config = params["config"]
-    x, kv = prefill_hidden(params, ids, tiles)
+    b, s = ids.shape
+    fits = max(1, PREFILL_CHUNK // (-(-s // LANES) * LANES))
+    chunk = max(n for n in range(1, min(fits, b) + 1) if b % n == 0)
+    parts = [prefill_hidden(params, ids[i : i + chunk], tiles) for i in range(0, b, chunk)]
+    x = jnp.concatenate([x for x, _ in parts])
+    kv = {i: tuple(jnp.concatenate([kv[i][n] for _, kv in parts]) for n in (0, 1)) for i in parts[0][1]}
     last = jnp.take_along_axis(x, (lengths - 1)[:, None, None], axis=1)[:, 0]
     logits = _call(lm_head, last, params["final_norm"], params["embed"], tiles=tiles.head)
     return logits, fill_caches(c, kv, lengths, max_len), lengths
