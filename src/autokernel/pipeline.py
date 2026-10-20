@@ -47,7 +47,12 @@ class Pipeline:
 
     def slots(self, kind: Kind) -> int:
         """VMEM slots for an input tile of this kind."""
-        return {Kind.STREAM: self.input_buffers, Kind.TILE: TILE_SLOTS, Kind.ONCE: 1}[kind]
+        return {
+            Kind.STREAM: self.input_buffers,
+            Kind.ITERATION: self.input_buffers,
+            Kind.TILE: TILE_SLOTS,
+            Kind.ONCE: 1,
+        }[kind]
 
     def __str__(self) -> str:
         return f"{self.input_buffers} input / {self.output_buffers} output buffers"
@@ -68,11 +73,14 @@ def fits(plan: Plan, schedule: Schedule, pipeline: Pipeline) -> bool:
 
 def default_pipeline(plan: Plan, schedule: Schedule) -> Pipeline:
     """Three input slots where they fit in VMEM (on a v5e, a 512^3-tile bf16 matmul ran 15% faster with
-    three than with two), else two; raises KernelError if not even two fit."""
-    for pipeline in (Pipeline(3, 2), Pipeline(2, 2)):
+    three than with two), else two; two output slots, or one if each output is stored once (a kernel of one
+    tile); raises KernelError if not even two input slots fit."""
+    stores = max(schedule.tiles if out.phase is None else schedule.phase_steps[out.phase] for out in plan.outputs)
+    outputs = min(2, stores)
+    for pipeline in (Pipeline(3, outputs), Pipeline(2, outputs)):
         if fits(plan, schedule, pipeline):
             return pipeline
-    need = vmem_bytes(plan, schedule, Pipeline(2, 2))
+    need = vmem_bytes(plan, schedule, Pipeline(2, outputs))
     raise KernelError(
         f"{plan.nest.name}: its tiles need {need / 2**20:.1f} MiB of VMEM double-buffered, more than the "
         f"{v5e.VMEM_BUDGET / 2**20:.0f} MiB a kernel can use: use smaller tiles"

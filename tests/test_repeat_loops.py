@@ -7,6 +7,7 @@ import pytest
 from helpers import f64, lower_for_v5e, make_kernel, rand, run_checking_races, spec
 
 from autokernel import Config, KernelError, Pipeline
+from autokernel.tune import _stats
 
 
 def check(kernel, *inputs, pipeline=None):
@@ -64,17 +65,20 @@ def test_layers_in_one_kernel(pipeline):
     plan, sch = lowered.plan, lowered.schedule
     assert [(r.range.var, r.first, r.last) for r in plan.repeats] == [("l", 0, 1)]
     assert set(plan.carried) == {"h", "n", "y"} and lowered.steps == 2 * 3 * 2
-    # The layer's weights (and norm, read before its loop) stream with the loop: fetched an iteration ahead.
+    # The layer's weights stream with its loop, and its norm is fetched once per layer: an iteration ahead.
     assert {op.name: (op.kind.value, op.phase) for op in plan.operands} == {
         "x": ("tile", None),
-        "gamma": ("stream", 0),
+        "gamma": ("iteration", 0),  # fetched once per layer
         "w_up": ("stream", 0),
         "w_down": ("stream", 0),
     }
     assert [sch.iteration_at(s) for s in range(lowered.steps)] == [0, 0, 1, 1, 2, 2] * 2
     src = lowered.source
     ahead = lowered.pipeline.input_buffers - 1  # (tuned on a TPU)
-    assert f"ahead_tile, ahead_ph, ahead_rb, ahead_kb, _, _ = step(s + {ahead})" in src
+    assert f"ahead_tile, ahead_ph, ahead_rb, ahead_kb, ahead_first, _ = step(s + {ahead})" in src
+    # Copies the tuner counts: x and out per tile, gamma per layer of a tile, the weights per step.
+    tile, layer, block = 128 * 128 * 4, 128 * 4, 2 * 128 * 128 * 4
+    assert _stats(plan, sch).dma_bytes == 2 * tile + 2 * 3 * layer + 12 * block + 2 * tile
     assert "w_up_hbm.at[rb, :, pl.ds(kb * 128, 128)]" in src and "@pl.when(rb == 2)" in src
 
 

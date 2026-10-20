@@ -571,7 +571,12 @@ class _Generator:
     def _operand_copy_fn(self, w: _Writer, op: Operand) -> None:
         buf, sem, at, kb, slot = self.bufs[op.name], self.sems[op.name], self.n_at, self.n_kb, self.n_slot
         rb = f"{self.n_rb}, " if self.repeated else ""
-        args = {Kind.STREAM: f"{at}, {rb}{kb}, {slot}", Kind.TILE: f"{at}, {slot}", Kind.ONCE: ""}[op.kind]
+        args = {
+            Kind.STREAM: f"{at}, {rb}{kb}, {slot}",
+            Kind.ITERATION: f"{at}, {rb}{slot}",
+            Kind.TILE: f"{at}, {slot}",
+            Kind.ONCE: "",
+        }[op.kind]
         with w.block(f"def {self.copy_fns[op.name]}({args}):"):
             w(f"# {op.tile.text}")
             block_of = {r.var: self.blk[r.var] for r in self.plan.parallel}
@@ -580,7 +585,7 @@ class _Generator:
             for r in self.plan.reductions:  # only the operand's own phase's loop moves it
                 block_of[r.var] = kb if op.phase is not None and self.plan.phases[op.phase].range is r else "0"
             for r in self.plan.repeat_loops:  # (repeat loops move only streamed operands)
-                block_of[r.var] = self.n_rb if op.kind is Kind.STREAM and self.repeated else "0"
+                block_of[r.var] = self.n_rb if op.kind in (Kind.STREAM, Kind.ITERATION) and self.repeated else "0"
             src = f"{self.hbm[op.tile.array]}.at[{self._window_index(op.tile, block_of)}]"
             dst = (buf, sem) if op.kind is Kind.ONCE else (f"{buf}.at[{slot}]", f"{sem}.at[{slot}]")
             w(f"return pltpu.make_async_copy({src}, {dst[0]}, {dst[1]})")
@@ -661,30 +666,50 @@ class _Generator:
             # (A shared window's slot flips when it moves: tile 0's moves into slot 0.)
             w(*[f"{self.tile_slots}[{k}] = 1" for k in range(len(self.shared))])
         streamed = [op for op in plan.operands if op.kind is Kind.STREAM]
+        iterated = [op for op in plan.operands if op.kind is Kind.ITERATION]
         ahead = min(self.pipeline.input_buffers - 1, sch.steps)
-        if not (streamed and ahead):
+        if not ((streamed or iterated) and ahead):
             return
         w(f"# The first {ahead} step(s)' inputs.")
         if sch.runtime:  # the steps are known only now
-            names = ("first_tile", "first_ph", "first_rb", "first_kb", "first_empty")
-            tile, ph, rb, kb, empty = (self.local(name) for name in names)
+            names = ("first_tile", "first_ph", "first_rb", "first_kb", "first_first", "first_empty")
+            tile, ph, rb, kb, first, empty = (self.local(name) for name in names)
             for step in range(ahead):
                 with self._when(w, f"{step} < {self.n_steps}", f"_first_inputs{step}"):
-                    w(f"{self._targets(tile, ph, rb, kb, '_', '_', empty)} = {self.n_step}({step})")
+                    w(f"{self._targets(tile, ph, rb, kb, first, '_', empty)} = {self.n_step}({step})")
                     for phase, ops in self._by_phase(streamed).items():
                         with self._when(w, self._runs(ph, phase, empty), f"_first_phase{phase}"):
                             for op in ops:
                                 at = f"{self.n_blocks}({tile})"
                                 w(f"{self.copy_fns[op.name]}({at}, {self._rb(rb)}{kb}, {step}).start()")
+                    self._fetch_iterated(w, iterated, tile, ph, rb, first)
             return
         for step in range(ahead):
             tile, phase, kb = sch.step_at(step)
+            at, rb = sch.blocks_at(tile), str(sch.iteration_at(step))
+            for op in iterated:
+                if op.phase == phase and sch.first_at(step):
+                    w(f"{self.copy_fns[op.name]}({at}, {rb}, {self._iteration_slot(op, str(tile), rb)}).start()")
             if sch.empty_at(step):
                 continue
-            at = sch.blocks_at(tile)
             for op in streamed:
                 if op.phase in (None, phase):
-                    w(f"{self.copy_fns[op.name]}({at}, {self._rb(str(sch.iteration_at(step)))}{kb}, {step}).start()")
+                    w(f"{self.copy_fns[op.name]}({at}, {self._rb(rb)}{kb}, {step}).start()")
+
+    def _iteration_slot(self, op: Operand, tile: str, rb: str) -> str:
+        """The slot of an operand fetched once per repeat loop iteration: its iterations, counted over tiles,
+        take the ring's slots in turn."""
+        count = self.plan.repeats[self.plan.phases[op.phase].repeat].range.count  # type: ignore[index]
+        return _int_expr(f"{tile} * {count} + {rb}", "%", self.pipeline.input_buffers)
+
+    def _fetch_iterated(self, w: _Writer, ops: list[Operand], tile: str, ph: str, rb: str, first: str) -> None:
+        """Start the copies of the operands fetched once per iteration for a step that is its phase's first."""
+        for phase, group in self._by_phase(ops).items():
+            cond = f"({ph} == {phase}) & {first}" if len(self.plan.phases) > 1 else first
+            with self._when(w, cond, f"_iteration_inputs{phase}"):
+                for op in group:
+                    slot = self._iteration_slot(op, tile, rb)
+                    w(f"{self.copy_fns[op.name]}({self.n_blocks}({tile}), {rb}, {slot}).start()")
 
     def _region(self, w: _Writer, region: str) -> Any:
         if not self.trace:
@@ -760,17 +785,20 @@ class _Generator:
             w(f"{at} = {self.n_blocks}({tile})")
 
             streamed = [op for op in plan.operands if op.kind is Kind.STREAM]
+            iterated = [op for op in plan.operands if op.kind is Kind.ITERATION]
             depth = pipe.input_buffers
-            if streamed:
+            if streamed or iterated:
                 with self._when(w, f"{s} + {depth - 1} < {steps}", "_fetch_ahead"):
                     ahead_tile, ahead_ph = self.local("ahead_tile"), self.local("ahead_ph")
                     ahead_kb, ahead_empty = self.local("ahead_kb"), self.local("ahead_empty")
-                    ahead_rb = self.local("ahead_rb")
+                    ahead_rb, ahead_first = self.local("ahead_rb"), self.local("ahead_first")
                     if self.single:
                         w(f"{ahead_tile}, {ahead_kb} = {s} + {depth - 1}, 0")
                     else:
-                        targets = self._targets(ahead_tile, ahead_ph, ahead_rb, ahead_kb, "_", "_", ahead_empty)
+                        first_ = ahead_first if iterated else "_"
+                        targets = self._targets(ahead_tile, ahead_ph, ahead_rb, ahead_kb, first_, "_", ahead_empty)
                         w(f"{targets} = {self.n_step}({s} + {depth - 1})")
+                    self._fetch_iterated(w, iterated, ahead_tile, ahead_ph, ahead_rb, ahead_first)
                     ahead_slot = _int_expr(f"{s} + {depth - 1}", "%", depth)
                     for phase, ops in self._by_phase(streamed).items():
                         with self._when(w, self._runs(ahead_ph, phase, ahead_empty), f"_fetch_phase{phase}"):
@@ -781,7 +809,7 @@ class _Generator:
 
             per_tile = [op for op in plan.operands if op.kind is Kind.TILE]
             slots = {Kind.STREAM: _int_expr(s, "%", depth), Kind.TILE: _int_expr(tile, "%", TILE_SLOTS)}
-            with self._region(w, WAIT) if per_tile or streamed else nullcontext():  # (no region to leave empty)
+            with self._region(w, WAIT) if per_tile or streamed or iterated else nullcontext():  # (none empty)
                 if per_tile:
                     with self._when(w, tile_first, "_tile_inputs"):
                         self._tile_inputs(w, per_tile, slots[Kind.TILE])
@@ -789,9 +817,20 @@ class _Generator:
                     with self._when(w, self._runs(ph, phase, empty), f"_wait_phase{phase}"):
                         for op in ops:
                             w(f"{self.copy_fns[op.name]}({at}, {self._rb(self.n_rb)}{kb}, {slots[Kind.STREAM]}).wait()")
+                for phase, ops in self._by_phase(iterated).items():
+                    cond = f"({ph} == {phase}) & {first}" if len(plan.phases) > 1 else first
+                    with self._when(w, cond, f"_wait_iteration{phase}"):
+                        for op in ops:
+                            slot = self._iteration_slot(op, tile, self.n_rb)
+                            w(f"{self.copy_fns[op.name]}({at}, {self.n_rb}, {slot}).wait()")
             for op in plan.operands:
                 buf = self.bufs[op.name]
-                slot = f"{self.tile_slots}[{self.shared.index(op)}]" if op in self.shared else slots.get(op.kind)
+                if op in self.shared:
+                    slot = f"{self.tile_slots}[{self.shared.index(op)}]"
+                elif op.kind is Kind.ITERATION:
+                    slot = self._iteration_slot(op, tile, self.n_rb)
+                else:
+                    slot = slots.get(op.kind)
                 view = buf if op.kind is Kind.ONCE else f"{buf}.at[{slot}]"
                 w(f"{self.views[op.name]} = {view}")
             self._loop_vars(w)

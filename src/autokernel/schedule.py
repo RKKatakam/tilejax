@@ -103,6 +103,10 @@ class Schedule:
         phase_block = (int(self.tables[STEP_CODE][r]) >> CODE_SHIFT) // self.iterations
         return tile, phase_block % len(self.phase_counts), phase_block // len(self.phase_counts)
 
+    def first_at(self, step: int) -> bool:
+        """Is the step its phase's first (in its repeat loop iteration)? (Steps found through tables.)"""
+        return bool(self.tables[STEP_CODE][step % self.pattern_steps] & 2)
+
     def iteration_at(self, step: int) -> int:
         """The iteration of its repeat loop a step's phase is in (0 outside repeat loops)."""
         if not self.step_tables:

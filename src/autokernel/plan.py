@@ -112,6 +112,8 @@ class Kind(Enum):
 
     STREAM = "stream"  # every step (of its phase): a ring of slots, fetched ahead
     TILE = "tile"  # every output tile: two slots, the next tile's fetched at a tile's first step
+    # every iteration of a repeat loop (and tile): a ring of slots, fetched ahead for its phase's first step
+    ITERATION = "iteration"
     ONCE = "once"  # never: fetched once, before the first step
 
 
@@ -577,6 +579,8 @@ class _Planner:
                 continue
             if not moving:
                 kind = Kind.ONCE
+            elif (node.lineno, node.col_offset) in self.read_phases:  # only repeat (and parallel) loops move it
+                kind = Kind.ITERATION
             elif phase is not None or not phases:
                 kind = Kind.STREAM
             else:

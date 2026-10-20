@@ -135,6 +135,8 @@ class _Stats:
 
 def _stats(plan: Plan, schedule: Schedule) -> _Stats:
     def copies(op: Operand) -> int:
+        if op.kind is Kind.ITERATION:
+            return schedule.tiles * sum(1 for p, _ in plan.instances if p == op.phase)
         if op.kind is Kind.STREAM:
             return schedule.steps if op.phase is None else schedule.phase_steps[op.phase]
         return schedule.tiles if op.kind is Kind.TILE else 1
