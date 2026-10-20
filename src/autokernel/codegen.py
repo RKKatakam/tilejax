@@ -1261,12 +1261,23 @@ class _Definitions:
             )
         closure = inspect.getclosurevars(fn)
         read = {**closure.globals, **closure.nonlocals}
+        # (getclosurevars misses the globals of the code inside: generator expressions, lambdas.)
+        read |= {n: fn.__globals__[n] for n in _inner_names(fn.__code__) if n in fn.__globals__}
         for default in [*fdef.args.defaults, *(d for d in fdef.args.kw_defaults if d is not None)]:
             read |= {n: fn.__globals__[n] for n in reads(default) if n in fn.__globals__}  # evaluated at `def`
         for inner, value in read.items():
             self._define(inner, value, via)
         alias = f"\n\n\n{name} = {fn.__name__}" if fn.__name__ != name else ""
         self.functions.append(source.rstrip() + alias)
+
+
+def _inner_names(code: types.CodeType) -> set[str]:
+    """The global names the code objects nested in `code` (generator expressions, lambdas) read."""
+    names: set[str] = set()
+    for const in code.co_consts:
+        if isinstance(const, types.CodeType):
+            names |= set(const.co_names) | _inner_names(const)
+    return names
 
 
 def _literal(value: Any) -> str | None:

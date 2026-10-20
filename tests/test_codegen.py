@@ -773,3 +773,28 @@ def test_a_per_tile_window_consecutive_tiles_share_is_fetched_once():
     assert "def u_moves(at, prev):" in src and "return (b_blk != b_prev)" in src
     assert "jnp.clip(ids_smem[i_blk * 128 // 128], 0, 2) != jnp.clip(ids_smem[i_prev * 128 // 128], 0, 2)" in src
     assert "def x_moves" not in src and "def w_moves" not in src  # streamed
+
+
+
+def test_a_helpers_generator_expressions_read_globals_too():
+    helpers = source_function(
+        "def double_it(v):\n"
+        "    return 2 * v\n"
+        "\n"
+        "def total_of(parts):\n"
+        "    return sum(double_it(p) for p in parts) + (lambda: double_it(0))()  # globals read only inside\n"
+    )
+    helpers.__module__ = "__main__"  # copied into the kernel, with what it reads
+    kernel = make_kernel(
+        """
+        def f(x):
+            out = jnp.zeros(x.shape)
+            for i in range(0, x.shape[0], 8):
+                out = out.at[i : i + 8, :].set(total_of([x[i : i + 8, :], x[i : i + 8, :]]))
+            return out
+        """,
+        total_of=helpers,
+    )
+    x = rand((16, 128))
+    np.testing.assert_allclose(f64(run_checking_races(kernel, x)), 4 * f64(x), rtol=1e-6)
+    assert "def double_it(v):" in kernel.source(x)
