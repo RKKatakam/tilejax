@@ -31,8 +31,9 @@ Kimi Linear's "safe gate" lower bound): they are clamped to it. Cumulative sums 
 triangular 0/1 matrices, the values split in three bf16 parts: f32-accurate.
 
 C is 128: every matmul is a full 128 x 128 MXU tile with bf16 operands and f32 accumulation (as
-flash-linear-attention's kernels round). Everything but the four matmuls of U' and S' (two in a chain per
-chunk) is independent of the state.
+flash-linear-attention's kernels round). Everything but four matmuls per chunk (W S and Gamma Q S, the
+attention times U', the keys' update; two of them in the chain from one state to the next) is independent
+of the state.
 
 **Kernels.** `gated_delta_rule`, `gated_delta_rule_gated` (with Qwen3-Next's gated RMSNorm fused) and
 `kimi_delta_attention` are one kernel each: a tile per (batch, group of heads), a reduction loop over blocks
@@ -40,9 +41,10 @@ of tokens carrying every head's state in VMEM (f32, d_k x d_v), each step storin
 A step first computes, for every chunk of the block and every head of the group, the state-independent
 operands above; then runs the chunks' state updates in order, the group's heads side by side. The code is
 written stage by stage across those chunk-heads (all their normalizations, then all their K K^T, then each
-doubling level for all of them, ...): consecutive matmuls are independent, so the MXUs pipeline them
+doubling level for all of them, ...): consecutive matmuls are independent, so the MXUs can pipeline them
 instead of waiting for each result, and only the short state chain is sequential. (Written chunk after
-chunk, the same work ran at the latency of one dependent matmul after another, ~23 ns per head and token.)
+chunk, the same work took ~23 ns per head and token whatever the tiles: it ran one dependent matmul after
+another, 14 deep per chunk.)
 Nothing but q, k, v, the gates and the outputs crosses HBM. Out-of-range gates are clamped (log decays to
 <= 0, betas to [0, 1]), so the random inputs tuning runs on are valid too.
 
@@ -50,7 +52,7 @@ Nothing but q, k, v, the gates and the outputs crosses HBM. Out-of-range gates a
 structure: a fully parallel kernel over (batch, block of chunks, head) tiles (`gdn_chunks`, `kda_chunks`)
 writes each chunk's operands to HBM (bf16: [W; Gamma Q], U, the decayed attention and the decayed keys,
 transposed: 640 x 128 per chunk and head, and the chunk's decay), and a thin sequential kernel
-(`delta_scan`) runs the state chain over them, a tile per (batch, group of heads). It moves 2.5x the
+(`delta_scan`) runs the state chain over them, a tile per (batch, group of heads). It moves 3.5x the
 fused kernel's bytes. (Under `jax.jit` the scan tunes on random operands, whose recurrence would grow
 without bound: it clamps its states to STATE_MAX, which real ones never reach.)
 
@@ -100,6 +102,9 @@ SCAN_TILES = DeltaTiles(heads=8, block=256)  # `delta_scan`'s defaults: a thin s
 
 
 # --------------------------------------------------------------------------- small helpers (plain JAX)
+# (Helpers the kernels call use list comprehensions, not generator expressions: when this module runs as a
+# script, autokernel copies them into the kernel's source with the globals they read, and doesn't see the
+# ones read only inside a generator expression.)
 
 
 def _bf16(x):
@@ -134,14 +139,14 @@ def cumsum_lanes(x):
     """Inclusive cumulative sums along the last dim (C), f32-accurate, on the MXU: x @ upper-triangular 1s."""
     rows, cols = _iotas(x.shape[-1])
     upper = _bf16(rows <= cols)
-    return sum(_dot(part, upper) for part in _split3(x))
+    return sum([_dot(part, upper) for part in _split3(x)])
 
 
 def cumsum_rows(x):
     """Inclusive cumulative sums along the second-to-last dim (C), f32-accurate: lower-triangular 1s @ x."""
     rows, cols = _iotas(x.shape[-2])
     lower = _bf16(rows >= cols)
-    return sum(_dot(lower, part) for part in _split3(x))
+    return sum([_dot(lower, part) for part in _split3(x)])
 
 
 def l2_normalize(x, scale=1.0):
@@ -269,7 +274,7 @@ def kda_operands(q, k, v, g, beta):
             _bf16(jnp.concatenate([x[lo : lo + SUB], x[CHUNK + lo : CHUNK + lo + SUB]]) * jnp.concatenate([rl, rl]))
             for x, rl in zip(qk_rows, rel, strict=True)
         ]
-        for i, block in enumerate(_dot_nt(x, y) for x, y in zip(lhs, kc, strict=True)):
+        for i, block in enumerate([_dot_nt(x, y) for x, y in zip(lhs, kc, strict=True)]):
             akk[i].append(block[:SUB])
             aqk[i].append(block[SUB:])
     a = [jnp.where(rows > cols, jnp.concatenate(x) * b, 0.0) for x, b in zip(akk, beta, strict=True)]
