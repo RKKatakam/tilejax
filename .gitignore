@@ -24,3 +24,4 @@ dumps/
 
 # TPU runs
 tpu-run.txt
+.claude/worktrees/
