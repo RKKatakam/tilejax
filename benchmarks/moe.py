@@ -70,7 +70,7 @@ def _time_or_inf(fn: Any, *args: Any, runs: int) -> float:
     Mosaic out of VMEM)."""
     try:
         return time_ms(fn, *args, runs=runs)
-    except jax.errors.JaxRuntimeError as e:
+    except (jax.errors.JaxRuntimeError, ValueError) as e:  # out of VMEM, or a tiling the shapes reject
         print(f"    (skipped a baseline configuration: {str(e).splitlines()[0][:100]})")
         return float("inf")
 
