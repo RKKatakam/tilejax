@@ -73,7 +73,8 @@ def test_layers_in_one_kernel(pipeline):
     }
     assert [sch.iteration_at(s) for s in range(lowered.steps)] == [0, 0, 1, 1, 2, 2] * 2
     src = lowered.source
-    assert "ahead_tile, ahead_ph, ahead_rb, ahead_kb, _, _ = step(s + 2)" in src
+    ahead = lowered.pipeline.input_buffers - 1  # (tuned on a TPU)
+    assert f"ahead_tile, ahead_ph, ahead_rb, ahead_kb, _, _ = step(s + {ahead})" in src
     assert "w_up_hbm.at[rb, :, pl.ds(kb * 128, 128)]" in src and "@pl.when(rb == 2)" in src
 
 
