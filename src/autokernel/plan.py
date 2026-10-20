@@ -28,7 +28,7 @@ import inspect
 import itertools
 import traceback
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any
 
@@ -126,6 +126,9 @@ class Operand:
     tile: Tile
     kind: Kind
     phase: int | None = None  # a streamed operand of a phase: the phase (None: it streams every step)
+    # An ITERATION operand only its phase's body reads: an iteration whose steps are all masked out (one
+    # empty step) doesn't fetch it.
+    in_body: bool = False
 
 
 @dataclass(frozen=True)
@@ -565,6 +568,14 @@ class _Planner:
             for n in ast.walk(stmt)
             if isinstance(n, ast.Subscript)
         }
+        in_bodies = {
+            (n.lineno, n.col_offset)
+            for phase in phases
+            for stmt in phase.body
+            for n in ast.walk(stmt)
+            if isinstance(n, ast.Subscript)
+        }
+        outside: set[str] = set()  # the keys of reads outside every phase's body
         repeat_vars = {rep.range.var for rep in repeats}
         subscripts = [n for stmt in self.nest.tile for n in ast.walk(stmt) if isinstance(n, ast.Subscript)]
         for node in sorted(subscripts, key=lambda n: (n.lineno, n.col_offset)):  # in source order
@@ -580,6 +591,8 @@ class _Planner:
             if phase is None and moving & repeat_vars:  # streamed with the phase whose steps read it
                 phase = self.read_phases[(node.lineno, node.col_offset)] = runs_in[(node.lineno, node.col_offset)]
             key = _read_key(node, self.read_phases)
+            if (node.lineno, node.col_offset) not in in_bodies:
+                outside.add(key)
             if key in by_key:
                 continue
             if not moving:
@@ -595,6 +608,9 @@ class _Planner:
             operand = Operand(name, param, tile, kind, phase)
             operands.append(operand)
             by_key[key] = operand
+        for key, operand in by_key.items():
+            if operand.kind is Kind.ITERATION and key not in outside:
+                by_key[key] = operands[operands.index(operand)] = replace(operand, in_body=True)
         return tuple(operands), by_key
 
     def _index_arrays(self) -> list[Index]:

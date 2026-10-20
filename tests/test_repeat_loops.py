@@ -191,6 +191,41 @@ def test_two_repeat_loops_and_static_tables():
     assert "def _before_phase1():" in lowered.source  # the second loop's code before its phase
 
 
+CHOSEN = """
+def f(x, w, ids, n):
+    M, K = x.shape
+    C = ids.shape[0]
+    out = jnp.zeros((M, K), jnp.float32)
+    for i in range(0, M, 128):
+        h = x[i : i + 128, :]
+        acc = jnp.zeros((128, K))
+        for c in range(C):  # the experts some row chose, then padding
+            for f in range(0, K, K):
+                if c >= n[0]:  # padding: an empty step, its expert's weights never fetched
+                    continue
+                acc += h @ w[ids[c], :, :] * (c + 1)
+        out = out.at[i : i + 128, :].set(acc)
+    return out
+"""
+
+
+@pytest.mark.parametrize("pipeline", [None, Pipeline(4, 2)])
+def test_an_empty_iteration_skips_what_only_its_steps_read(pipeline):
+    kernel = make_kernel(CHOSEN)
+    x, w = rand((256, 128)), rand((6, 128, 128), 1) / 10
+    ids, n = jnp.array([4, 1, 0, 0], jnp.int32), jnp.array([2], jnp.int32)
+    out = check(kernel, x, w, ids, n, pipeline=pipeline)
+    want = f64(x) @ f64(w[4]) + 2 * f64(x) @ f64(w[1])
+    np.testing.assert_allclose(f64(out), want, rtol=1e-4, atol=1e-3)
+    lowered = kernel.lower(x, w, ids, n)
+    [op] = [op for op in lowered.plan.operands if op.name == "w"]
+    assert op.kind.value == "iteration" and op.in_body
+    assert "jnp.logical_not" in lowered.source and "def _iteration_inputs0_body():" in lowered.source
+    # A layer's norm, read before its phase's steps, is fetched for every iteration.
+    plan = make_kernel(FFN_STACK).lower(*_ffn_inputs()).plan
+    assert [op.in_body for op in plan.operands if op.name == "gamma"] == [False]
+
+
 def test_a_repeat_loop_takes_a_step_per_iteration_at_least():
     # Its one reduction loop has one iteration (a whole layer's weights per step): it stays a phase.
     kernel = make_kernel(FFN_STACK.replace("range(0, F, 128)", "range(0, F, F)").replace("f + 128", "f + F"))

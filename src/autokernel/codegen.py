@@ -682,13 +682,13 @@ class _Generator:
                             for op in ops:
                                 at = f"{self.n_blocks}({tile})"
                                 w(f"{self.copy_fns[op.name]}({at}, {self._rb(rb)}{kb}, {step}).start()")
-                    self._fetch_iterated(w, iterated, tile, ph, rb, first)
+                    self._fetch_iterated(w, iterated, tile, ph, rb, first, empty)
             return
         for step in range(ahead):
             tile, phase, kb = sch.step_at(step)
             at, rb = sch.blocks_at(tile), str(sch.iteration_at(step))
             for op in iterated:
-                if op.phase == phase and sch.first_at(step):
+                if op.phase == phase and sch.first_at(step) and not (op.in_body and sch.empty_at(step)):
                     w(f"{self.copy_fns[op.name]}({at}, {rb}, {self._iteration_slot(op, str(tile), rb)}).start()")
             if sch.empty_at(step):
                 continue
@@ -702,14 +702,33 @@ class _Generator:
         count = self.plan.repeats[self.plan.phases[op.phase].repeat].range.count  # type: ignore[index]
         return _int_expr(f"{tile} * {count} + {rb}", "%", self.pipeline.input_buffers)
 
-    def _fetch_iterated(self, w: _Writer, ops: list[Operand], tile: str, ph: str, rb: str, first: str) -> None:
+    def _fetch_iterated(
+        self, w: _Writer, ops: list[Operand], tile: str, ph: str, rb: str, first: str, empty: str
+    ) -> None:
         """Start the copies of the operands fetched once per iteration for a step that is its phase's first."""
-        for phase, group in self._by_phase(ops).items():
-            cond = f"({ph} == {phase}) & {first}" if len(self.plan.phases) > 1 else first
-            with self._when(w, cond, f"_iteration_inputs{phase}"):
+        for (phase, in_body), group in self._by_iteration(ops).items():
+            cond = self._iteration_first(phase, in_body, ph, first, empty)
+            with self._when(w, cond, f"_iteration_inputs{phase}" + ("_body" if in_body else "")):
                 for op in group:
                     slot = self._iteration_slot(op, tile, rb)
                     w(f"{self.copy_fns[op.name]}({self.n_blocks}({tile}), {rb}, {slot}).start()")
+
+    @staticmethod
+    def _by_iteration(ops: list[Operand]) -> dict[tuple[int, bool], list[Operand]]:
+        """Operands fetched once per iteration, grouped by phase and by whether only the phase's body reads
+        them."""
+        groups: dict[tuple[int, bool], list[Operand]] = {}
+        for op in ops:
+            groups.setdefault((op.phase, op.in_body), []).append(op)  # type: ignore[arg-type]
+        return groups
+
+    def _iteration_first(self, phase: int, in_body: bool, ph: str, first: str, empty: str) -> str:
+        """The condition that a step fetches (waits for) phase `phase`'s once-per-iteration operands: the
+        phase's first step of an iteration, unless only the phase's body reads them and the step is empty."""
+        cond = f"({ph} == {phase}) & {first}" if len(self.plan.phases) > 1 else first
+        if in_body and self._may_be_empty(phase):
+            cond = f"{cond} & jnp.logical_not({empty})"
+        return cond
 
     def _region(self, w: _Writer, region: str) -> Any:
         if not self.trace:
@@ -798,7 +817,7 @@ class _Generator:
                         first_ = ahead_first if iterated else "_"
                         targets = self._targets(ahead_tile, ahead_ph, ahead_rb, ahead_kb, first_, "_", ahead_empty)
                         w(f"{targets} = {self.n_step}({s} + {depth - 1})")
-                    self._fetch_iterated(w, iterated, ahead_tile, ahead_ph, ahead_rb, ahead_first)
+                    self._fetch_iterated(w, iterated, ahead_tile, ahead_ph, ahead_rb, ahead_first, ahead_empty)
                     ahead_slot = _int_expr(f"{s} + {depth - 1}", "%", depth)
                     for phase, ops in self._by_phase(streamed).items():
                         with self._when(w, self._runs(ahead_ph, phase, ahead_empty), f"_fetch_phase{phase}"):
@@ -817,9 +836,9 @@ class _Generator:
                     with self._when(w, self._runs(ph, phase, empty), f"_wait_phase{phase}"):
                         for op in ops:
                             w(f"{self.copy_fns[op.name]}({at}, {self._rb(self.n_rb)}{kb}, {slots[Kind.STREAM]}).wait()")
-                for phase, ops in self._by_phase(iterated).items():
-                    cond = f"({ph} == {phase}) & {first}" if len(plan.phases) > 1 else first
-                    with self._when(w, cond, f"_wait_iteration{phase}"):
+                for (phase, in_body), ops in self._by_iteration(iterated).items():
+                    cond = self._iteration_first(phase, in_body, ph, first, empty)
+                    with self._when(w, cond, f"_wait_iteration{phase}" + ("_body" if in_body else "")):
                         for op in ops:
                             slot = self._iteration_slot(op, tile, self.n_rb)
                             w(f"{self.copy_fns[op.name]}({at}, {self.n_rb}, {slot}).wait()")
