@@ -200,12 +200,33 @@ def test_loops():
             out = out.at[i].set(1)
         return out
 
-    def nested_reduction(x):
+    def nested_repeats(x):
         out = jnp.zeros(1)
         for i in range(1):
-            for k in range(1):
-                for k2 in range(1):
-                    pass
+            for r in range(1):
+                for k in range(1):
+                    for k2 in range(1):
+                        a = 1
+            out = out.at[i].set(1)
+        return out
+
+    def masked_repeat(x):
+        out = jnp.zeros(1)
+        for i in range(1):
+            for r in range(2):
+                if r:
+                    continue
+                for k in range(1):
+                    a = 1
+            out = out.at[i].set(1)
+        return out
+
+    def loop_in_a_scope(x):
+        out = jnp.zeros(1)
+        for i in range(1):
+            with jax.named_scope("s"):
+                for k in range(1):
+                    a = 1
             out = out.at[i].set(1)
         return out
 
@@ -215,7 +236,9 @@ def test_loops():
     assert "nothing to run" in error(only_a_mask)
     nest = parse(two_reductions)  # reduction loops run one after another: phases
     assert [loop.var for loop in nest.reductions] == ["k", "k2"] and [len(s) for s in nest.segments] == [0, 0, 1]
-    assert "loops nest only as parallel loops" in error(nested_reduction)
+    assert "repeat loops don't nest" in error(nested_repeats)
+    assert "a repeat loop (around reduction loops) can't be masked" in error(masked_repeat)
+    assert "loops nest only as parallel loops around reduction (and repeat) loops" in error(loop_in_a_scope)
 
 
 def _tile(*lines: str) -> str:

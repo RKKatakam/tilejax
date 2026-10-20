@@ -141,6 +141,13 @@ def f(x, y, tiles=Tiles()):                   # the input arrays; optionally las
   VMEM like accumulators. A loop of one iteration (`range(0, F, F)`) takes no step: its body runs inline,
   and windows only it moved are fetched once, so a tunable block size covering a whole dim turns streamed
   weights into resident ones.
+- **Repeat loops**: a loop around reduction loops (`for l in range(L):` holding a layer's reduction loops
+  and code) runs their steps iteration after iteration, carrying values from one iteration to the next as
+  from one step to the next. Windows it moves (`w_up[l, :, f : f + bf]`) stream with the phase that reads
+  them, so the pipeline fetches the next iteration's (the next layer's weights) while this one runs: a
+  whole stack of layers is one kernel, with prefetch across layers. The repeat loop's own code runs at its
+  first phase's first step and its last phase's last step, every iteration; the tile's code after the loop,
+  as its last iteration ends. Repeat loops don't nest; one of one iteration runs inline.
 - **Loop variables** can be used as values (`i + jax.lax.broadcasted_iota(...)`); they behave as Python
   ints (`bf16_tile * i` stays bf16), as int32 in the kernel.
 - **Defaults that don't fit** (block sizes too big for VMEM, or not dividing the arrays) are replaced by the

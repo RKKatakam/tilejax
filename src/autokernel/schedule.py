@@ -16,7 +16,9 @@ reads): causal attention's masks don't read the batch and head loops, so its tab
 pattern, repeated, and stay small whatever the batch size.
 
 A tile whose mask skips every block of a reduction loop still takes one step of it, an empty one: its body
-doesn't run (as the loop's body doesn't), but the code after the loop does.
+doesn't run (as the loop's body doesn't), but the code after the loop does. A repeat loop's phases take
+their steps once per iteration (`Plan.instances`), always through tables: a step's code holds the
+iteration too.
 
 Masks that read index arrays (runtime masks, `if j >= lengths[b]: continue`) can only be evaluated when the
 kernel runs: then the step tables are made on the device, just before the kernel, from every step that
@@ -41,7 +43,8 @@ __all__ = ["Schedule", "make_schedule"]
 # Table names: steps' tiles and codes (and, made on the device, their count), and per inner loop `var`:
 # TILE_TABLE % var, FILL_TABLE % var.
 STEP_TILE, STEP_CODE, STEP_COUNT, TILE_TABLE, FILL_TABLE = "step_tile", "step_code", "step_count", "tile_%s", "fill_%s"
-# A step's code: (block * phases + phase) << CODE_SHIFT | empty << 2 | first << 1 | last.
+# A step's code: ((block * phases + phase) * iterations + iteration) << CODE_SHIFT | empty << 2 | first << 1 |
+# last, where iterations is the most any repeat loop runs (1 without repeat loops).
 CODE_SHIFT = 3
 
 
@@ -63,6 +66,7 @@ class Schedule:
     tile_tables: bool  # are tiles found through tables (a tile mask skips tiles), or arithmetic
     tables: dict[str, np.ndarray] = field(default_factory=dict)  # name -> int32 table, in SMEM
     empty: bool = False  # may a step be empty (a phase whose mask skips all of a tile's blocks)?
+    iterations: int = 1  # the radix of the repeat loop iteration in a step's code
     # Runtime masks: the step tables are made on the device from every step that could run (`steps` is the
     # most there can be). For each of the pattern's tiles, the value of each inner loop; for each phase whose
     # mask reads no index array, which of each tile's blocks run (the others are evaluated on the device).
@@ -96,8 +100,14 @@ class Schedule:
             return tile, phase, within
         rep, r = divmod(step, self.pattern_steps)
         tile = rep * self.pattern_tiles + int(self.tables[STEP_TILE][r])
-        phase_block = int(self.tables[STEP_CODE][r]) >> CODE_SHIFT
+        phase_block = (int(self.tables[STEP_CODE][r]) >> CODE_SHIFT) // self.iterations
         return tile, phase_block % len(self.phase_counts), phase_block // len(self.phase_counts)
+
+    def iteration_at(self, step: int) -> int:
+        """The iteration of its repeat loop a step's phase is in (0 outside repeat loops)."""
+        if not self.step_tables:
+            return 0
+        return (int(self.tables[STEP_CODE][step % self.pattern_steps]) >> CODE_SHIFT) % self.iterations
 
     def empty_at(self, step: int) -> bool:
         """Is the step empty (its phase's body doesn't run)?"""
@@ -119,10 +129,12 @@ def make_schedule(plan: Plan) -> Schedule:
     counts = tuple(r.count for r in phases)
     tile_masks = [r.mask for r in plan.parallel if r.mask is not None]
     step_masks = [r.mask for r in phases if r.mask is not None]
-    if not tile_masks and not step_masks:
+    if not tile_masks and not step_masks and not plan.repeats:
         _check_smem(plan, {})
         return _arithmetic(plan, counts)
 
+    instances = plan.instances
+    iterations = max((rep.range.count for rep in plan.repeats), default=1)
     read = set().union(*(reads(m) for m in [*tile_masks, *step_masks]))
     split = next((i for i, r in enumerate(plan.parallel) if r.var in read), len(plan.parallel))
     outer, inner = plan.parallel[:split], plan.parallel[split:]
@@ -135,12 +147,14 @@ def make_schedule(plan: Plan) -> Schedule:
             continue
         active.append(blocks)
         if not plan.runtime:
-            steps.append([_blocks_run(plan, r, values) for r in phases])
+            steps.append([_blocks_run(plan, phases[p], {**values, **_iteration(plan, p, it)}) for p, it in instances])
     if not active:
         raise nest.error("the masks skip every output tile", nest.parallel[0].node)
     if plan.runtime:
-        return _runtime(plan, counts, outer, inner, active, skipped)
-    step_tables = any(ks != list(range(r.count)) for tile in steps for ks, r in zip(tile, phases, strict=True))
+        return _runtime(plan, counts, iterations, outer, inner, active, skipped)
+    step_tables = bool(plan.repeats) or any(
+        ks != list(range(phases[p].count)) for tile in steps for ks, (p, _) in zip(tile, instances, strict=True)
+    )
     if not skipped and not step_tables:
         _check_smem(plan, {})
         return _arithmetic(plan, counts)  # the masks skip nothing
@@ -150,14 +164,21 @@ def make_schedule(plan: Plan) -> Schedule:
     if step_tables:
         tile_of, codes = [], []
         for t, tile in enumerate(steps):
-            for p, ks in enumerate(tile):
+            for (p, it), ks in zip(instances, tile, strict=True):
                 runs = ks or [0]  # a phase none of whose blocks run takes one empty step
                 empty |= not ks
                 tile_of += [t] * len(runs)
-                codes += [_code(kb, p, len(phases), not ks, n == 0, n == len(runs) - 1) for n, kb in enumerate(runs)]
+                codes += [
+                    _code(kb, p, len(phases), it, iterations, not ks, n == 0, n == len(runs) - 1)
+                    for n, kb in enumerate(runs)
+                ]
         tables[STEP_TILE] = np.array(tile_of, np.int32)
         tables[STEP_CODE] = np.array(codes, np.int32)
     _check_smem(plan, tables)
+    per_phase = [0] * len(phases)  # each phase's steps in the pattern
+    for tile in steps:
+        for ks, (p, _) in zip(tile, instances, strict=True):
+            per_phase[p] += max(len(ks), 1)
     repeats = math.prod(r.count for r in outer)
     pattern_steps = sum(max(len(ks), 1) for tile in steps for ks in tile) or len(active)
     tiles, fills = repeats * len(active), repeats * len(skipped)
@@ -167,7 +188,7 @@ def make_schedule(plan: Plan) -> Schedule:
         total_tiles=math.prod(r.count for r in plan.parallel),
         steps=repeats * pattern_steps,
         phase_counts=counts,
-        phase_steps=tuple(repeats * sum(max(len(tile[p]), 1) for tile in steps) for p in range(len(phases))),
+        phase_steps=tuple(repeats * per_phase[p] for p in range(len(phases))),
         step_tables=step_tables,
         outer=outer,
         inner=inner,
@@ -177,34 +198,50 @@ def make_schedule(plan: Plan) -> Schedule:
         tile_tables=bool(skipped),
         tables=tables,
         empty=empty,
+        iterations=iterations,
     )
+
+
+def _iteration(plan: Plan, phase: int, iteration: int) -> dict[str, int]:
+    """The value of the repeat loop around `phase` (if any) at `iteration`."""
+    r = plan.phases[phase].repeat
+    return {} if r is None else {plan.repeats[r].range.var: plan.repeats[r].range.value(iteration)}
 
 
 def _runtime(
     plan: Plan,
     counts: tuple[int, ...],
+    iterations: int,
     outer: tuple[Range, ...],
     inner: tuple[Range, ...],
     active: list[tuple[int, ...]],
     skipped: list[tuple[int, ...]],
 ) -> Schedule:
     """A schedule whose step tables are made on the device (masks read index arrays): every step that could
-    run, described by the pattern's tiles' loop values and the masks that can be evaluated now."""
+    run, described by the pattern's tiles' loop values and the masks that can be evaluated now (for a phase
+    in a repeat loop, per iteration)."""
     phases = [phase.range for phase in plan.phases]
     tables = _tile_tables(inner, active, skipped)
-    capacity = len(active) * sum(counts)
+    per_phase = [sum(1 for q, _ in plan.instances if q == p) for p in range(len(phases))]  # its iterations
+    capacity = len(active) * sum(count * n for count, n in zip(counts, per_phase, strict=True))
     # The tables made on the device: each step's tile and code, and their count.
     _check_smem(plan, tables, 4 * (2 * capacity + 1))
     tile_values = {r.var: np.array([r.value(blocks[i]) for blocks in active], np.int32) for i, r in enumerate(inner)}
     static_runs = {}
     for p, r in enumerate(phases):
-        if r.mask is not None and not r.runtime:
-            static_runs[p] = np.array(
+        if r.mask is None or r.runtime:
+            continue
+        runs = [
+            [
                 [
-                    [not _holds(plan, r.mask, {**_values(inner, blocks), r.var: r.value(kb)}) for kb in range(r.count)]
-                    for blocks in active
+                    not _holds(plan, r.mask, {**_values(inner, blocks), **_iteration(plan, p, it), r.var: r.value(kb)})
+                    for kb in range(r.count)
                 ]
-            )
+                for blocks in active
+            ]
+            for it in range(per_phase[p])
+        ]
+        static_runs[p] = np.array(runs if plan.phases[p].repeat is not None else runs[0])
     repeats = math.prod(q.count for q in outer)
     tiles = repeats * len(active)
     _check_tiles(plan, tiles, repeats * len(skipped))
@@ -213,7 +250,7 @@ def _runtime(
         total_tiles=math.prod(r.count for r in plan.parallel),
         steps=repeats * capacity,
         phase_counts=counts,
-        phase_steps=tuple(tiles * count for count in counts),
+        phase_steps=tuple(tiles * count * n for count, n in zip(counts, per_phase, strict=True)),
         step_tables=True,
         outer=outer,
         inner=inner,
@@ -226,11 +263,14 @@ def _runtime(
         runtime=True,
         tile_values=tile_values,
         static_runs=static_runs,
+        iterations=iterations,
     )
 
 
-def _code(block: int, phase: int, phases: int, empty: bool, first: bool, last: bool) -> int:
-    return (block * phases + phase) << CODE_SHIFT | empty << 2 | first << 1 | last
+def _code(
+    block: int, phase: int, phases: int, iteration: int, iterations: int, empty: bool, first: bool, last: bool
+) -> int:
+    return ((block * phases + phase) * iterations + iteration) << CODE_SHIFT | empty << 2 | first << 1 | last
 
 
 def _values(inner: tuple[Range, ...], blocks: tuple[int, ...]) -> dict[str, int]:

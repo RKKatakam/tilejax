@@ -19,7 +19,16 @@ A kernel function is
         return out                                 # the outputs, one name or a tuple of names
 
 A tile's reduction loops run one after another (the kernel's steps for a tile are those of its first
-reduction loop, then its second's, ...): a phase each.
+reduction loop, then its second's, ...): a phase each. A loop around reduction loops is a repeat loop
+
+                for l in range(L):                 # a repeat loop: its reduction loops' steps, L times over
+                    <code>                         #   (one level of them: a repeat loop holds reduction loops
+                    for k in range(0, K, TK):      #   and code, and values carry from one iteration to the
+                        <body>                     #   next, as across steps)
+                    <code>
+
+whose steps are its reduction loops' steps, iteration after iteration: a whole model's layers in one
+kernel, the next layer's weights fetched while this one's run.
 
 An input read only element by element, `lengths[b]` (integer indices, no slices), is an index array: the
 kernel keeps it whole in SMEM, and tile code, reduction masks and the indices of tile reads
@@ -37,7 +46,7 @@ from dataclasses import dataclass, field
 from .errors import KernelError
 from .tilecode import Store, as_store, assigned, element_reads, flatten, reads
 
-__all__ = ["Loop", "Nest", "parse"]
+__all__ = ["Loop", "Nest", "Repeat", "parse"]
 
 # Prologue statements: Python run on shapes when the kernel is planned.
 _PROLOGUE_STATEMENTS = (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Assert, ast.Pass)
@@ -51,6 +60,18 @@ class Loop:
     bounds: tuple[ast.expr, ...]
     mask: ast.expr | None
     node: ast.For
+
+
+@dataclass(frozen=True)
+class Repeat:
+    """A repeat loop: `for var in range(...)` around the reduction loops `first` to `last` (exclusive), with
+    its own code before the first and after the last (the code between them is in `Nest.segments`)."""
+
+    loop: Loop
+    first: int
+    last: int
+    before: tuple[ast.stmt, ...]
+    after: tuple[ast.stmt, ...]
 
 
 @dataclass(frozen=True)
@@ -68,7 +89,10 @@ class Nest:
     parallel: tuple[Loop, ...]  # outermost first
     reductions: tuple[Loop, ...]  # in the order they run
     bodies: tuple[tuple[ast.stmt, ...], ...]  # each reduction loop's body
-    segments: tuple[tuple[ast.stmt, ...], ...]  # the code before, between and after them: one more
+    # The code before, between and after them (one more): at a repeat loop's first and last reduction
+    # loops, the code outside the repeat loop (before and after it).
+    segments: tuple[tuple[ast.stmt, ...], ...]
+    repeats: tuple[Repeat, ...]
     stores: dict[str, Store]  # output -> its store, in the last segment
     _store_nodes: dict[int, Store] = field(default_factory=dict, repr=False)
 
@@ -77,15 +101,22 @@ class Nest:
 
     @property
     def tile(self) -> tuple[ast.stmt, ...]:
-        """Everything a tile runs, in order: the segments and, between them, the reduction bodies."""
+        """Everything a tile runs, in order (as written): the segments and, between them, the reduction
+        bodies, and the repeat loops' own code."""
+        before = {rep.first: rep.before for rep in self.repeats}
+        after = {rep.last - 1: rep.after for rep in self.repeats}
         out = self.segments[0]
-        for body, segment in zip(self.bodies, self.segments[1:], strict=True):
-            out += body + segment
+        for r, (body, segment) in enumerate(zip(self.bodies, self.segments[1:], strict=True)):
+            out += before.get(r, ()) + body + after.get(r, ()) + segment
         return out
 
     @property
     def loops(self) -> tuple[Loop, ...]:
-        return self.parallel + self.reductions
+        return self.parallel + self.reductions + tuple(rep.loop for rep in self.repeats)
+
+    def repeat_of(self, reduction: int) -> Repeat | None:
+        """The repeat loop around the `reduction`-th reduction loop, if any."""
+        return next((rep for rep in self.repeats if rep.first <= reduction < rep.last), None)
 
     @property
     def runtime_masks(self) -> bool:
@@ -147,8 +178,9 @@ class _Parser:
         allocations = self._allocations(prologue, outputs, body[at + 1])
 
         parallel, tile = self._parallel_loops(body[at])  # type: ignore[arg-type]
-        reductions, bodies, segments = self._split_tile(tile)
-        stores = self._stores(bodies, segments, outputs)
+        reductions, bodies, segments, repeats = self._split_tile(tile)
+        inner = [s for rep in repeats for s in rep.before + rep.after]
+        stores = self._stores((*bodies, tuple(inner)), segments, outputs)
         nest = Nest(
             name=self.name,
             filename=self.filename,
@@ -162,6 +194,7 @@ class _Parser:
             reductions=reductions,
             bodies=bodies,
             segments=segments,
+            repeats=repeats,
             stores=stores,
         )
         self._check_names(nest)
@@ -248,31 +281,51 @@ class _Parser:
 
     def _split_tile(
         self, tile: list[ast.stmt]
-    ) -> tuple[tuple[Loop, ...], tuple[tuple[ast.stmt, ...], ...], tuple[tuple[ast.stmt, ...], ...]]:
-        """(the reduction loops, their bodies, the segments before, between and after them)."""
-        reductions, bodies, segments, segment = [], [], [], []
+    ) -> tuple[
+        tuple[Loop, ...], tuple[tuple[ast.stmt, ...], ...], tuple[tuple[ast.stmt, ...], ...], tuple[Repeat, ...]
+    ]:
+        """(the reduction loops, their bodies, the segments before, between and after them, the repeat loops)."""
+        reductions: list[Loop] = []
+        bodies: list[tuple[ast.stmt, ...]] = []
+        segments: list[tuple[ast.stmt, ...]] = []
+        repeats: list[Repeat] = []
+        segment: list[ast.stmt] = []
         for stmt in tile:
-            if isinstance(stmt, ast.For):
-                loop, body = self._loop(stmt)
+            if not isinstance(stmt, ast.For):
+                segment.append(stmt)
+                continue
+            loop, body = self._loop(stmt)
+            if not any(isinstance(s, ast.For) for s in body):
                 self._check_statements(body)
                 reductions.append(loop)
                 bodies.append(tuple(body))
                 segments.append(tuple(segment))
                 segment = []
-            else:
-                segment.append(stmt)
+                continue
+            if loop.mask is not None:
+                raise self.error("a repeat loop (around reduction loops) can't be masked", loop.mask)
+            inner, inner_bodies, inner_segments, nested = self._split_tile(body)
+            if nested:
+                raise self.error("repeat loops don't nest: a repeat loop holds reduction loops", nested[0].loop.node)
+            segments.append(tuple(segment))
+            segments.extend(inner_segments[1:-1])
+            segment = []
+            first = len(reductions)
+            reductions.extend(inner)
+            bodies.extend(inner_bodies)
+            repeats.append(Repeat(loop, first, len(reductions), inner_segments[0], inner_segments[-1]))
         self._check_statements(segment)
         segments.append(tuple(segment))
         for done in segments[:-1]:
             self._check_statements(done)
-        return tuple(reductions), tuple(bodies), tuple(segments)
+        return tuple(reductions), tuple(bodies), tuple(segments), tuple(repeats)
 
     # ------------------------------------------------------------------ tile statements
 
     def _check_statements(self, stmts: Iterable[ast.stmt]) -> None:
         for stmt in stmts:
             if isinstance(stmt, ast.For):
-                raise self.error("loops nest only as parallel loops around reduction loops", stmt)
+                raise self.error("loops nest only as parallel loops around reduction (and repeat) loops", stmt)
             if isinstance(stmt, ast.Assign):
                 if len(stmt.targets) != 1 or not _names_only(stmt.targets[0]):
                     raise self.error("tile code assigns names: `a = ...` or `a, b = ...`", stmt)
@@ -347,9 +400,13 @@ class _Parser:
         for depth, loop in enumerate(nest.loops):
             if loop.mask is None:
                 continue
-            # A parallel loop's mask sees the loops around it; a reduction's, the parallel loops and its own.
+            # A parallel loop's mask sees the loops around it; a reduction's, the parallel loops, the repeat loop
+            # around it and its own.
             reduction = depth >= len(parallel_vars)
             visible = {*parallel_vars, loop.var} if reduction else set(parallel_vars[: depth + 1])
+            around = nest.repeat_of(depth - len(parallel_vars)) if reduction else None
+            if around is not None:
+                visible.add(around.loop.var)
             elements = {id(n.value) for n in element_reads(loop.mask, params)} if reduction else set()
             arrays = [
                 n.id
@@ -377,11 +434,20 @@ class _Parser:
         for loop in nest.loops:
             if loop.var in written:
                 raise self.error(f"loop variable `{loop.var}` can't be assigned in the tile", loop.node)
+        repeat_code = [s for rep in nest.repeats for s in rep.before + rep.after]
         for r, reduction in enumerate(nest.reductions):
             elsewhere = [s for b, body in enumerate(nest.bodies) if b != r for s in body]
-            for stmt in flatten([*elsewhere, *(s for segment in nest.segments for s in segment)]):
+            for stmt in flatten([*elsewhere, *(s for segment in nest.segments for s in segment), *repeat_code]):
                 if reduction.var in reads(stmt):
                     raise self.error(f"`{reduction.var}` is only defined inside its reduction loop", stmt)
+        for rep in nest.repeats:
+            inside = range(rep.first, rep.last)
+            outside = [s for b, body in enumerate(nest.bodies) if b not in inside for s in body]
+            outside += [s for i, segment in enumerate(nest.segments) if not rep.first < i < rep.last for s in segment]
+            outside += [s for other in nest.repeats if other is not rep for s in other.before + other.after]
+            for stmt in flatten(outside):  # (masks outside it can't read it: they read only enclosing loops)
+                if rep.loop.var in reads(stmt):
+                    raise self.error(f"`{rep.loop.var}` is only defined inside its repeat loop", stmt)
 
 
 def _names_only(target: ast.expr) -> bool:

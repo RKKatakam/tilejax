@@ -156,6 +156,7 @@ def test_mla_attention(heads, tiles):
     assert (kinds["kv"], kinds["k_rope"], kinds["w_o"], kinds["q"]) == ("stream", "stream", "stream", "tile")
 
 
+@pytest.mark.cpu  # the helpers' f32 matmuls use the default precision: one bf16 pass on a TPU
 def test_mla_attention_f32():
     x, q, kv, k_rope, w_o = (t.astype(jnp.float32) for t in _attention_inputs(1, 256, 2, 256))
     cos, sin = rope_tables(256)

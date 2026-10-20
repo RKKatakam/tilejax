@@ -10,6 +10,10 @@ loop of one iteration (and no mask) takes no step of its own: its body runs inli
 with its variable bound to its one value. So a tunable block size that covers a whole dim turns a loop
 into straight-line code, and the windows it moved into ones fetched once.
 
+A repeat loop's phases take their steps once per iteration, one iteration after another; windows the
+repeat loop moves (a layer's weights, `w[l, :, f : f + bf]`) stream like any other, so the next
+iteration's are fetched while this one's run.
+
 Inputs read element by element (`lengths[b]`) are index arrays, kept whole in SMEM: their elements are
 values in tile code, conditions in reduction masks (which the kernel then evaluates when it runs: runtime
 masks), and integer indices of tile reads (`w[expert[e], :, :]`: runtime windows).
@@ -23,7 +27,7 @@ import copy
 import inspect
 import itertools
 import traceback
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -48,6 +52,7 @@ __all__ = [
     "Phase",
     "Plan",
     "Range",
+    "Repeat",
     "Tile",
     "Window",
     "make_plan",
@@ -133,10 +138,25 @@ class Index:
 
 @dataclass(frozen=True)
 class Phase:
-    """A reduction loop that takes steps: the tile's steps for it, and its body."""
+    """A reduction loop that takes steps: the tile's steps for it, and its body. In a repeat loop it takes
+    them once per iteration; the repeat loop's first phase runs the loop's own code before it (`before`) at
+    its first step, every iteration."""
 
     range: Range
     body: tuple[ast.stmt, ...]
+    before: tuple[ast.stmt, ...] = ()
+    repeat: int | None = None  # the repeat loop it runs in, an index into `Plan.repeats`
+
+
+@dataclass(frozen=True)
+class Repeat:
+    """A repeat loop that takes steps: its phases, `first` to `last` (exclusive), run `range.count` times
+    over. `after` is the tile's code after the loop (up to the next phase), run as its last iteration ends."""
+
+    range: Range
+    first: int
+    last: int
+    after: tuple[ast.stmt, ...]
 
 
 @dataclass(frozen=True)
@@ -170,10 +190,17 @@ class Plan:
     parallel: tuple[Range, ...]  # outermost first
     reductions: tuple[Range, ...]  # every reduction loop, in order (the inlined ones too)
     phases: tuple[Phase, ...]  # the reduction loops that take steps
-    segments: tuple[tuple[ast.stmt, ...], ...]  # the code before, between and after the phases: one more
+    # The code at a tile's first step (before the phases), then after each phase, at its last step (in a
+    # repeat loop: every iteration).
+    segments: tuple[tuple[ast.stmt, ...], ...]
+    repeats: tuple[Repeat, ...]  # the repeat loops that take steps
+    repeat_loops: tuple[Range, ...]  # every repeat loop (one of one iteration runs inline)
     operands: tuple[Operand, ...]
     indices: tuple[Index, ...]  # the index arrays, in parameter order
     reads: Mapping[str, Operand]  # `read_key` of a tile read -> its operand
+    # Reads of windows only a repeat loop moves, outside phase bodies: (line, column) -> the phase whose
+    # steps run them (they stream with that phase).
+    read_phases: Mapping[tuple[int, int], int]
     outputs: tuple[Output, ...]
     carried: Mapping[str, Carried]
     assigned_types: Mapping[int, Mapping[str, jax.ShapeDtypeStruct]]  # id(stmt) -> the types it assigns
@@ -188,7 +215,27 @@ class Plan:
 
     @property
     def loops(self) -> tuple[Range, ...]:
-        return self.parallel + self.reductions
+        return self.parallel + self.reductions + self.repeat_loops
+
+    @property
+    def instances(self) -> tuple[tuple[int, int], ...]:
+        """A tile's phases in the order its steps run them: (phase, iteration of its repeat loop, or 0)."""
+        out: list[tuple[int, int]] = []
+        p = 0
+        while p < len(self.phases):
+            r = self.phases[p].repeat
+            if r is None:
+                out.append((p, 0))
+                p += 1
+                continue
+            rep = self.repeats[r]
+            out += [(q, it) for it in range(rep.range.count) for q in range(rep.first, rep.last)]
+            p = rep.last
+        return tuple(out)
+
+    def read_key(self, node: ast.Subscript) -> str:
+        """Identifies a tile read `x[...]` (the same window of the same input is one operand)."""
+        return _read_key(node, self.read_phases)
 
     @property
     def runtime(self) -> bool:
@@ -210,9 +257,10 @@ def evaluate(nest: Nest, env: dict[str, Any], node: ast.expr, values: Mapping[st
         raise nest.error(f"can't evaluate `{ast.unparse(node)}` when planning: {e!r}", node) from e
 
 
-def read_key(node: ast.Subscript) -> str:
-    """Identifies a tile read `x[...]` (the same window of the same input is one operand)."""
-    return ast.dump(node)
+def _read_key(node: ast.Subscript, read_phases: Mapping[tuple[int, int], int]) -> str:
+    """A tile read's operand key: its window, and the phase that streams it if only a repeat loop moves it."""
+    phase = read_phases.get((node.lineno, node.col_offset))
+    return ast.dump(node) if phase is None else f"{ast.dump(node)}@{phase}"
 
 
 def make_plan(nest: Nest, fn: Callable, inputs: Sequence[jax.ShapeDtypeStruct], tunable: Any = None) -> Plan:
@@ -232,6 +280,7 @@ class _Planner:
             self.env[nest.tunable] = tunable
         self.ranges: dict[str, Range] = {}
         self.indices: dict[str, Index] = {}
+        self.read_phases: dict[tuple[int, int], int] = {}
 
     def error(self, message: str, node: ast.AST | None = None) -> KernelError:
         return self.nest.error(message, node)
@@ -244,15 +293,17 @@ class _Planner:
         self.indices = {index.name: index for index in self._index_arrays()}
         parallel = tuple(self._range(loop) for loop in self.nest.parallel)
         reductions = tuple(self._range(loop) for loop in self.nest.reductions)
-        self.ranges = {r.var: r for r in (*parallel, *reductions)}
+        repeat_loops = tuple(self._range(rep.loop) for rep in self.nest.repeats)
+        self.ranges = {r.var: r for r in (*parallel, *reductions, *repeat_loops)}
         self._check_element_bounds()
-        phases, segments = self._phases(reductions)
-        operands, reads_ = self._operands(phases)
+        phases, segments, repeats = self._phases(reductions, repeat_loops)
+        operands, reads_ = self._operands(phases, segments, repeats)
         output_tiles = {name: self._output_tile(name, *outputs[name], parallel) for name in self.nest.outputs}
         self._check_reads_before_assignment()
-        carried_names = self._carried_names(phases, segments)
+        sequence = _Sequence(phases, segments, repeats)
+        carried_names = sequence.carried()
         scopes = self._scopes()
-        types = _TypeTrace(self, operands, reads_, carried_names, phases, segments).run()
+        types = _TypeTrace(self, operands, reads_, carried_names, sequence).run()
         for name in self.nest.outputs:
             self._check_store(output_tiles[name], types.stores[name])
         carried = {name: Carried(name, aval.shape, aval.dtype) for name, aval in types.carried.items()}
@@ -264,9 +315,12 @@ class _Planner:
             reductions=reductions,
             phases=phases,
             segments=segments,
+            repeats=repeats,
+            repeat_loops=repeat_loops,
             operands=operands,
             indices=tuple(self.indices.values()),
             reads=reads_,
+            read_phases=self.read_phases,
             outputs=tuple(
                 Output(name, *outputs[name], output_tiles[name], types.stores[name]) for name in self.nest.outputs
             ),
@@ -407,37 +461,117 @@ class _Planner:
             raise self.error(f"{text}: a {tile.shape} tile breaks the TPU layout: {'; '.join(problems)}", node)
         return tile
 
-    def _phases(self, reductions: tuple[Range, ...]) -> tuple[tuple[Phase, ...], tuple[tuple[ast.stmt, ...], ...]]:
-        """The reduction loops that take steps, and the code around them: a loop of one iteration (and no
-        mask) joins the code around it, its variable bound to its value first."""
+    def _phases(
+        self, reductions: tuple[Range, ...], repeat_loops: tuple[Range, ...]
+    ) -> tuple[tuple[Phase, ...], tuple[tuple[ast.stmt, ...], ...], tuple[Repeat, ...]]:
+        """The reduction loops that take steps, the code around them, and the repeat loops around them. A
+        loop of one iteration (and no mask) joins the code around it, its variable bound to its value first."""
         nest = self.nest
-        phases: list[Phase] = []
-        segments: list[list[ast.stmt]] = [list(nest.segments[0])]
-        for r, body, after in zip(reductions, nest.bodies, nest.segments[1:], strict=True):
-            if r.count == 1 and r.mask is None:
-                bind = ast.Assign([ast.Name(r.var, ast.Store())], ast.Constant(r.start))
-                segments[-1] += [ast.fix_missing_locations(ast.copy_location(bind, body[0])), *body, *after]
-            else:
-                phases.append(Phase(r, body))
-                segments.append(list(after))
-        return tuple(phases), tuple(tuple(s) for s in segments)
+        # The tile as written: code, reduction loops, and repeat loops of code and reduction loops.
+        items: list[tuple[Any, ...]] = [("code", nest.segments[0])]
+        starts = {rep.first: (rep, r) for rep, r in zip(nest.repeats, repeat_loops, strict=True)}
+        i = 0
+        while i < len(reductions):
+            if i not in starts:
+                items += [("loop", reductions[i], nest.bodies[i]), ("code", nest.segments[i + 1])]
+                i += 1
+                continue
+            rep, r = starts[i]
+            inner: list[tuple[Any, ...]] = [("code", rep.before)]
+            for j in range(rep.first, rep.last):
+                inner += [("code", nest.segments[j])] if j > rep.first else []
+                inner.append(("loop", reductions[j], nest.bodies[j]))
+            items += [("repeat", r, rep.loop.node, [*inner, ("code", rep.after)]), ("code", nest.segments[rep.last])]
+            i = rep.last
 
-    def _operands(self, phases: tuple[Phase, ...]) -> tuple[tuple[Operand, ...], dict[str, Operand]]:
+        phases: list[Phase] = []
+        segments: list[list[ast.stmt]] = [[]]
+        repeats: list[tuple[Range, int, int]] = []
+        afters: list[list[ast.stmt]] = []  # each repeat loop's `after`
+        code = segments[-1]  # where the tile's code goes next
+        for item in self._inline(items):
+            if item[0] == "code":
+                code += item[1]
+            elif item[0] == "loop":
+                phases.append(Phase(item[1], item[2]))
+                segments.append([])
+                code = segments[-1]
+            else:
+                first, before = len(phases), []
+                for sub in item[2]:
+                    if sub[0] == "code":
+                        (before if len(phases) == first else segments[-1]).extend(sub[1])
+                    else:
+                        own = tuple(before) if len(phases) == first else ()
+                        phases.append(Phase(sub[1], sub[2], own, len(repeats)))
+                        segments.append([])
+                repeats.append((item[1], first, len(phases)))
+                afters.append([])
+                code = afters[-1]
+        loops = tuple(Repeat(r, a, b, tuple(after)) for (r, a, b), after in zip(repeats, afters, strict=True))
+        return tuple(phases), tuple(tuple(s) for s in segments), loops
+
+    def _inline(self, items: list[tuple[Any, ...]]) -> list[tuple[Any, ...]]:
+        """`items` with the loops of one iteration (and no mask) as code: a reduction loop's binding its
+        variable first."""
+        out: list[tuple[Any, ...]] = []
+        for item in items:
+            if item[0] == "code":
+                out.append(item)
+            elif item[0] == "loop":
+                r, body = item[1], item[2]
+                if r.count == 1 and r.mask is None:
+                    out.append(("code", (_bind(r, body[0]), *body)))
+                else:
+                    out.append(item)
+            else:
+                r, node, inner = item[1], item[2], self._inline(item[3])
+                if r.count == 1:  # (its variable, read across phases, is bound at every step: codegen.py)
+                    out += inner
+                elif not any(sub[0] == "loop" for sub in inner):
+                    raise self.error(
+                        f"the repeat loop over `{r.var}` has no reduction loop of more than one iteration to take "
+                        "steps: give one a mask, or more iterations",
+                        node,
+                    )
+                else:
+                    out.append(("repeat", r, inner))
+        return out
+
+    def _operands(
+        self, phases: tuple[Phase, ...], segments: tuple[tuple[ast.stmt, ...], ...], repeats: tuple[Repeat, ...]
+    ) -> tuple[tuple[Operand, ...], dict[str, Operand]]:
         operands: list[Operand] = []
         by_key: dict[str, Operand] = {}
         params = {name: i for i, name in enumerate(self.nest.params)}
+        # The phase whose steps run each tile read (for windows only a repeat loop moves).
+        regions = [(0, segments[0])] + [(rep.last - 1, rep.after) for rep in repeats]
+        for p, phase in enumerate(phases):
+            regions += [(p, phase.before), (p, phase.body), (p, segments[p + 1])]
+        runs_in = {
+            (n.lineno, n.col_offset): p
+            for p, stmts in regions
+            for stmt in stmts
+            for n in ast.walk(stmt)
+            if isinstance(n, ast.Subscript)
+        }
+        repeat_vars = {rep.range.var for rep in repeats}
         subscripts = [n for stmt in self.nest.tile for n in ast.walk(stmt) if isinstance(n, ast.Subscript)]
         for node in sorted(subscripts, key=lambda n: (n.lineno, n.col_offset)):  # in source order
             is_index = isinstance(node.value, ast.Name) and node.value.id in self.indices
             param = params.get(node.value.id) if isinstance(node.value, ast.Name) and not is_index else None
-            key = read_key(node)
-            if param is None or key in by_key:
+            if param is None:
                 continue
             spec = self.inputs[param]
             index = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
             tile = self._tile(node.value.id, spec.shape, spec.dtype, index, node)
             moving = {v for v in tile.loops if self.ranges[v].count > 1}  # loops of one block don't move it
             phase = next((p for p, ph in enumerate(phases) if ph.range.var in moving), None)
+            if phase is None and moving & repeat_vars:  # streamed with the phase whose steps read it
+                phase = self.read_phases[(node.lineno, node.col_offset)] = runs_in[(node.lineno, node.col_offset)]
+            key = _read_key(node, self.read_phases)
+            if key in by_key:
+                continue
             if not moving:
                 kind = Kind.ONCE
             elif phase is not None or not phases:
@@ -567,21 +701,6 @@ class _Planner:
                     stmt,
                 )
 
-    def _carried_names(self, phases: tuple[Phase, ...], segments: tuple[tuple[ast.stmt, ...], ...]) -> set[str]:
-        """Values a tile carries from one step to another (kept in VMEM): read by a phase's body before it
-        assigns them; or read by the code after a phase, but made before that phase. (The code after a phase
-        runs in the phase's last step, after its body: it sees the body's values; but where a mask may leave
-        a tile's phase one empty step, whose body doesn't run, it reads them from VMEM.)"""
-        carried: set[str] = set()
-        made = assigned(segments[0])
-        for phase, after in zip(phases, segments[1:], strict=True):
-            carried |= first_reads(phase.body) & (made | assigned(phase.body))
-            carried |= (first_reads(after) & made) - assigned(phase.body)
-            if phase.range.mask is not None:
-                carried |= first_reads(after) & assigned(phase.body)
-            made |= assigned(phase.body) | assigned(after)
-        return carried
-
     def _constants(self) -> dict[str, Any]:
         """The names tile code reads that aren't its own: the module's, the closure's and the prologue's."""
         nest = self.nest
@@ -610,13 +729,70 @@ class _Types:
     stores: dict[str, jax.ShapeDtypeStruct]
 
 
-_LAST = "last"  # the segment after the last phase
+_LAST = "last"  # the code that ends a tile
+
+
+class _Sequence:
+    """A tile's code in the order it runs, as regions: the code at its first step; for each phase, the
+    repeat loop's code before it, its body (twice: what a step leaves, the next step starts from) and the
+    code after it; after a repeat loop's last phase in its last iteration, the code after the loop. A
+    repeat loop runs twice over: what an iteration leaves, the next starts from."""
+
+    def __init__(
+        self, phases: tuple[Phase, ...], segments: tuple[tuple[ast.stmt, ...], ...], repeats: tuple[Repeat, ...]
+    ) -> None:
+        self.phases, self.segments, self.repeats = phases, segments, repeats
+
+    def unrolled(self) -> Iterator[tuple[int, int, tuple[ast.stmt, ...]]]:
+        """(phase, iteration, the code after it) in the order a tile runs them, repeat loops twice over."""
+        p = 0
+        while p < len(self.phases):
+            r = self.phases[p].repeat
+            if r is None:
+                yield p, 0, self.segments[p + 1]
+                p += 1
+                continue
+            rep = self.repeats[r]
+            for it in (0, 1):
+                for q in range(rep.first, rep.last):
+                    end = rep.after if it == 1 and q == rep.last - 1 else ()
+                    yield q, it, self.segments[q + 1] + end
+            p = rep.last
+
+    def regions(self) -> list[tuple[str, tuple[ast.stmt, ...]]]:
+        """The regions, labelled: "seg..." for code (the last: `_LAST`), "body<phase>.<iteration>" for a
+        phase's body at its first step, "+" after it for its next."""
+        regions = [("seg0", self.segments[0])]
+        for n, (p, it, end) in enumerate(self.unrolled()):
+            phase = self.phases[p]
+            if phase.before:
+                regions.append((f"seg-before{n}", phase.before))
+            regions += [(f"body{p}.{it}", phase.body), (f"body{p}.{it}+", phase.body), (f"seg-after{n}", end)]
+        regions[-1] = (_LAST, regions[-1][1])
+        return regions
+
+    def carried(self) -> set[str]:
+        """Values a tile carries from one step to another (kept in VMEM): read by code that runs in a scope of
+        its own (the kernel's functions for the code at a tile's first step, a phase's code before it, its
+        body; and at its last step, its body with the code after it) before assigning them, after an earlier
+        scope assigned them. (Where a mask may leave a phase's tile one empty step, whose body doesn't run,
+        the code after it is a scope apart from the body.)"""
+        scopes = [self.segments[0]]
+        for p, _, end in self.unrolled():
+            phase = self.phases[p]
+            scopes += [phase.before, phase.body]
+            scopes += [phase.body, end] if phase.range.mask is not None else [phase.body + end]
+        carried: set[str] = set()
+        made: set[str] = set()
+        for scope in scopes:
+            carried |= first_reads(scope) & made
+            made |= assigned(scope)
+        return carried
 
 
 class _TypeTrace:
-    """Runs the tile code once with abstract values (`jax.eval_shape`): the segments in order, each phase's
-    body twice between them (a value's type after its first step must be its type after every step).
-    Records the type of every value assigned and stored."""
+    """Runs the tile code once with abstract values (`jax.make_jaxpr`): its regions in the order they run
+    (`_Sequence`). Records the type of every value assigned and stored."""
 
     def __init__(
         self,
@@ -624,17 +800,12 @@ class _TypeTrace:
         operands: tuple[Operand, ...],
         reads_: Mapping[str, Operand],
         carried: set[str],
-        phases: tuple[Phase, ...],
-        segments: tuple[tuple[ast.stmt, ...], ...],
+        sequence: _Sequence,
     ) -> None:
         self.planner, self.nest = planner, planner.nest
         self.operands, self.reads, self.carried = operands, reads_, carried
-        # The regions in the order they run, labelled (a phase's body runs twice: "body0", "body0+").
-        self.regions: list[tuple[str, tuple[ast.stmt, ...]]] = [("seg0" if phases else _LAST, segments[0])]
-        for p, phase in enumerate(phases):
-            after = _LAST if p == len(phases) - 1 else f"seg{p + 1}"
-            self.regions += [(f"body{p}", phase.body), (f"body{p}+", phase.body), (after, segments[p + 1])]
-        self.notes: dict[tuple[str, int], dict[str, Any]] = {}  # (segment, id(stmt)) -> name -> type
+        self.regions = sequence.regions() if sequence.phases else [(_LAST, sequence.segments[0])]
+        self.notes: dict[tuple[str, int], dict[str, Any]] = {}  # (region, id(stmt)) -> name -> type
         self.stores: dict[str, jax.ShapeDtypeStruct] = {}
         self.stmts: dict[int, ast.stmt] = {}
 
@@ -709,11 +880,11 @@ class _TypeTrace:
 
     def _rewrite[T: ast.AST](self, tree: T) -> T:
         index = {op.name: i for i, op in enumerate(self.operands)}
-        reads_ = self.reads
+        reads_, read_phases = self.reads, self.planner.read_phases
 
         class Reads(ast.NodeTransformer):
             def visit_Subscript(self, node: ast.Subscript) -> ast.expr:
-                operand = reads_.get(read_key(node))
+                operand = reads_.get(_read_key(node, read_phases))
                 if operand is None:
                     return self.generic_visit(node)  # type: ignore[return-value]
                 return ast.copy_location(ast.Name(f"__operand{index[operand.name]}", ast.Load()), node)
@@ -781,6 +952,12 @@ class _TypeTrace:
         for (_, stmt), values in self.notes.items():
             assigned_.setdefault(stmt, {}).update(values)  # a body statement: its type in the second step
         return assigned_
+
+
+def _bind(r: Range, at: ast.AST) -> ast.stmt:
+    """`var = start`: a loop of one iteration's variable, bound where its body runs inline."""
+    bind = ast.Assign([ast.Name(r.var, ast.Store())], ast.Constant(r.start))
+    return ast.fix_missing_locations(ast.copy_location(bind, at))
 
 
 def _fresh(base: str, taken: set[str]) -> str:

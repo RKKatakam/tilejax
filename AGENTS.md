@@ -80,6 +80,14 @@ A tile's reduction loops are its phases (`plan.Phase`); a reduction loop of one 
 the code around it by plan.py (its variable bound by a synthetic assignment), so it takes no step and the
 windows it moves are fetched once. Values cross phases through VMEM scratch exactly as they cross steps.
 
+A repeat loop (`plan.Repeat`, a loop around reduction loops) repeats its phases' steps per iteration
+(`Plan.instances`); steps then always decode through tables whose codes hold the iteration (`rb`). Its own
+code before its first phase is that phase's `before` (run at its first step), the code after its last phase
+is `segments[last]` (every iteration), and the tile's code after the loop is `Repeat.after` (run when
+`rb` is the last iteration). Windows only a repeat loop moves stream with the phase whose steps read them
+(`Plan.read_phases`), so prefetch crosses iterations: this is cross-layer weight prefetch. Which values are
+carried is decided on the code in the order it runs, repeat loops twice over (`plan._Sequence`).
+
 ## Measured facts that shape the code (TPU v5e, JAX 0.11.2)
 
 Each of these was found on hardware; don't undo them without measuring again.
@@ -136,7 +144,7 @@ uv run python examples/matmul.py        # prints the generated source
 
 Tests: `test_parse.py` (every syntax rule), `test_plan.py`, `test_schedule.py`, `test_codegen.py` (every
 emission path runs in the interpreter with the race detector and cross-lowers to Mosaic for a v5e),
-`test_index_arrays.py` (SMEM index arrays, runtime masks and windows), `test_api.py`, `test_profiling.py` (synthetic traces), `test_tunable.py`, `test_tune.py` (the search and
+`test_index_arrays.py` (SMEM index arrays, runtime masks and windows), `test_repeat_loops.py`, `test_api.py`, `test_profiling.py` (synthetic traces), `test_tunable.py`, `test_tune.py` (the search and
 proposals with synthetic profiles; tuning end to end with `tune._can_time` and `profiling.measure` faked,
 kernels really running in the interpreter), `test_examples.py`, `test_tpu.py` (`tpu` marker: real hardware
 only). `helpers.make_kernel(source, **globals)` builds a kernel from a source string, which
