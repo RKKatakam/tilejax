@@ -114,7 +114,7 @@ class MegaTiles:
     rows of Wo, MLP hidden units, per-layer-embedding units, vocabulary rows."""
 
     block_d: int = autokernel.choice(128, 256, 512, 768, 1536, default=256)
-    block_kv: int = autokernel.choice(128, 256, 512, default=128)
+    block_kv: int = autokernel.choice(128, 256, 512, default=256)
     block_a: int = autokernel.choice(256, 512, 1024, 2048, default=512)
     block_f: int = autokernel.choice(256, 512, 1024, 2048, default=256)
     block_p: int = autokernel.choice(128, 256, default=128)
