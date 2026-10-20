@@ -752,7 +752,8 @@ class Generator:
         config: Config = self.params["config"]
         if self.mega is None:
             self.mega = self.batch <= MEGA_MAX_BATCH and config.kv_heads == 1
-        self.max_len = -(-(self.prompt_len + self.new_tokens) // 128) * 128
+        # Caches in whole blocks of the largest decode block (512): a block never spans two sequences' caches.
+        self.max_len = -(-(self.prompt_len + self.new_tokens) // 512) * 512
         steps = self.new_tokens - 1
         prefill_fn = functools.partial(prefill, max_len=self.max_len, tiles=self.tiles)
         if self.mega:
