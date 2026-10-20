@@ -25,20 +25,24 @@ WEIGHTS. `load(path)` reads the checkpoint's 600 text tensors (`model.language_m
 model.safetensors with a minimal reader of the format (an 8-byte header length, a JSON header of names,
 dtypes, shapes and byte offsets, then the raw little-endian data: bf16 is read as uint16 and viewed as
 ml_dtypes' bfloat16) and packs them once into the layouts the kernels read: every nn.Linear weight (out,
-in) transposed to (in, out), norm weights as (1, n) rows, the layer scalar as a (1, D) row. The tied
-embedding (V, D) stays as is: the LM head reads it transposed in place. The per-layer-embedding table
-(V, 35 * 256: 4.7 GB) stays on the device (the text weights total 9.3 GB of the v5e's 16 GB) and each
-step gathers only its tokens' rows. KV-shared layers' unused k/v projections are not loaded.
+in) transposed to (in, out), norm weights as (1, n) rows, the layer scalar as a (1, D) row, each kind of
+weight STACKED over the layers that have it (`stack_layers`: q / Wo per attention kind, k / v per kind
+over the non-shared layers, MLPs per width, the rest per layer). Every kernel, per-layer or the whole-step
+one, reads a layer's blocks out of the stacks through an index array of its slots (`w_q_s[slots[1], d :
+d + bd, :]`), so each weight is in HBM once and nothing is sliced or copied per step. The tied embedding
+(V, D) stays as is: the LM head reads it transposed in place. The per-layer-embedding table (V, 35 * 256:
+4.7 GB) stays on the device (the text weights total 9.3 GB of the v5e's 16 GB) and each step gathers only
+its tokens' rows. KV-shared layers' unused k/v projections are not loaded.
 
 REFERENCE. `reference_forward` is the model written straight from the definition in plain JAX, rounding
 to bf16 where Hugging Face's bf16 model does (between ops; norms and softmax in f32).
 
 FAST PATH (gemma4_kernels.py's kernels, plain-JAX glue for embedding gathers, the PLE inputs, RoPE
-tables and cache writes). Every layer is three kernels:
+tables and cache writes). Prefill (and decoding big batches) runs three kernels per layer:
   1. `qkv_projection` (`q_projection` on KV-shared layers): input RMSNorm + projections + q/k/v norms +
-     RoPE. Rows are tokens: prefill passes all B * S tokens as one sequence of rows (1, B * S, D) with
-     each row's RoPE tables, so its row tiles span prompts (128-token prompts would be too few rows per
-     tile to reuse the weights); decode passes the B new tokens the same way.
+     RoPE. Rows are tokens: prefill passes all B * S tokens as rows (B * S, D) with each row's RoPE
+     tables, so its row tiles span prompts (128-token prompts would be too few rows per tile to reuse the
+     weights); decode passes the B new tokens the same way.
   2. attention: prefill, `make_attention(head_dim, window)` (flash attention over each prompt's keys);
      decode, decode.py's `gqa_decode` over the KV cache (one tile per sequence, a runtime mask at its
      length). Sliding layers' caches are RING BUFFERS of the last 512 positions (position p in slot
@@ -47,10 +51,15 @@ tables and cache writes). Every layer is three kernels:
   3. `post_attention`: Wo, norms, residuals, the GELU MLP, the per-layer-embedding gate, projection and
      norm, the layer scalar, on rows (all B tokens in one tile when decoding: every weight read once).
 The final norm + tied LM head + soft-cap is `lm_head` (logits) or, for greedy decoding, `lm_head_argmax`
-(token ids only).
+(token ids only). Prompts are prefilled in chunks of about PREFILL_CHUNK tokens.
 
-`generate` runs prefill, then the decode steps in ONE jitted `lax.fori_loop` (no host round trip per
-token; the caches are donated and updated in place), and reports the prefill time and decode tokens/s.
+Decoding small batches (up to MEGA_MAX_BATCH sequences), where a step is bound by reading 4.5 GB of
+weights, runs the WHOLE STEP AS ONE KERNEL instead (gemma4_megakernel.py: every layer and the greedy LM head,
+the next layer's weights prefetched while this one runs; its caches are the same, stacked per kind).
+
+`generate` (and `Generator`, which compiles once and runs many times) runs prefill, then the decode steps
+in ONE jitted `lax.fori_loop` (no host round trip per token; the caches are donated and updated in place),
+and reports the prefill time and decode tokens/s.
 
 Run with `uv run python examples/gemma4.py`; without a TPU it runs a tiny random model in the interpreter.
 """

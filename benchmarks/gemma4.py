@@ -5,6 +5,7 @@ token on the host, prefill included, after a warm-up run that compiles and tunes
 
     python benchmarks/gemma4.py --model /content/gemma-4-E2B            # the real weights
     python benchmarks/gemma4.py --batch 1 --batch 8 --no-tune           # default tiles, no tuning
+    python benchmarks/gemma4.py --batch 64 --path mega                   # the one-kernel decode step at B 64
     python benchmarks/gemma4.py --small                                  # a tiny random model (CPU smoke test)
 
 Prints a JSON line per batch ("engine": "autokernel", batch, prompt_len, new_tokens, seconds,
@@ -24,8 +25,9 @@ import jax.numpy as jnp
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "examples"))
+from decode import DecodeTiles
 from gemma4 import TINY, Generator, Tiles, init_params, load
-from gemma4_kernels import AttentionTiles, HeadTiles, PostTiles, QkvTiles
+from gemma4_kernels import AttentionTiles, HeadTiles, MegaTiles, PostTiles, QkvTiles
 
 BATCHES = (1, 8, 32, 64, 128, 256)
 
@@ -38,6 +40,12 @@ def main() -> None:
     parser.add_argument("--batch", type=int, action="append", help="batch sizes (repeatable)")
     parser.add_argument("--no-tune", action="store_true", help="the kernels' default tiles instead of tuning")
     parser.add_argument("--small", action="store_true", help="a tiny random model, few tokens (smoke test)")
+    parser.add_argument(
+        "--path",
+        choices=("auto", "mega", "layers"),
+        default="auto",
+        help="decode with the one-kernel step (mega), three kernels per layer (layers), or by batch size (auto)",
+    )
     args = parser.parse_args()
     if args.small:
         params, vocab = init_params(TINY), TINY.vocab
@@ -51,14 +59,15 @@ def main() -> None:
         batches = args.batch or list(BATCHES)
     tiles = Tiles()
     if args.no_tune:
-        tiles = Tiles(qkv=QkvTiles(), attention=AttentionTiles(), post=PostTiles(), head=HeadTiles())
+        tiles = Tiles(QkvTiles(), AttentionTiles(), DecodeTiles(), PostTiles(), HeadTiles(), MegaTiles())
     rng = np.random.default_rng(0)
     rows = []
     for batch in batches:
         high = min(200_000, vocab)
         prompts = np.stack([rng.integers(min(1000, high - 1), high, args.prompt_len) for _ in range(batch)])
         prompts = prompts.astype(np.int32)
-        generator = Generator(params, batch, args.prompt_len, args.new_tokens, tiles)
+        mega = {"auto": None, "mega": True, "layers": False}[args.path]
+        generator = Generator(params, batch, args.prompt_len, args.new_tokens, tiles, mega)
         start = time.perf_counter()
         generator(jnp.asarray(prompts))  # warm-up: tunes (on a TPU) and compiles this batch's shapes
         warmup = time.perf_counter() - start
@@ -76,16 +85,17 @@ def main() -> None:
             "prefill_ms": round(timings.prefill_ms, 2),
             "decode_ms_per_step": round(timings.decode_ms / max(args.new_tokens - 1, 1), 3),
             "decode_tokens_per_s": round(timings.decode_tokens_per_s, 1),
+            "decode": "megakernel" if generator.mega else "per-layer kernels",
             "warmup_s": round(warmup, 1),
         }
         rows.append(row)
         print(json.dumps(row), flush=True)
     print(f"\nautokernel, Gemma 4 E2B (text), {jax.devices()[0].device_kind}")
-    print("  batch   seconds  output tok/s  prefill ms  decode ms/step")
+    print("  batch   seconds  output tok/s  prefill ms  decode ms/step  decode")
     for row in rows:
         print(
             f"  {row['batch']:>5}  {row['seconds']:8.3f}  {row['output_tokens_per_s']:12.1f}"
-            f"  {row['prefill_ms']:10.2f}  {row['decode_ms_per_step']:14.3f}"
+            f"  {row['prefill_ms']:10.2f}  {row['decode_ms_per_step']:14.3f}  {row['decode']}"
         )
 
 

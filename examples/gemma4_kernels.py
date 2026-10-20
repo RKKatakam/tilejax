@@ -15,14 +15,18 @@ and 512 on full-attention ones, GELU-tanh MLP, per-layer embeddings):
 Four kinds of kernel, each one loop nest, used by prefill (B sequences of S tokens) and decode (B new
 tokens, one per sequence) alike:
 
+Weights are stacks over the layers (gemma4.py's layout); a kernel reads its layer's blocks through `slots`,
+a small int32 index array ([layer, q slot, kv slot], ...): `w_q[slots[1], d : d + bd, :]` is a window
+chosen on the device, so one compiled kernel serves every layer of a shape and no weight is copied.
+
 `qkv_projection` / `q_projection`: the input RMSNorm fused with the projections (the row scale commutes
 with the matmul: rmsnorm(x) @ W = inv_rms * ((x * w_in) @ W), rmsnorm_matmul.py's trick), then the
 per-head norms and RoPE as the epilogue of the reduction over d_model, on the f32 accumulators: q and k
 norms with their weights, v's norm without one. RoPE is the rotate-half form over the WHOLE head, cos and
 sin being input tables of the rows' positions: the proportional RoPE of the full-attention layers (only
 the first quarter of the frequencies turn; the rest have frequency 0, so cos 1 and sin 0) is the same code
-with other tables. x is (B, S, D); for decoding, the B new tokens are the rows of one sequence (1, B, D)
-and the tables hold row b's position (qwen3_models.py's trick). KV-shared layers project only q.
+with other tables. x is rows of tokens (M, D), the tables hold each row's position (prefill: all prompts'
+tokens; decode: the B new tokens, row b at position lengths[b]). KV-shared layers project only q.
 
 `make_attention(head_dim, window)`: causal GQA attention (flash attention over key blocks, every head of
 a (batch, query block) tile at once; gqa_attention.py's `gqa_step`: a kv head's group of query heads is
@@ -49,7 +53,7 @@ Decode attention is decode.py's `gqa_decode` (one tile per sequence, a runtime m
 length, every head at once): sliding layers keep a ring buffer of the last `window` positions (softmax
 doesn't care about the order of the keys), full layers a contiguous cache.
 
-Run with `uv run python examples/gemma4_kernels.py`; without a TPU it runs in the Pallas TPU interpreter.
+tests/test_gemma4.py runs each kernel in the Pallas TPU interpreter and cross-lowers it at E2B's shapes.
 """
 
 from __future__ import annotations
