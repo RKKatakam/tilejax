@@ -219,6 +219,8 @@ class TpuKernel:
         self._tuning: dict[_Context, list[tune_lib.Candidate]] = {}
         self._measured: set[_Context] = set()
         self._cache_keys: dict[_Context, str] = {}  # tuning cache keys of the signatures searched
+        self._cached_history: dict[_Context, dict[str, float]] = {}  # measurements earlier runs cached
+        self._history: dict[_Context, dict[str, float]] = {}  # measurements, this run's included
         self._compiled: dict[tuple, tuple[Lowered, Callable[..., Any], Callable[..., Any]]] = {}
         self._verified: set[_Context] = set()
         self._reference: dict[tuple, Callable] = {}  # by context and tuned constants
@@ -342,9 +344,10 @@ class TpuKernel:
     def _lower(self, ctx: _Context, inputs: tuple[Any, ...]) -> Lowered:
         options = self.options
         # Measuring without tuned names still picks the buffer depth: the search then has one combination.
-        search = bool(options.tune) or options.autotune == "measure"
+        measuring = options.autotune in ("measure", "profile")
+        search = bool(options.tune) or measuring
         lowered = self._lowered.get(ctx)
-        if lowered is not None and (options.autotune != "measure" or ctx in self._measured):
+        if lowered is not None and (not measuring or ctx in self._measured):
             return lowered
         with self._lock:
             if ctx not in self._lowered:
@@ -360,17 +363,46 @@ class TpuKernel:
                             stacklevel=4,
                         )
             # Measuring needs real arrays on a real TPU: do it on the first call that has them.
-            measure = search and options.autotune == "measure" and ctx not in self._measured
+            measure = search and measuring and ctx not in self._measured
             if measure and _concrete(inputs) and hardware.on_tpu():
                 self._measured.add(ctx)
                 arrays = tuple(jax.numpy.asarray(a) for a in inputs)
                 check = self._accuracy_check(ctx, arrays)
-                best = tune_lib.measure(self._tuning[ctx], arrays, options.measure_top, check)
+                if options.autotune == "profile":
+                    best = self._profile_guided(ctx, inputs, arrays, check)
+                else:
+                    best = tune_lib.measure(self._tuning[ctx], arrays, options.measure_top, check)
                 if best is not None:
                     self._lowered[ctx] = best
                     seconds = next(c.measured_s for c in self._tuning[ctx] if c.lowered is best)
-                    self._remember(ctx, best, seconds)
+                    self._remember(ctx, best, seconds, self._history.get(ctx, {}))
             return self._lowered[ctx]
+
+    def _profile_guided(
+        self, ctx: _Context, inputs: tuple[Any, ...], arrays: tuple[Any, ...], check: Callable
+    ) -> Lowered | None:
+        """`autotune="profile"`: `tune.guided` over this signature's candidates, timed and diagnosed from the
+        device's own trace, continuing from the measurements earlier runs left in the tuning cache."""
+        from . import profiling
+
+        options, specs = self.options, [_spec(a) for a in inputs]
+        if self._tuning[ctx] and self._tuning[ctx][0].cached:  # a cached pick: search again to explore from it
+            self._tuning[ctx] = tune_lib.search(ctx.nest, ctx.env, specs, options)
+        history = self._history.setdefault(ctx, dict(self._cached_history.get(ctx, {})))
+
+        def make(c: tune_lib.Candidate) -> Lowered:
+            return lower(ctx.nest, ctx.env, specs, options, c.overrides, c.buffers)
+
+        return tune_lib.guided(
+            self._tuning[ctx],
+            arrays,
+            options.measure_top,
+            make,
+            lambda lw, xs: profiling.profile_lowered(lw, xs).device_s,
+            lambda lw, xs: profiling.profile_lowered(lw, xs, runs=3, trace=True, options=options).bottleneck,
+            check,
+            history,
+        )
 
     def _search(self, ctx: _Context, specs: list[jax.ShapeDtypeStruct]) -> None:
         """Tune the kernel for a new signature: the pick of an earlier search from the tuning cache when there
@@ -378,7 +410,9 @@ class TpuKernel:
         options = self.options
         key = self._cache_keys[ctx] = self._cache_key(ctx, specs)
         entry = cache_lib.load(key)
-        if entry is not None and (entry.measured_s is not None or options.autotune != "measure"):
+        if entry is not None:
+            self._cached_history[ctx] = dict(entry.history)
+        if entry is not None and (entry.measured_s is not None or options.autotune == "model"):
             try:
                 lowered = lower(ctx.nest, ctx.env, specs, options, entry.overrides, entry.buffers)
             except AutoKernelError:  # not a valid pick any more: search again
@@ -388,7 +422,8 @@ class TpuKernel:
                     dict(entry.overrides), entry.buffers, lowered, None, entry.measured_s, lowered.estimate, True
                 )
                 self._tuning[ctx], self._lowered[ctx] = [candidate], lowered
-                if entry.measured_s is not None:
+                # A measured pick is final for "measure"; "profile" carries on exploring from it when it runs.
+                if entry.measured_s is not None and options.autotune == "measure":
                     self._measured.add(ctx)
                 return
         self._tuning[ctx] = tune_lib.search(ctx.nest, ctx.env, specs, options)
@@ -405,10 +440,13 @@ class TpuKernel:
         chip = f"{hw.name}:{jax.devices()[0].device_kind}" if hardware.on_tpu() else f"{hw.name}:planned"
         return cache_lib.key(ctx.nest.fdef, constants, specs, chip, self.options)
 
-    def _remember(self, ctx: _Context, lowered: Lowered, measured_s: float | None) -> None:
+    def _remember(
+        self, ctx: _Context, lowered: Lowered, measured_s: float | None, history: dict[str, float] | None = None
+    ) -> None:
         key = self._cache_keys.get(ctx)
         if key is not None:
-            cache_lib.store(key, cache_lib.Entry(dict(lowered.overrides), lowered.buffers, measured_s))
+            entry = cache_lib.Entry(dict(lowered.overrides), lowered.buffers, measured_s, dict(history or {}))
+            cache_lib.store(key, entry)
 
     def _accuracy_check(self, ctx: _Context, arrays: tuple[Any, ...]) -> Callable[[Lowered], str | None]:
         """`check(lowered)` for `tune_lib.measure`: run a candidate on `arrays` and compare it with the Python
@@ -716,7 +754,10 @@ def tpu(
             ranked by a cost model built from the TPU's specs and JAX's cost analysis.
         autotune: "model" picks the best predicted candidate; "measure" also times the best eight block
             sizes on the TPU on the first call with concrete arrays, then 2 and 3 buffers for the winner
-            (without `tune`, just the 2 and 3 buffers of the kernel as written).
+            (without `tune`, just the 2 and 3 buffers of the kernel as written); "profile" times candidates by
+            their device time in a profiler trace and follows the bottleneck it finds (exposed DMA, per-step
+            overhead, compute) to the next one to try, keeping every measurement in the tuning cache so each
+            run continues from the last (see `tune.guided`; best with `autokernel.enable_profiling()`).
         buffers: VMEM slots per streamed input (2 = double buffering). Default: 3 where they fit in VMEM,
             else 2; `autotune="measure"` tries both.
         target: the TPU to plan for when not running on one, e.g. "v5e" (default) or "v5p".

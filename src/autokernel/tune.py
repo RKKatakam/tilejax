@@ -73,6 +73,7 @@ class Candidate:
     measured_s: float | None = None
     estimate: Estimate | None = None  # the cost model's estimate, for every valid candidate
     cached: bool = False  # the pick of an earlier search, read from the tuning cache (see `cache`)
+    bottleneck: str | None = None  # what profiling found limits it (`autotune="profile"`): dma/overhead/compute
 
     @property
     def predicted_s(self) -> float:
@@ -105,7 +106,7 @@ def search(
     cache = space.cache
     for c in diverse([c for c in candidates if c.error is None], max(1, options.measure_top)):
         c.lowered = build(plan(nest, fn, specs, options, c.overrides, cost_cache=cache), options)
-        if options.autotune == "measure" and not options.buffers and c.buffers == 3:
+        if options.autotune in ("measure", "profile") and not options.buffers and c.buffers == 3:
             p2 = plan(nest, fn, specs, options, c.overrides, 2, cost_cache=cache)
             candidates.append(Candidate(c.overrides, 2, build(p2, options), estimate=p2.estimate))
     candidates.sort(key=space.rank)
@@ -612,6 +613,106 @@ def measure(
             time_candidate(c)
     timed = [c for c in valid if c.measured_s is not None]
     return min(timed, key=lambda c: c.measured_s).lowered
+
+
+def candidate_key(c: Candidate) -> str:
+    """A candidate's tuned values and buffer depth as a string, the same in every process (the tuning cache's
+    history of measurements is keyed by it)."""
+    values = ", ".join(f"{k}={type(v).__name__}:{v!r}" for k, v in sorted(c.overrides.items()))
+    return f"{values}; buffers={c.buffers}"
+
+
+def _volume(c: Candidate) -> float:
+    """The product of a candidate's int block sizes: bigger blocks mean fewer steps and fewer bytes per flop."""
+    sizes = [v for v in c.overrides.values() if isinstance(v, (int, np.integer)) and not isinstance(v, bool)]
+    return float(np.prod(sizes)) if sizes else 0.0
+
+
+GUIDED_SEED = 4  # candidates the cost model ranks best, measured before following the profile
+GUIDED_SPREAD = 8  # without a direction to follow, try no further down the model's ranking than this
+
+
+def guided(
+    candidates: list[Candidate],
+    args: Sequence[Any],
+    budget: int,
+    make: Callable[[Candidate], Lowered],
+    seconds: Callable[[Lowered, Sequence[Any]], float],
+    diagnose: Callable[[Lowered, Sequence[Any]], str | None],
+    check: Callable[[Lowered], str | None] | None = None,
+    history: dict[str, float] | None = None,
+) -> Lowered | None:
+    """Profile-guided tuning: measure the cost model's best `GUIDED_SEED`, then repeatedly profile the fastest
+    so far and try the candidate its bottleneck points to, up to `budget` new measurements; the fastest, or
+    None if nothing ran.
+
+    - "dma" (copies not hidden behind compute): the same blocks with one more buffer, else bigger blocks;
+    - "overhead" (fixed per-step costs dominate): bigger blocks (fewer steps);
+    - "compute", or no diagnosis: the next candidates the model ranks best (no further than `GUIDED_SPREAD`).
+
+    `candidates` are ranked by the model; their `lowered` is built by `make` when first measured. `seconds`
+    measures device time, `diagnose` returns a bottleneck, `check` drops wrong results (see `measure`).
+    `history` maps `candidate_key` to seconds measured by earlier runs: those aren't measured again, and new
+    measurements are added to it, so successive runs keep improving on the pick until nothing is left to try.
+    """
+    history = history if history is not None else {}
+    valid = [c for c in candidates if c.error is None]
+    for c in valid:
+        if candidate_key(c) in history:
+            c.measured_s = history[candidate_key(c)]
+
+    def run(c: Candidate) -> None:
+        try:
+            if c.lowered is None:
+                c.lowered = make(c)
+            wrong = check(c.lowered) if check is not None else None
+            if wrong is not None:
+                c.error = f"wrong result: {wrong}"
+                return
+            c.measured_s = seconds(c.lowered, args)
+            history[candidate_key(c)] = c.measured_s
+        except Exception as e:  # e.g. Mosaic rejects it: drop the candidate
+            c.error = f"failed to run: {type(e).__name__}"
+
+    def timed() -> list[Candidate]:
+        return [c for c in valid if c.measured_s is not None and c.error is None]
+
+    spent = 0
+    for c in valid[:GUIDED_SEED]:
+        if spent < budget and c.measured_s is None:
+            run(c)
+            spent += 1
+    while spent < budget and timed():
+        best = min(timed(), key=lambda c: c.measured_s)
+        if best.lowered is None:
+            best.lowered = make(best)
+        best.bottleneck = diagnose(best.lowered, args)
+        nxt = _next_candidate(valid, best, best.bottleneck)
+        if nxt is None:
+            break
+        run(nxt)
+        spent += 1
+    if not timed():
+        return None
+    best = min(timed(), key=lambda c: c.measured_s)
+    if best.lowered is None:
+        best.lowered = make(best)
+    return best.lowered
+
+
+def _next_candidate(valid: list[Candidate], best: Candidate, bottleneck: str | None) -> Candidate | None:
+    """The untried candidate `best`'s bottleneck points to (see `guided`), best-ranked by the model first."""
+    untried = [c for c in valid if c.measured_s is None and c.error is None]
+    if bottleneck == "dma":
+        deeper = [c for c in untried if _shape(c) == _shape(best) and (c.buffers or 0) > (best.buffers or 0)]
+        if deeper:
+            return deeper[0]
+    if bottleneck in ("dma", "overhead"):
+        bigger = [c for c in untried if _volume(c) > _volume(best)]
+        if bigger:
+            return bigger[0]
+    near = [c for c in valid[:GUIDED_SPREAD] if c in untried]
+    return near[0] if near else None
 
 
 def _shape(c: Candidate) -> tuple:

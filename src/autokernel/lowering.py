@@ -34,7 +34,7 @@ __all__ = [
     "plan",
 ]
 
-AUTOTUNE = ("model", "measure")
+AUTOTUNE = ("model", "measure", "profile")
 # Slots per streamed input when none is asked for: three where they fit in VMEM (on a v5e, three
 # buffers ran a 512^3-tiled bf16 matmul 14% faster than two), else two.
 DEFAULT_BUFFERS = (3, 2)
@@ -64,6 +64,7 @@ class Options:
     tune: tuple[tuple[str, TuneValues], ...] = ()
     autotune: str = "model"
     measure_top: int = 8
+    trace: bool = False  # mark each step's waits and compute as profiler trace regions (see `profile`)
 
     def __post_init__(self) -> None:
         if self.matmul_precision not in mxu.MATMUL_PRECISIONS:
@@ -143,6 +144,7 @@ class Plan:
     aliased: list[str]
     estimate: cost_lib.Estimate
     overrides: dict[str, Any]
+    trace: bool = False  # generate with profiler trace regions
 
 
 def lower(
@@ -200,7 +202,7 @@ def plan(
             f"{nest.fn_name}: needs about {est.vmem_bytes / 2**20:.0f} MiB of VMEM, more than {room}; use smaller "
             "tiles or fewer buffers"
         )
-    return Plan(spec, sched, hw, cores, buffers, fills, aliased, est, dict(overrides or {}))
+    return Plan(spec, sched, hw, cores, buffers, fills, aliased, est, dict(overrides or {}), options.trace)
 
 
 def build(p: Plan, options: Options) -> Lowered:
@@ -216,6 +218,7 @@ def build(p: Plan, options: Options) -> Lowered:
         aliased=p.aliased,
         vmem_limit_bytes=limit,
         cost=est.cost_estimate(),
+        trace=p.trace,
     )
     return Lowered(
         source=generated.source,

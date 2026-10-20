@@ -31,18 +31,23 @@ from .api import TpuKernel, tpu
 from .errors import AutoKernelError
 from .fusion import FusedLowered
 from .lowering import Lowered
+from .profiling import KernelProfile, Profile, enable_profiling, profile
 from .program import ProgramLowered, ProgramNest, TpuProgram
 from .tiles import tile
 
 __all__ = [
     "AutoKernelError",
     "FusedLowered",
+    "KernelProfile",
     "Lowered",
+    "Profile",
     "ProgramLowered",
     "ProgramNest",
     "TpuKernel",
     "TpuProgram",
     "__version__",
+    "enable_profiling",
+    "profile",
     "tile",
     "tpu",
 ]

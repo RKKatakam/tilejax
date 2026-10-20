@@ -6,10 +6,11 @@ pick: the nest's source, the values of the constants it reads, the input signatu
 and the versions of JAX and autokernel. Entries live in `$AUTOKERNEL_CACHE_DIR` (default
 `~/.cache/autokernel`), one JSON file each under `tuning/`; `AUTOKERNEL_CACHE=0` turns the cache off.
 
-A measured pick (`autotune="measure"`) is only reused by a measured search, and a model pick by either
-(a measured search then measures again, and replaces it). Unreadable or stale entries are ignored, and a
-cache that can't be written is skipped: the cache never changes what a kernel computes, only how long
-finding its block sizes takes.
+A measured pick (`autotune="measure"`) is only reused by a measured search, and a model pick by either (a
+measured search then measures again, and replaces it). A profile-guided search (`autotune="profile"`) also
+keeps every candidate it measured, so each run carries on from what earlier runs learned. Unreadable or
+stale entries are ignored, and a cache that can't be written is skipped: the cache never changes what a
+kernel computes, only how long finding its block sizes takes.
 """
 
 from __future__ import annotations
@@ -40,6 +41,8 @@ class Entry:
     overrides: dict[str, Any]
     buffers: int
     measured_s: float | None  # None: the cost model's pick, not measured
+    # Every candidate measured so far (`autotune="profile"`), by `tune.candidate_key`: device seconds.
+    history: dict[str, float] = dataclasses.field(default_factory=dict)
 
 
 def enabled() -> bool:
@@ -135,7 +138,8 @@ def load(k: str) -> Entry | None:
         data = json.loads((directory() / f"{k}.json").read_text())
         overrides = {name: _decode(v) for name, v in data["overrides"].items()}
         measured = data["measured_s"]
-        return Entry(overrides, int(data["buffers"]), None if measured is None else float(measured))
+        history = {str(k): float(v) for k, v in data.get("history", {}).items()}
+        return Entry(overrides, int(data["buffers"]), None if measured is None else float(measured), history)
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return None
 
@@ -150,6 +154,7 @@ def store(k: str, entry: Entry) -> bool:
             "overrides": {name: _encode(v) for name, v in entry.overrides.items()},
             "buffers": int(entry.buffers),
             "measured_s": entry.measured_s,
+            "history": {k: float(v) for k, v in entry.history.items()},
         }
     except TypeError:
         return False

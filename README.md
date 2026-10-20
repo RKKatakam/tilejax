@@ -501,6 +501,51 @@ def matmul(x, y):
 block size like a module constant (`"auto"`, or explicit values `tune={"TM": (256, 512)}`), and the
 kernel, `reference` and `verify` all use the tuned value.
 
+### Profiling: where each kernel's time goes
+
+```python
+import autokernel
+autokernel.enable_profiling()  # first thing: before JAX starts its TPU backend
+
+report = autokernel.profile(model, *args)  # a kernel or a whole program, on a TPU
+print(report)
+```
+
+```
+kernel                           device us  model us   steps   compute  dma wait      fill     other  bottleneck
+matmul                              1723.7    1563.5    4096    1184.4     386.8       0.8     151.7  dma
+```
+
+(A 4096³ bf16 matmul with 256³ blocks on a v5e: 22% of its time is copies the pipeline didn't hide.)
+
+The kernels are built again with *trace regions*: every step marks its input waits (`<kernel>/wait`), the
+user's code (`<kernel>/compute`) and, inside it, waits for a free output slot (`<kernel>/out_wait`), which
+libtpu records with `--xla_enable_custom_call_region_trace=true` (what `enable_profiling` adds to
+`LIBTPU_INIT_ARGS`). A wait region's length is DMA time not hidden behind compute, so the report gives each
+kernel's device time next to the cost model's prediction, its compute, its exposed DMA waits, the pipeline
+fill, everything else (decoding steps, issuing copies), and the bottleneck: `dma`, `overhead` (fixed
+per-step costs: bigger blocks help) or `compute`. Fused kernels report per part, and XLA ops between kernels
+are listed by name. The trace stays in `report.logdir`: `tensorboard --logdir <it>` (or XProf) shows the
+timeline, step by step, with the waits and compute of each kernel and where copies overlap compute.
+Without the flag, the report has device times only. Kernels built normally have no regions: nothing changes
+unless you profile.
+
+### Profile-guided tuning: `autotune="profile"`
+
+```python
+@autokernel.tpu(tune="auto", autotune="profile")
+def matmul(x, y): ...
+```
+
+On the first call with concrete arrays on a TPU, candidates are timed by their device time in a profiler
+trace (no host overhead), and the search follows what the profile says: it measures the cost model's best
+four, then profiles the fastest so far and tries the candidate its bottleneck points to (exposed DMA: one
+more buffer, else bigger blocks; overhead: bigger blocks; compute: the model's next best), up to eight
+measurements. Every measurement goes into the tuning cache, so the next run starts from them and only tries
+what hasn't been measured: on a v5e, a 4096³ bf16 matmul's first run took 50 s to settle on 512×1024×4096
+(0.723 ms, compute-bound) and the second 3.3 s, measuring nothing new. Measured candidates are checked
+against the Python loops first, as with `"measure"`.
+
 ### The tuning cache
 
 A search's pick (the tuned values and buffer depth, and its measured time) is saved on disk, so later
@@ -591,6 +636,7 @@ uv run python benchmarks/matmul.py      # timings; meaningful only on a TPU
 uv run python benchmarks/attention.py   # autokernel vs JAX splash attention at the same block sizes
 uv run python benchmarks/transformer.py # a transformer stack: autokernel vs XLA + splash vs XLA (--breakdown)
 uv run python benchmarks/decode.py      # decode-like MLP layers that stream their weights
+uv run python benchmarks/profile_guided.py report|tune  # profiling and autotune="profile" on a TPU
 ```
 
 Besides running kernels in the interpreter (with its race detector), the tests cross-lower every kind of
@@ -626,6 +672,7 @@ src/autokernel/
   reference.py  the Python loops as a traceable reference (runtime masks as jnp.where, ragged tiles)
   tiles.py      autokernel.tile: block sizes declared in the prologue, tunable
   cache.py      the on-disk tuning cache
+  profiling.py  profiling on a TPU: trace regions read from the device trace; profile-guided tuning's timing
   scopes.py     Python's scoping rules: the names code binds and reads, for every pass that asks
   errors.py     AutoKernelError
 examples/       runnable examples

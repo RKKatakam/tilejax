@@ -337,7 +337,16 @@ def fuse(name: str, parts: Sequence[Part], matmul_precision: str, hw: hardware.H
         dependent = {param for param, src in part.sources.items() if src[0] == "part"}
         emitters.append(
             codegen.Emitter(
-                p.spec, p.sched, p.buffers, matmul_precision, p.fills, p.aliased, 0, None, dependent=dependent
+                p.spec,
+                p.sched,
+                p.buffers,
+                matmul_precision,
+                p.fills,
+                p.aliased,
+                0,
+                None,
+                dependent=dependent,
+                trace=p.trace,
             )
         )
     cores = parts[0].lowered.cores

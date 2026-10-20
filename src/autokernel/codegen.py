@@ -127,9 +127,12 @@ def generate(
     aliased: Sequence[str],
     vmem_limit_bytes: int,
     cost: pl.CostEstimate | None,
+    trace: bool = False,
 ) -> Generated:
-    """`fills` and `aliased` are the outputs `plan_fills` assigned to fill DMAs and to an aliased input."""
-    return Emitter(spec, sched, buffers, matmul_precision, fills, aliased, vmem_limit_bytes, cost).emit()
+    """`fills` and `aliased` are the outputs `plan_fills` assigned to fill DMAs and to an aliased input.
+    With `trace`, each step marks its waits and compute as profiler trace regions (see `profile`)."""
+    emitter = Emitter(spec, sched, buffers, matmul_precision, fills, aliased, vmem_limit_bytes, cost, trace=trace)
+    return emitter.emit()
 
 
 def plan_fills(spec: Specialization, background_fill: bool) -> tuple[list[str], list[str]]:
@@ -196,6 +199,16 @@ def _scalar_src(value: Any) -> str:
     if isinstance(value, float) and not math.isfinite(value):
         return f"float('{value}')"
     return repr(value)
+
+
+# Profiler trace regions a traced kernel marks in every step (`generate(trace=True)`): waiting for the step's
+# inputs, the user's code, and (inside it) waiting for an output slot to be free.
+WAIT, COMPUTE, OUT_WAIT = "wait", "compute", "out_wait"
+REGIONS = (WAIT, COMPUTE, OUT_WAIT)
+
+
+def region_name(kernel: str, what: str) -> str:
+    return f"{kernel}/{what}"
 
 
 def _pad_widths(shape: Sequence[int], padded: Sequence[int]) -> str:
@@ -431,8 +444,11 @@ class Emitter:
     """Generates one nest's kernel: as a whole `pallas_call` (`emit`), or as one part of a fused kernel
     (`part` and `prepare`, used by `fusion`), where `dependent` names the inputs an earlier part writes."""
 
-    def __init__(self, spec, sched, buffers, precision, fills, aliased, vmem_limit, cost, dependent=frozenset()):
+    def __init__(
+        self, spec, sched, buffers, precision, fills, aliased, vmem_limit, cost, dependent=frozenset(), trace=False
+    ):
         self.spec, self.sched, self.nest = spec, sched, spec.nest
+        self.trace = trace  # mark each step's waits and compute as profiler trace regions
         self.buffers, self.precision, self.vmem_limit, self.cost = buffers, precision, vmem_limit, cost
         self.dependent = frozenset(dependent)
         self.names = spec.names.copy()  # emitting twice gives the same names
@@ -877,6 +893,7 @@ class Emitter:
         waits = [
             f"{self._out_copy_fn(out)}({blocks}({v['o']} - 2, 0), {v['o']} & 1).wait()" for out in self.spec.outputs
         ]
+        waits = self._region(OUT_WAIT, waits)
         return _fn(self._n("_free_output_slots"), "", waits, when=f"{v['o']} - 2 >= {v['o_begin']}")
 
     def _units(self) -> list[str]:
@@ -967,17 +984,25 @@ class Emitter:
             ]
             # A tile of one step is always at its first step: no test (Mosaic schedules unguarded waits better).
             guard = self._flag_test(0, v["ph"], v["first"]) if self.P and not self.spec.single_step else None
-            lines += _block(self._n("_tile_inputs"), body, guard)
+            lines += self._region(WAIT, _block(self._n("_tile_inputs"), body, guard))
         for p, ops in self._by_phase_ops(self.streamed):  # 3. this step's inputs
             waits = [f"{self._copy_fn(op)}({v['blocks']}, {slot}).wait()" for op in ops]
-            lines += _block(self._n(f"_wait_phase_{p}"), waits, self._phase_test(p, v["ph"], v["empty"]))
+            lines += self._region(
+                WAIT, _block(self._n(f"_wait_phase_{p}"), waits, self._phase_test(p, v["ph"], v["empty"]))
+            )
         lines += [f"{op.ref} = {self.slots[op.ref]}.at[{slot}]" for op in self.streamed]
         lines += [f"{op.ref} = {self.slots[op.ref]}.at[{v['o']} & 1]" for op in self.per_tile]
         units = self._units()  # 4. the user's code
         values = self._loop_values()
         if values:
             lines.append(f"{self._blocks_tuple(self.blk)} = {v['blocks']}")
-        return lines + values + units
+        return lines + values + self._region(COMPUTE, units)
+
+    def _region(self, what: str, lines: list[str]) -> list[str]:
+        """`lines` as a profiler trace region named `<kernel>/<what>` when tracing (see `profile`)."""
+        if not self.trace or not lines:
+            return lines
+        return [f"with jax.named_scope({region_name(self.nest.fn_name, what)!r}):", *_indent(lines)]
 
     def _arg_groups(self) -> dict[str, list[str]]:
         """The kernel's parameters by kind, in order: SMEM inputs, HBM inputs, aliased inputs, outputs, scratch."""
