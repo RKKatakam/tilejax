@@ -1,0 +1,6 @@
+{"engine": "vllm", "batch": 1, "prompt_len": 128, "new_tokens": 256, "seconds": 1.7304, "output_tokens_per_s": 147.9}
+{"engine": "vllm", "batch": 8, "prompt_len": 128, "new_tokens": 256, "seconds": 1.8068, "output_tokens_per_s": 1133.5}
+{"engine": "vllm", "batch": 32, "prompt_len": 128, "new_tokens": 256, "seconds": 2.1467, "output_tokens_per_s": 3816.1}
+{"engine": "vllm", "batch": 64, "prompt_len": 128, "new_tokens": 256, "seconds": 2.6603, "output_tokens_per_s": 6158.7}
+{"engine": "vllm", "batch": 128, "prompt_len": 128, "new_tokens": 256, "seconds": 3.6056, "output_tokens_per_s": 9088.2}
+{"engine": "vllm", "batch": 256, "prompt_len": 128, "new_tokens": 256, "seconds": 5.5951, "output_tokens_per_s": 11713.1}
