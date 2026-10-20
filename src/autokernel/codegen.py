@@ -50,7 +50,7 @@ from .parse import Nest
 from .pipeline import TILE_SLOTS, Pipeline
 from .plan import Kind, Operand, Plan, Range, Tile
 from .schedule import CODE_SHIFT, FILL_TABLE, STEP_CODE, STEP_COUNT, STEP_TILE, TILE_TABLE, Schedule
-from .tilecode import assigned, flatten, reads
+from .tilecode import as_store, assigned, flatten, reads
 from .tunable import choices, is_tunable
 
 __all__ = ["COMPUTE", "FILLS_IN_FLIGHT", "OUT_WAIT", "REGIONS", "WAIT", "generate"]
@@ -923,6 +923,19 @@ class _TileCode:
             new = copy.copy(stmt)
             new.body = [s for inner in stmt.body for s in self._statement(inner)]
             return [new]
+        update = as_store(stmt)
+        scalars = {r.var for r in plan.loops} | set(plan.constants)
+        if (
+            update is not None
+            and update.output in plan.carried
+            and update.output not in self.renamed
+            and set().union(*(reads(i) for i in update.index)) <= scalars
+        ):  # `a = a.at[index].set(v)` of a carried value in its VMEM buffer: store just that part
+            ref, index = gen.refs[update.output], ", ".join(ast.unparse(self._expr(i)) for i in update.index)
+            value = _parse_expr(
+                f"jnp.broadcast_to(VALUE, {ref}.at[{index}].shape).astype({ref}.dtype)", VALUE=self._expr(update.value)
+            )
+            return [_parse_stmt(f"{ref}[{index}] = VALUE", VALUE=value)]
         types_ = plan.assigned_types.get(id(stmt), {})
         original = stmt
         if isinstance(stmt, ast.AugAssign):  # `a op= b` is `a = a op b` (arrays are immutable)

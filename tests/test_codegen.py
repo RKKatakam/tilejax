@@ -717,3 +717,31 @@ def test_unpacking_into_carried_values():
     src = kernel.source(x)
     assert "acc, total = step(acc_ref[...], total_ref[...], x_ref[...])" in src
     assert "total_ref[...] = total" in src and "acc_ref[...] = acc * 0.5" in src
+
+
+def test_updating_part_of_a_carried_value_stores_just_that_part():
+    kernel = make_kernel(
+        """
+        def f(x):
+            out = jnp.zeros((4, 128, 128))
+            for i in range(0, 128, 128):
+                acc = jnp.zeros((4, 128, 128))
+                for k in range(4):
+                    acc = acc.at[k].set(x[k, i : i + 128, :] * 2)
+                    acc = acc.at[k, 0:8, :].set(1)
+                    acc = acc.at[k, 8:16, :].set(acc[k, 8:16, :] + 1)
+                acc = acc.at[0].set(acc[1])
+                out = out.at[:, i : i + 128, :].set(acc)
+            return out
+        """
+    )
+    x = rand((4, 128, 128))
+    out = check(kernel, x)
+    want = 2 * f64(x)
+    want[:, :8] = 1
+    want[:, 8:16] += 1
+    want[0] = want[1]
+    np.testing.assert_allclose(f64(out), want, rtol=1e-6)
+    src = kernel.source(x)
+    assert "acc_ref[k] = jnp.broadcast_to(x_ref[...] * 2, acc_ref.at[k].shape).astype(acc_ref.dtype)" in src
+    assert "acc_ref[k, 8:16, :] = jnp.broadcast_to(acc_ref[k, 8:16, :] + 1," in src
