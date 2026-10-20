@@ -120,6 +120,7 @@ def _close(got, want, tol=3e-2):
 # --------------------------------------------------------------------------- RoPE tables
 
 
+@pytest.mark.cpu  # a TPU computes f32 cos/sin of large angles (2000 rad) to ~2e-3, not to NumPy's float64
 @pytest.mark.parametrize("rotary_dim", [None, 32])
 def test_rope_tables_rotate_like_numpy(rotary_dim):
     t = np.random.default_rng(0).normal(size=(64, 128))
