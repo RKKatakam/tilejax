@@ -5,7 +5,8 @@ EOS ignored, every prompt submitted at once), so the two compare directly.
 Runs in vLLM's own environment (the `vllm-tpu` package pins its own JAX), e.g. on the VM:
 
     uv venv /content/vllm --python 3.12 && VIRTUAL_ENV=/content/vllm uv pip install vllm-tpu
-    /content/vllm/bin/python benchmarks/vllm_gemma4.py --model /content/gemma-4-E2B
+    /content/vllm/bin/python -P benchmarks/vllm_gemma4.py --model /content/gemma-4-E2B  # -P: benchmarks/profile.py
+    # would shadow the standard library's `profile`, which torch imports
 """
 
 from __future__ import annotations
