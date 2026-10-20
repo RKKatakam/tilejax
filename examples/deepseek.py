@@ -372,11 +372,12 @@ def factor(attn: dict[str, jax.Array]) -> dict[str, jax.Array]:
 DECODE_FORMS = {"folded": fold, "factored": factor}
 
 
-def pack(params: dict[str, Any], decode: str = "folded") -> dict[str, Any]:
+def pack(params: dict[str, Any], decode: str = "factored") -> dict[str, Any]:
     """The kernels' layout of the weights (done once, when the model is loaded): each layer's attention
-    weights as mla.py's `pack` makes them (prefill), and for decode `fold`'s ("folded": W_uk and W_uv folded
-    into the projections around attention, one matmul each) or `factor`'s ("factored": applied head by head
-    in the kernels around attention, reading 2.8x fewer weight bytes at CONFIGS' shapes)."""
+    weights as mla.py's `pack` makes them (prefill), and for decode `factor`'s ("factored": W_uk and W_uv
+    applied head by head in the kernels around attention, reading 2.8x fewer weight bytes at CONFIGS' shapes:
+    on a v5e 2-31% faster per step than "folded") or `fold`'s ("folded": folded into the projections around
+    attention, one matmul each)."""
     make = DECODE_FORMS[decode]
     layers = [layer | {"attn": pack_attention(layer["attn"]) | make(layer["attn"])} for layer in params["layers"]]
     return params | {"layers": layers}
