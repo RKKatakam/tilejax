@@ -25,4 +25,4 @@ COPYFILE_DISABLE=1 tar czf "$work/ak.tar.gz" src tests examples benchmarks pypro
 "$COLAB" new -s "$SESSION" --tpu v5e1
 trap '"$COLAB" stop -s "$SESSION" || true' EXIT
 "$COLAB" upload -s "$SESSION" "$work/ak.tar.gz" /content/ak.tar.gz
-"$COLAB" exec -s "$SESSION" -f tools/colab_driver.py --timeout 5400 | tee tpu-run.txt
+"$COLAB" exec -s "$SESSION" -f tools/colab_driver.py --timeout ${TIMEOUT:-14400} | tee tpu-run.txt
