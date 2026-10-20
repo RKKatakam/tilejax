@@ -38,10 +38,8 @@ after the other for every head of the group, in one unrolled stretch of code (in
 scheduler to interleave). The tunable picks the heads per tile and the tokens per step. Out-of-range gates
 are clamped (log decays to <= 0, betas to [0, 1]), so the random inputs tuning runs on are valid too.
 
-A reduction step can't store an output tile (outputs are stored once per tile, at its end), so each step
-appends its outputs to a carried buffer, and the tile stores the whole sequence at the end. A carried value
-is loaded and stored whole by every step that assigns it, so the sequence is split into PARTS phases, each
-with a buffer of its own: a step moves a quarter of the tile's outputs, not all of them.
+Each step stores its block's outputs itself (an output stored in the reduction loop's body: a tile per
+step), so they go to HBM while the next blocks run.
 
 `reference_recurrent` is the recurrence above in float64 NumPy; `baseline_chunked` the chunked algorithm
 in plain JAX (intra-chunk work batched over every chunk, a `lax.scan` over chunks for the state, outputs
@@ -63,7 +61,6 @@ import autokernel
 
 HEAD_DIM = 128  # d_k = d_v: Qwen3-Next's and Kimi Linear's
 CHUNK = 128  # tokens per chunk: C x C matrices are full MXU tiles, and C = HEAD_DIM = lanes (see above)
-PARTS = 4  # phases per tile: each step appends its outputs to a quarter of the sequence
 SUB = 32  # KDA: rows per block of a chunk sharing a decay reference point
 KDA_GATE_MIN = -5.0  # KDA: per-token log decays are clamped to [KDA_GATE_MIN, 0]
 NORM_EPS = 1e-6  # q and k L2 normalization, as flash-linear-attention's
@@ -265,32 +262,6 @@ def delta_block(intra, q, k, v, g, beta, col, state):
     return jnp.concatenate(outs, axis=1), jnp.stack(states)
 
 
-def append(buffer, rows):
-    """`buffer` shifted up by the rows of `rows`, which go at its end: after a phase's steps, the buffer holds
-    their outputs in order."""
-    n = rows.shape[0]
-    rows = rows.astype(buffer.dtype)
-    return jnp.concatenate([buffer[n:], rows], axis=0) if n < buffer.shape[0] else rows
-
-
-def gdn_block(q, k, v, g, beta, col, state, outputs):
-    """A step of `gated_delta_rule`: `delta_block`, its outputs appended to `outputs`."""
-    o, state = delta_block(gdn_intra, q, k, v, g, beta, col, state)
-    return state, append(outputs, o)
-
-
-def gdn_gated_block(q, k, v, g, beta, z, weight, col, state, outputs):
-    """A step of `gated_delta_rule_gated`: `gdn_block`, with Qwen3-Next's gated RMSNorm on its outputs."""
-    o, state = delta_block(gdn_intra, q, k, v, g, beta, col, state)
-    return state, append(outputs, gated_rmsnorm(o, z, weight))
-
-
-def kda_block(q, k, v, g, beta, col, state, outputs):
-    """A step of `kimi_delta_attention`: `delta_block`, its outputs appended to `outputs`."""
-    o, state = delta_block(kda_intra, q, k, v, g, beta, col, state)
-    return state, append(outputs, o)
-
-
 @autokernel.kernel
 def gated_delta_rule(q, k, v, g, beta, tiles=DeltaTiles()):
     """Gated DeltaNet, chunked. q, k, v (B, S, H * HEAD_DIM), q and k not yet normalized; g and beta
@@ -298,30 +269,16 @@ def gated_delta_rule(q, k, v, g, beta, tiles=DeltaTiles()):
     B, S, D = v.shape
     G = min(tiles.heads, D // HEAD_DIM)
     W = G * HEAD_DIM
-    part = S // PARTS
-    T = min(tiles.block, part)
+    T = min(tiles.block, S)
     dtype = v.dtype
     out = jnp.zeros((B, S, D), dtype)
     for b in range(B):
         for j in range(0, D, W):
             state = jnp.zeros((G, HEAD_DIM, HEAD_DIM), jnp.float32)  # per head, transposed: (d_v, d_k)
-            o0 = jnp.zeros((part, W), dtype)  # the tile's outputs, a quarter of the sequence each
-            o1 = jnp.zeros((part, W), dtype)
-            o2 = jnp.zeros((part, W), dtype)
-            o3 = jnp.zeros((part, W), dtype)
-            for c0 in range(0, part, T):
-                qt, kt, vt = q[b, c0 : c0 + T, j : j + W], k[b, c0 : c0 + T, j : j + W], v[b, c0 : c0 + T, j : j + W]
-                state, o0 = gdn_block(qt, kt, vt, g[b, :, c0 : c0 + T], beta[b, :, c0 : c0 + T], j, state, o0)
-            for c1 in range(part, 2 * part, T):
-                qt, kt, vt = q[b, c1 : c1 + T, j : j + W], k[b, c1 : c1 + T, j : j + W], v[b, c1 : c1 + T, j : j + W]
-                state, o1 = gdn_block(qt, kt, vt, g[b, :, c1 : c1 + T], beta[b, :, c1 : c1 + T], j, state, o1)
-            for c2 in range(2 * part, 3 * part, T):
-                qt, kt, vt = q[b, c2 : c2 + T, j : j + W], k[b, c2 : c2 + T, j : j + W], v[b, c2 : c2 + T, j : j + W]
-                state, o2 = gdn_block(qt, kt, vt, g[b, :, c2 : c2 + T], beta[b, :, c2 : c2 + T], j, state, o2)
-            for c3 in range(3 * part, S, T):
-                qt, kt, vt = q[b, c3 : c3 + T, j : j + W], k[b, c3 : c3 + T, j : j + W], v[b, c3 : c3 + T, j : j + W]
-                state, o3 = gdn_block(qt, kt, vt, g[b, :, c3 : c3 + T], beta[b, :, c3 : c3 + T], j, state, o3)
-            out = out.at[b, :, j : j + W].set(jnp.concatenate([o0, o1, o2, o3], axis=0))
+            for c in range(0, S, T):  # a block of tokens per step, its outputs stored by the step
+                qt, kt, vt = q[b, c : c + T, j : j + W], k[b, c : c + T, j : j + W], v[b, c : c + T, j : j + W]
+                o, state = delta_block(gdn_intra, qt, kt, vt, g[b, :, c : c + T], beta[b, :, c : c + T], j, state)
+                out = out.at[b, c : c + T, j : j + W].set(o.astype(dtype))
     return out
 
 
@@ -332,35 +289,17 @@ def gated_delta_rule_gated(q, k, v, g, beta, z, weight, tiles=DeltaTiles()):
     B, S, D = v.shape
     G = min(tiles.heads, D // HEAD_DIM)
     W = G * HEAD_DIM
-    part = S // PARTS
-    T = min(tiles.block, part)
+    T = min(tiles.block, S)
     dtype = v.dtype
     out = jnp.zeros((B, S, D), dtype)
     for b in range(B):
         for j in range(0, D, W):
             state = jnp.zeros((G, HEAD_DIM, HEAD_DIM), jnp.float32)
-            o0 = jnp.zeros((part, W), dtype)
-            o1 = jnp.zeros((part, W), dtype)
-            o2 = jnp.zeros((part, W), dtype)
-            o3 = jnp.zeros((part, W), dtype)
-            wt = weight[:, :]
-            for c0 in range(0, part, T):
-                qt, kt, vt = q[b, c0 : c0 + T, j : j + W], k[b, c0 : c0 + T, j : j + W], v[b, c0 : c0 + T, j : j + W]
-                gt, bt, zt = g[b, :, c0 : c0 + T], beta[b, :, c0 : c0 + T], z[b, c0 : c0 + T, j : j + W]
-                state, o0 = gdn_gated_block(qt, kt, vt, gt, bt, zt, wt, j, state, o0)
-            for c1 in range(part, 2 * part, T):
-                qt, kt, vt = q[b, c1 : c1 + T, j : j + W], k[b, c1 : c1 + T, j : j + W], v[b, c1 : c1 + T, j : j + W]
-                gt, bt, zt = g[b, :, c1 : c1 + T], beta[b, :, c1 : c1 + T], z[b, c1 : c1 + T, j : j + W]
-                state, o1 = gdn_gated_block(qt, kt, vt, gt, bt, zt, wt, j, state, o1)
-            for c2 in range(2 * part, 3 * part, T):
-                qt, kt, vt = q[b, c2 : c2 + T, j : j + W], k[b, c2 : c2 + T, j : j + W], v[b, c2 : c2 + T, j : j + W]
-                gt, bt, zt = g[b, :, c2 : c2 + T], beta[b, :, c2 : c2 + T], z[b, c2 : c2 + T, j : j + W]
-                state, o2 = gdn_gated_block(qt, kt, vt, gt, bt, zt, wt, j, state, o2)
-            for c3 in range(3 * part, S, T):
-                qt, kt, vt = q[b, c3 : c3 + T, j : j + W], k[b, c3 : c3 + T, j : j + W], v[b, c3 : c3 + T, j : j + W]
-                gt, bt, zt = g[b, :, c3 : c3 + T], beta[b, :, c3 : c3 + T], z[b, c3 : c3 + T, j : j + W]
-                state, o3 = gdn_gated_block(qt, kt, vt, gt, bt, zt, wt, j, state, o3)
-            out = out.at[b, :, j : j + W].set(jnp.concatenate([o0, o1, o2, o3], axis=0))
+            for c in range(0, S, T):
+                qt, kt, vt = q[b, c : c + T, j : j + W], k[b, c : c + T, j : j + W], v[b, c : c + T, j : j + W]
+                o, state = delta_block(gdn_intra, qt, kt, vt, g[b, :, c : c + T], beta[b, :, c : c + T], j, state)
+                normed = gated_rmsnorm(o, z[b, c : c + T, j : j + W], weight[:, :])
+                out = out.at[b, c : c + T, j : j + W].set(normed.astype(dtype))
     return out
 
 
@@ -371,34 +310,17 @@ def kimi_delta_attention(q, k, v, g, beta, tiles=DeltaTiles()):
     B, S, D = v.shape
     G = min(tiles.heads, D // HEAD_DIM)
     W = G * HEAD_DIM
-    part = S // PARTS
-    T = min(tiles.block, part)
+    T = min(tiles.block, S)
     dtype = v.dtype
     out = jnp.zeros((B, S, D), dtype)
     for b in range(B):
         for j in range(0, D, W):
             state = jnp.zeros((G, HEAD_DIM, HEAD_DIM), jnp.float32)
-            o0 = jnp.zeros((part, W), dtype)
-            o1 = jnp.zeros((part, W), dtype)
-            o2 = jnp.zeros((part, W), dtype)
-            o3 = jnp.zeros((part, W), dtype)
-            for c0 in range(0, part, T):
-                qt, kt, vt = q[b, c0 : c0 + T, j : j + W], k[b, c0 : c0 + T, j : j + W], v[b, c0 : c0 + T, j : j + W]
-                gt, bt = g[b, c0 : c0 + T, j : j + W], beta[b, :, c0 : c0 + T]
-                state, o0 = kda_block(qt, kt, vt, gt, bt, j, state, o0)
-            for c1 in range(part, 2 * part, T):
-                qt, kt, vt = q[b, c1 : c1 + T, j : j + W], k[b, c1 : c1 + T, j : j + W], v[b, c1 : c1 + T, j : j + W]
-                gt, bt = g[b, c1 : c1 + T, j : j + W], beta[b, :, c1 : c1 + T]
-                state, o1 = kda_block(qt, kt, vt, gt, bt, j, state, o1)
-            for c2 in range(2 * part, 3 * part, T):
-                qt, kt, vt = q[b, c2 : c2 + T, j : j + W], k[b, c2 : c2 + T, j : j + W], v[b, c2 : c2 + T, j : j + W]
-                gt, bt = g[b, c2 : c2 + T, j : j + W], beta[b, :, c2 : c2 + T]
-                state, o2 = kda_block(qt, kt, vt, gt, bt, j, state, o2)
-            for c3 in range(3 * part, S, T):
-                qt, kt, vt = q[b, c3 : c3 + T, j : j + W], k[b, c3 : c3 + T, j : j + W], v[b, c3 : c3 + T, j : j + W]
-                gt, bt = g[b, c3 : c3 + T, j : j + W], beta[b, :, c3 : c3 + T]
-                state, o3 = kda_block(qt, kt, vt, gt, bt, j, state, o3)
-            out = out.at[b, :, j : j + W].set(jnp.concatenate([o0, o1, o2, o3], axis=0))
+            for c in range(0, S, T):
+                qt, kt, vt = q[b, c : c + T, j : j + W], k[b, c : c + T, j : j + W], v[b, c : c + T, j : j + W]
+                gt, bt = g[b, c : c + T, j : j + W], beta[b, :, c : c + T]
+                o, state = delta_block(kda_intra, qt, kt, vt, gt, bt, j, state)
+                out = out.at[b, c : c + T, j : j + W].set(o.astype(dtype))
     return out
 
 

@@ -49,11 +49,11 @@ def test_kernels_match_the_recurrence(per_channel, batch, heads, seq, tiles):
 def test_kernel_structure(per_channel):
     kernel = KERNELS[per_channel]
     lowered = kernel.lower(*make_inputs(2, 4, 2048, per_channel), DeltaTiles(heads=2, block=256))
-    # A tile per (batch, pair of heads); its four phases stream a block of tokens per step.
+    # A tile per (batch, pair of heads); a block of tokens per step, its outputs stored by the step.
     assert (lowered.tiles, lowered.steps) == (4, 4 * 2048 // 256)
-    assert [phase.range.var for phase in lowered.plan.phases] == ["c0", "c1", "c2", "c3"]
+    assert [phase.range.var for phase in lowered.plan.phases] == ["c"]
     assert {op.kind.value for op in lowered.plan.operands} == {"stream"}
-    assert set(lowered.plan.carried) == {"state", "o0", "o1", "o2", "o3"}
+    assert set(lowered.plan.carried) == {"state"} and lowered.plan.outputs[0].phase == 0
     assert lowered.plan.carried["state"].shape == (2, HEAD_DIM, HEAD_DIM)
 
 
