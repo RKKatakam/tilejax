@@ -48,7 +48,7 @@ from . import mxu, v5e
 from .errors import KernelError
 from .parse import Nest
 from .pipeline import TILE_SLOTS, Pipeline
-from .plan import Kind, Operand, Plan, Range, Tile
+from .plan import Kind, Operand, Output, Plan, Range, Tile
 from .schedule import CODE_SHIFT, FILL_TABLE, STEP_CODE, STEP_COUNT, STEP_TILE, TILE_TABLE, Schedule
 from .tilecode import as_store, assigned, flatten, reads
 from .tunable import choices, is_tunable
@@ -427,7 +427,7 @@ class _Generator:
             for op in self.shared:
                 self._moves_fn(w, op)
             for out in plan.outputs:
-                self._output_copy_fn(w, out.name, out.tile)
+                self._output_copy_fn(w, out)
             if self.schedule.fills:
                 self._fill_copy_fns(w)
             self._setup(w)
@@ -606,12 +606,15 @@ class _Generator:
                 starts.append(_scaled(block_of[window.loop], self._range(window.loop)))
         return starts
 
-    def _output_copy_fn(self, w: _Writer, name: str, tile: Tile) -> None:
-        at, slot = self.n_at, self.n_slot
-        with w.block(f"def {self.copy_fns[name]}({at}, {slot}):"):
+    def _output_copy_fn(self, w: _Writer, out: Output) -> None:
+        at, slot, name, tile = self.n_at, self.n_slot, out.name, out.tile
+        kb = "" if out.phase is None else f"{self.n_kb}, "  # a tile per step: placed by the phase's block too
+        with w.block(f"def {self.copy_fns[name]}({at}, {kb}{slot}):"):
             w(f"# {tile.text}")
             self._unpack(w, at)
             block_of = {r.var: self.blk[r.var] for r in self.plan.parallel}
+            if out.phase is not None:
+                block_of[self.plan.phases[out.phase].range.var] = self.n_kb
             dst = f"{self.hbm[name]}.at[{self._window_index(tile, block_of)}]"
             w(f"return pltpu.make_async_copy({self.bufs[name]}.at[{slot}], {dst}, {self.sems[name]}.at[{slot}])")
 
@@ -794,11 +797,12 @@ class _Generator:
             self._loop_vars(w)
 
             out_slots = pipe.output_buffers
-            with self._region(w, OUT_WAIT):
+            per_tile_outs = [out for out in plan.outputs if out.phase is None]
+            with self._region(w, OUT_WAIT) if per_tile_outs else nullcontext():
                 cond = f"{tile} >= {out_slots}" if tile_last is None else f"{tile_last} & ({tile} >= {out_slots})"
-                with self._when(w, cond, "_free_output_slot"):
+                with self._when(w, cond, "_free_output_slot") if per_tile_outs else nullcontext():
                     zero = (0,) * len(plan.parallel)
-                    for out in plan.outputs:
+                    for out in per_tile_outs:
                         w(f"{self.copy_fns[out.name]}({zero}, {_int_expr(tile, '%', out_slots)}).wait()")
 
             if sch.fills:
@@ -911,9 +915,13 @@ class _Generator:
         w("")
         w("# Wait for the copies still in flight.")
         zero = (0,) * len(self.plan.parallel)
-        for tile in range(max(0, sch.tiles - pipe.output_buffers), sch.tiles):
-            for out in self.plan.outputs:
-                w(f"{self.copy_fns[out.name]}({zero}, {tile % pipe.output_buffers}).wait()")
+        ob = pipe.output_buffers
+        for out in self.plan.outputs:
+            # The last copies of each output: a tile per tile, or per step of its phase.
+            stores = sch.tiles * (1 if out.phase is None else self.plan.phases[out.phase].range.count)
+            kb = "" if out.phase is None else "0, "
+            for n in range(max(0, stores - ob), stores):
+                w(f"{self.copy_fns[out.name]}({zero}, {kb}{n % ob}).wait()")
         for _ in range(min(sch.fills, FILLS_IN_FLIGHT)):
             w(*[f"{self.fill_copies[out.name]}({zero}).wait()" for out in self.plan.outputs])
 
@@ -976,12 +984,23 @@ class _TileCode:
         store = plan.nest.store(stmt)
         if store is not None:
             out = next(o for o in plan.outputs if o.name == store.output)
-            slot = _int_expr(gen.n_tile, "%", gen.pipeline.output_buffers)
-            buf = gen.bufs[out.name]
+            ob, buf = gen.pipeline.output_buffers, gen.bufs[out.name]
             value = self._cast(self._expr(store.value), out.value, out.tile.shape, out.dtype, f"{buf}.dtype")
+            if out.phase is None:
+                slot = _int_expr(gen.n_tile, "%", ob)
+                return [
+                    _parse_stmt(f"{buf}[{slot}] = VALUE", VALUE=value),
+                    _parse_stmt(f"{gen.copy_fns[out.name]}({gen.n_at}, {slot}).start()"),
+                ]
+            # A tile per step: the n-th waits for the copy of the (n - slots)-th to free its slot.
+            n = f"{gen.n_tile} * {plan.phases[out.phase].range.count} + {gen.n_kb}"
+            slot, zero = _int_expr(n, "%", ob), (0,) * len(plan.parallel)
+            free = gen.local(f"_free_{out.name}_slot")
+            wait = f"@pl.when({n} >= {ob})\ndef {free}():\n    {gen.copy_fns[out.name]}({zero}, 0, {slot}).wait()"
             return [
+                ast.parse(wait).body[0],
                 _parse_stmt(f"{buf}[{slot}] = VALUE", VALUE=value),
-                _parse_stmt(f"{gen.copy_fns[out.name]}({gen.n_at}, {slot}).start()"),
+                _parse_stmt(f"{gen.copy_fns[out.name]}({gen.n_at}, {gen.n_kb}, {slot}).start()"),
             ]
         if isinstance(stmt, ast.With):
             new = copy.copy(stmt)

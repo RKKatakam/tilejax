@@ -93,7 +93,8 @@ class Nest:
     # loops, the code outside the repeat loop (before and after it).
     segments: tuple[tuple[ast.stmt, ...], ...]
     repeats: tuple[Repeat, ...]
-    stores: dict[str, Store]  # output -> its store, in the last segment
+    stores: dict[str, Store]  # output -> its store: in the last segment, or a reduction loop's body
+    stored_in: dict[str, int | None]  # output -> the reduction loop storing a tile of it per step (None: per tile)
     _store_nodes: dict[int, Store] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
@@ -179,8 +180,7 @@ class _Parser:
 
         parallel, tile = self._parallel_loops(body[at])  # type: ignore[arg-type]
         reductions, bodies, segments, repeats = self._split_tile(tile)
-        inner = [s for rep in repeats for s in rep.before + rep.after]
-        stores = self._stores((*bodies, tuple(inner)), segments, outputs)
+        stores, stored_in = self._stores(bodies, segments, repeats, outputs)
         nest = Nest(
             name=self.name,
             filename=self.filename,
@@ -196,6 +196,7 @@ class _Parser:
             segments=segments,
             repeats=repeats,
             stores=stores,
+            stored_in=stored_in,
         )
         self._check_names(nest)
         return nest
@@ -350,23 +351,36 @@ class _Parser:
         self,
         bodies: tuple[tuple[ast.stmt, ...], ...],
         segments: tuple[tuple[ast.stmt, ...], ...],
+        repeats: tuple[Repeat, ...],
         outputs: tuple[str, ...],
-    ) -> dict[str, Store]:
-        for stmt in flatten([s for part in (*bodies, *segments[:-1]) for s in part]):
+    ) -> tuple[dict[str, Store], dict[str, int | None]]:
+        """Each output's store, and where: after the reduction loops (a tile per tile), or in the body of a
+        reduction loop outside repeat loops (a tile per step)."""
+        in_repeats = {r for rep in repeats for r in range(rep.first, rep.last)}
+        elsewhere = [s for part in segments[:-1] for s in part] + [s for rep in repeats for s in rep.before + rep.after]
+        elsewhere += [s for r, body in enumerate(bodies) if r in in_repeats for s in body]
+        for stmt in flatten(elsewhere):
             store = as_store(stmt)
             if store and store.output in outputs:
-                raise self.error("store outputs once per tile, after the reduction loops", stmt)
+                raise self.error(
+                    "store outputs after the reduction loops (a tile per tile), or in the body of a reduction loop "
+                    "outside repeat loops (a tile per step)",
+                    stmt,
+                )
+        places = [(None, segments[-1])] + [(r, body) for r, body in enumerate(bodies) if r not in in_repeats]
         stores: dict[str, Store] = {}
-        for stmt in flatten(segments[-1]):
-            store = as_store(stmt)
-            if store and store.output in outputs:
-                if store.output in stores:
-                    raise self.error(f"output `{store.output}` is stored twice in a tile", stmt)
-                stores[store.output] = store
+        stored_in: dict[str, int | None] = {}
+        for r, stmts in places:
+            for stmt in flatten(stmts):
+                store = as_store(stmt)
+                if store and store.output in outputs:
+                    if store.output in stores:
+                        raise self.error(f"output `{store.output}` is stored twice in a tile", stmt)
+                    stores[store.output], stored_in[store.output] = store, r
         for name in outputs:
             if name not in stores:
                 raise self.error(f"no tile stores output `{name}`: `{name} = {name}.at[...].set(...)`")
-        return stores
+        return stores, stored_in
 
     # ------------------------------------------------------------------ names
 

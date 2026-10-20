@@ -144,7 +144,7 @@ uv run python examples/matmul.py        # prints the generated source
 
 Tests: `test_parse.py` (every syntax rule), `test_plan.py`, `test_schedule.py`, `test_codegen.py` (every
 emission path runs in the interpreter with the race detector and cross-lowers to Mosaic for a v5e),
-`test_index_arrays.py` (SMEM index arrays, runtime masks and windows), `test_repeat_loops.py`, `test_api.py`, `test_profiling.py` (synthetic traces), `test_tunable.py`, `test_tune.py` (the search and
+`test_index_arrays.py` (SMEM index arrays, runtime masks and windows), `test_repeat_loops.py`, `test_step_outputs.py` (outputs stored per step), `test_api.py`, `test_profiling.py` (synthetic traces), `test_tunable.py`, `test_tune.py` (the search and
 proposals with synthetic profiles; tuning end to end with `tune._can_time` and `profiling.measure` faked,
 kernels really running in the interpreter), `test_examples.py`, `test_tpu.py` (`tpu` marker: real hardware
 only). `helpers.make_kernel(source, **globals)` builds a kernel from a source string, which

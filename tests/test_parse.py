@@ -304,12 +304,13 @@ def test_stores():
                 a = 1
         return out
 
-    def store_in_body(x):
+    def store_in_a_repeat_loop(x):
         out = jnp.zeros((8, 128))
         for i in range(0, 8, 8):
             a = 1
-            for k in range(1):
-                out = out.at[i : i + 8, :].set(1.0)
+            for r in range(2):
+                for k in range(1):
+                    out = out.at[i : i + 8, :].set(1.0)
         return out
 
     def stored_twice(x):
@@ -340,7 +341,7 @@ def test_stores():
         return out
 
     assert "after the reduction loop" in error(store_in_pre)
-    assert "after the reduction loop" in error(store_in_body)
+    assert "in the body of a reduction loop outside repeat loops" in error(store_in_a_repeat_loop)
     assert "stored twice" in error(stored_twice)
     assert "no tile stores output `out`" in error(never_stored)
     assert "tiles can't be read" in error(reads_an_output)

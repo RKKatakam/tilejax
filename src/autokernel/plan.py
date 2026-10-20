@@ -169,6 +169,7 @@ class Output:
     fill: Any  # the allocation's value (0 for jnp.zeros)
     tile: Tile
     value: jax.ShapeDtypeStruct  # the type of the value the tile code stores
+    phase: int | None = None  # the phase whose steps each store a tile of it (None: a tile per output tile)
 
 
 @dataclass(frozen=True)
@@ -298,10 +299,11 @@ class _Planner:
         self._check_element_bounds()
         phases, segments, repeats = self._phases(reductions, repeat_loops)
         operands, reads_ = self._operands(phases, segments, repeats)
+        stored_by = {name: self._storing_phase(name, phases) for name in self.nest.outputs}
         output_tiles = {name: self._output_tile(name, *outputs[name], parallel) for name in self.nest.outputs}
         self._check_reads_before_assignment()
         sequence = _Sequence(phases, segments, repeats)
-        carried_names = sequence.carried()
+        carried_names = sequence.carried() - set(self.nest.outputs)
         scopes = self._scopes()
         types = _TypeTrace(self, operands, reads_, carried_names, sequence).run()
         for name in self.nest.outputs:
@@ -322,7 +324,8 @@ class _Planner:
             reads=reads_,
             read_phases=self.read_phases,
             outputs=tuple(
-                Output(name, *outputs[name], output_tiles[name], types.stores[name]) for name in self.nest.outputs
+                Output(name, *outputs[name], output_tiles[name], types.stores[name], stored_by[name])
+                for name in self.nest.outputs
             ),
             carried=carried,
             assigned_types=types.assigned,
@@ -522,7 +525,8 @@ class _Planner:
                 out.append(item)
             elif item[0] == "loop":
                 r, body = item[1], item[2]
-                if r.count == 1 and r.mask is None and not keep_first:
+                stores = any(self.nest.store(s) for s in flatten(body))  # (a step stores a tile: it stays a phase)
+                if r.count == 1 and r.mask is None and not keep_first and not stores:
                     out.append(("code", (_bind(r, body[0]), *body)))
                 else:
                     out.append(item)
@@ -649,17 +653,40 @@ class _Planner:
                             node,
                         )
 
+    def _storing_phase(self, name: str, phases: tuple[Phase, ...]) -> int | None:
+        """The phase whose steps store a tile of output `name` each, if a reduction loop's body stores it."""
+        r = self.nest.stored_in[name]
+        if r is None:
+            return None
+        var = self.nest.reductions[r].var
+        p = next(p for p, phase in enumerate(phases) if phase.range.var == var)
+        node = self.nest.stores[name].node
+        if phases[p].range.mask is not None or any(q.mask is not None for q in self.ranges.values()):
+            raise self.error(
+                f"output `{name}` is stored at every step of `{var}`'s loop, so no mask may skip tiles or steps "
+                "(the kernel couldn't fill what they skip)",
+                node,
+            )
+        return p
+
     def _output_tile(
-        self, name: str, shape: tuple[int, ...], dtype: np.dtype, fill: Any, parallel: tuple[Range, ...]
+        self,
+        name: str,
+        shape: tuple[int, ...],
+        dtype: np.dtype,
+        fill: Any,
+        parallel: tuple[Range, ...],
     ) -> Tile:
         store = self.nest.stores[name]
         tile = self._tile(name, shape, dtype, store.index, store.node)
         uses = [w.loop for w in tile.windows if w.loop]
-        for r in parallel:
+        r = self.nest.stored_in[name]
+        placing = [*parallel, *([self.ranges[self.nest.reductions[r].var]] if r is not None else [])]
+        for r in placing:
             if uses.count(r.var) != 1:
+                what = "every parallel loop places" if r in parallel else f"`{r.var}`'s steps each store"
                 raise self.error(
-                    f"{tile.text}: every parallel loop places each output tile, so `{r.var}` indexes exactly one "
-                    "dim of the output",
+                    f"{tile.text}: {what} each output tile, so `{r.var}` indexes exactly one dim of the output",
                     store.node,
                 )
         for window, dim in zip(tile.windows, shape, strict=True):

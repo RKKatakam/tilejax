@@ -140,7 +140,9 @@ def _stats(plan: Plan, schedule: Schedule) -> _Stats:
         return schedule.tiles if op.kind is Kind.TILE else 1
 
     moved = sum(copies(op) * _bytes(op.tile.shape, op.tile.dtype) for op in plan.operands)
-    moved += sum((schedule.tiles + schedule.fills) * _bytes(o.tile.shape, o.dtype) for o in plan.outputs)
+    for out in plan.outputs:
+        stores = schedule.tiles + schedule.fills if out.phase is None else schedule.phase_steps[out.phase]
+        moved += stores * _bytes(out.tile.shape, out.dtype)
     return _Stats(schedule.steps, moved)
 
 

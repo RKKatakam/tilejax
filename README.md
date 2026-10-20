@@ -125,6 +125,10 @@ def f(x, y, tiles=Tiles()):                   # the input arrays; optionally las
   slice (`8:16`) or a constant int. Integer indices come before sliced dims (`q[b, h, i : i + T, :]`).
   Tiles follow the TPU layout: the last dim a multiple of 128, the second-to-last a multiple of 8 (16 for
   bf16, 32 for 8-bit), each unless it is the whole dim.
+- **Outputs stored per step**: a reduction loop's body (outside repeat loops) may store an output, a tile
+  per step, placed by the parallel loops and the reduction loop's variable (`out = out.at[i : i + C, :].set(y)`
+  in a scan over chunks `i`, with the state carried): each step's tile goes to HBM while the next steps run.
+  No mask may skip tiles or steps of such a kernel.
 - **Outputs are stored as tiles**: every parallel loop places each output tile through exactly one dim
   (`v : v + step`, or `v` for a loop of step 1), covering the dim exactly; other dims are stored whole
   (`:`). Masked-out tiles keep the allocation's value (`jnp.zeros`, `jnp.full(..., -jnp.inf)`), written by
