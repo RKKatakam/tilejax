@@ -145,6 +145,13 @@ Each of these was found on hardware; don't undo them without measuring again.
   prefetch) is copy-bound at B1 (6.31 ms vs a 5.5 ms weight-read floor) and only beats three kernels per layer
   there (6.36 ms): its attention takes a step per sequence (B32: 3429 steps, 7.49 ms vs 6.18 at B1), so the
   per-layer kernels win from B8 (6.58 vs 6.70 ms) up. Tuning moved every batch by under 1%.
+- MoE at full width (Qwen3-235B layer, 4096 tokens): fused `expert_ffn_blocks` 10.35 ms (119.5 TFLOP/s, MXU-bound)
+  vs ragged_dot 15.00 and megablox 16.86, each baseline at its best of XLA's default scoped VMEM limit and
+  `--xla_tpu_scoped_vmem_limit_kib` raised to 115 MiB (megablox's 256+-row tilings only compile with it; it went
+  20.45 -> 16.86 ms). Compare baselines at both limits. Decode is bandwidth-bound for all (720-750 GB/s).
+  An expert's whole weights per step can't fit VMEM at full width (Mixtral: 352 MB): `moe_decode` streams
+  blocks of hidden units in a repeat loop over the chosen experts. `compare` checks outputs in chunks:
+  float64 copies of a 16384-token layer's rows ran the TPU VM's host out of memory.
 - Mosaic and XLA can differ by one bf16 ulp on fused elementwise math, and XLA may skip an
   f32 -> bf16 -> f32 round trip in the reference (excess precision) that the kernel performs: exact
   kernel-vs-reference checks only hold in the interpreter (mark such tests `cpu`). Plain `f32 @ f32` in

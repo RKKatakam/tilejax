@@ -36,6 +36,7 @@ from moe import (
     gmm_down,
     gmm_swiglu,
     group_candidates,
+    hidden_block,
     init_params,
     megablox_tiling,
     moe_decode,
@@ -400,10 +401,17 @@ def test_decode_kernels_run_each_chosen_expert_once_against_numpy(config, tokens
     want = _moe(x, params, config)
     np.testing.assert_allclose(f64(out), want, rtol=2e-2, atol=3e-2 * np.abs(want).max())
     kernel.verify(*args)
-    # A step per expert some token chose (its weights read once), and the shared experts' blocks.
-    counts = args[5]
+    # Each chosen expert's blocks of hidden units (its weights read once), and the shared experts' blocks.
+    order, n_chosen = args[5], int(args[6][0])
+    assert (
+        sorted(np.asarray(order[:n_chosen]).tolist())
+        == np.unique(
+            np.asarray(route(rmsnorm(x, params["norm"]), params["router"], params["bias"], config)[0])
+        ).tolist()
+    )
+    blocks = config.ffn // hidden_block(config.ffn, DecodeTiles().block_e)
     shared = config.shared_ffn // 128 if config.shared else 0
-    assert len(_steps(kernel.lower(*args), counts)) == int(np.sum(np.asarray(counts) > 0)) + shared
+    assert len(_steps(kernel.lower(*args), order, args[6])) == n_chosen * blocks + shared
 
 
 # --------------------------------------------------------------------------- whole layers
@@ -523,7 +531,16 @@ def test_grouped_matmuls_lower_for_v5e(name, tokens, tm, tn):
         assert "tpu_custom_call" in lower_for_v5e(lowered, *specs)
 
 
-@pytest.mark.parametrize(("name", "tokens"), [("kimi-k2-small", 64), ("deepseek-v2-lite", 64), ("qwen3-30b-a3b", 8)])
+@pytest.mark.parametrize(
+    ("name", "tokens"),
+    [
+        ("kimi-k2-small", 64),
+        ("deepseek-v2-lite", 64),
+        ("qwen3-30b-a3b", 8),
+        ("mixtral-8x7b", 8),  # an expert's weights (352 MB) streamed in blocks of hidden units
+        ("deepseek-v3-64e", 64),
+    ],
+)
 def test_decode_kernels_lower_for_v5e(name, tokens):
     kernel, specs = experts_specs(CONFIGS[name], tokens, 16)
     lowered = kernel.lower(*specs)

@@ -100,6 +100,14 @@ def test_compare_tolerances():
     assert compare("all nan", nan, nan) == 0.0
 
 
+def test_compare_checks_a_big_output_a_chunk_at_a_time(monkeypatch):
+    monkeypatch.setattr(autokernel.api, "COMPARE_CHUNK", 2)
+    want = jnp.array([[1.0, 2.0, 3.0], [4.0, 5.0, 100.0]], jnp.bfloat16)  # the largest value in the last chunk
+    assert compare("bf16", want.at[0, 0].add(1.0), want) == 1.0  # within 2e-2 of 100
+    with pytest.raises(AssertionError, match="2 of 6 elements"):
+        compare("bf16", want.at[0, 0].add(4.0).at[1, 1].add(-4.0), want)
+
+
 def test_buffering_falls_back_to_two_slots_then_fails():
     def big(tile):
         kernel = make_kernel(

@@ -160,6 +160,68 @@ features they needed came from them:
   computes them, carrying only the recurrent state.
 - *Per-tile windows fetched once*: MoE tiles of one expert read its weights once.
 
+### MoE layers at full width: autokernel vs `ragged_dot` and megablox
+
+One MoE layer of a real model, at its real width, with random weights. bf16, ms per call under `jax.jit`.
+
+**What's compared:**
+
+- **autokernel:** `expert_ffn_blocks` for prefill and the streaming `moe_decode` for decode.
+- **autokernel grouped matmuls:** our megablox-style `gmm_swiglu` + `gmm_down`.
+- **`jax.lax.ragged_dot`:** XLA's grouped matmul.
+- **megablox `gmm`:** JAX's Pallas kernel, at the best of eight tilings (64 to 1024 rows).
+
+**Fairness:** every method is timed twice. Once at XLA's default scoped VMEM limit, and once with
+`--xla_tpu_scoped_vmem_limit_kib` raised to 115 MiB. Megablox's `gmm` takes no limit of its own, and its
+256-row and larger tilings only compile with the higher one. Each method is reported at its better run.
+autokernel's kernels set their own limit either way.
+
+**Columns:**
+
+- **Experts:** the routed experts on already-dispatched rows.
+- **Layer:** RMSNorm, router, dispatch, experts, combine and residual.
+- **GB/s:** the fewest bytes the experts must move (each chosen expert's weights once, rows in and out)
+  divided by the time.
+
+Reproduce with `benchmarks/moe.py --config <name> --profile [--scoped-vmem-mib 115]`.
+
+**Qwen3-235B-A22B** (d_model 4096, 128 experts, top-8, 1536 hidden units each; 4.8 GB of experts):
+
+| Tokens | Experts: autokernel | `ragged_dot` | megablox | Layer: autokernel | `ragged_dot` | megablox | Layer speedup |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 4096 (prefill) | **10.35** (119.5 TFLOP/s) | 15.00 (82.5) | 16.86 (73.4) | **14.78** | 19.92 | 21.74 | **1.35×** |
+| 64 (decode) | **6.40** (750 GB/s) | 6.70 (717) | 6.88 (698) | **6.41** | 6.66 | 6.55 | 1.02× |
+| 8 (decode) | **2.54** (744 GB/s) | 2.60 (727) | 2.62 (720) | **2.55** | 2.61 | 2.56 | 1.01× |
+
+The decode rows were measured at the default limit only.
+
+**Profiles at 4096 tokens** (default limit, from `autokernel.profile` trace regions):
+
+| Kernel | Steps | Compute | Exposed DMA waits | Output waits | Overhead | Device time |
+| --- | --- | --- | --- | --- | --- | --- |
+| `expert_ffn_blocks`, 384-row tiles | 853 | 9.86 ms | 0.09 ms | 0.24 ms | 0.10 ms | 10.31 ms |
+| `gmm_swiglu`, 256 × 2048 tiles | 254 | 8.57 ms | 0.40 ms | | 0.02 ms | 9.02 ms |
+
+At 4096 tokens each expert gets ~256 rows, and the fused kernel is MXU-bound. Every weight it fetches
+is hidden behind compute.
+
+**Where megablox loses:**
+
+- **Weight reads:** its 128-row tiles at the default limit reread an expert's weights for every 128 rows.
+  At 819 GB/s that caps it near 105 TFLOP/s.
+- **Straddling tiles:** a tile spanning two experts is computed once for each.
+- **Unfused SwiGLU:** the gate/up output, 32k rows × 3072, goes to HBM and back through an XLA SwiGLU.
+
+The higher VMEM limit fixes the first: 256-row tiles, 20.45 → 16.86 ms. The other two remain.
+
+**Decode:** a few tokens touch most experts once, and every method reads those weights at 85–92% of the
+v5e's 819 GB/s, so they run at parity. The streaming `moe_decode` (a repeat loop over the chosen experts,
+each one's weights in blocks of hidden units, the next one fetched while this one runs) is what makes a
+full-width expert fit at all: Mixtral's experts are 352 MB each.
+
+Qwen3-Next-80B, Mixtral 8x7B and DeepSeek-V3 width (64 of its 256 experts), and 16384-token prefill, are
+being measured; raw rows in `benchmarks/results/moe_full_width_v5e.jsonl`.
+
 ## A real model against vLLM: Gemma 4 E2B
 
 [gemma4.py](examples/gemma4.py) is Gemma 4 E2B's text decoder with its real weights:

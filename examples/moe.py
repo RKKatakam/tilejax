@@ -36,9 +36,11 @@ The layer, `moe_layer`, for prefill: three kernels and some XLA between them.
 
 For decode (up to `DECODE_TOKENS` tokens) every row gather and kernel launch is overhead next to reading
 the chosen experts' weights, so the layer is the routing in XLA (as the baselines route) and one kernel,
-`moe_decode` / `moe_decode_shared`: a step per expert some token chose (a runtime mask on its token
-count), every token through it, weighted by its routing weight (zero for the tokens that didn't choose
-it); then the shared experts; RMSNorm and the residual around them. Computing all tokens with each expert
+`moe_decode` / `moe_decode_shared`: a repeat loop over the experts some token chose (a list made by the
+routing, padded to its most; the padding a runtime mask), each expert's weights streamed in blocks of
+hidden units (a full-width expert, Mixtral's 352 MB, doesn't fit in VMEM) while the next one's first blocks
+are fetched, every token through it, weighted by its routing weight (zero for the tokens that didn't
+choose it); then the shared experts; RMSNorm and the residual around them. Computing all tokens with each expert
 costs T flops per weight byte, which a v5e hides under the weights' reads while T is under ~200.
 
 The grouped kernels. Every step reads a whole block of an expert's weights for the rows of a tile: G flops
@@ -117,6 +119,12 @@ CONFIGS = {
     "deepseek-v2-lite": MoeConfig(2048, 64, 6, 1408, shared=2, normalize=False),
     "deepseek-v3-small": MoeConfig(2048, 256, 8, 512, shared=1, scoring="sigmoid", n_group=8, topk_group=4, scale=2.5),
     "kimi-k2-small": MoeConfig(2048, 384, 8, 512, shared=1, scoring="sigmoid", scale=2.827),
+    # One layer of real models at full width (weights 2.8-5.6 GB in bf16). DeepSeek-V3's 256 experts would be
+    # 22.5 GB: 64 of them, at its width, top-8 routing and groups.
+    "qwen3-235b-a22b": MoeConfig(4096, 128, 8, 1536),
+    "qwen3-next-80b-a3b": MoeConfig(2048, 512, 10, 512, shared=1),
+    "mixtral-8x7b": MoeConfig(4096, 8, 2, 14336),
+    "deepseek-v3-64e": MoeConfig(7168, 64, 8, 2048, shared=1, scoring="sigmoid", n_group=8, topk_group=4, scale=2.5),
 }
 
 
@@ -346,18 +354,27 @@ def shared_combine(x, gamma, w_gate, w_up, w_down, rows, weights, tiles=SharedTi
 
 @autokernel.tunable
 class DecodeTiles:
-    """Shared hidden units per step."""
+    """Hidden units per step: of a routed expert, of the shared experts."""
 
+    block_e: int = autokernel.choice(256, 512, 1024, 2048, 4096, default=512)
     block_f: int = autokernel.choice(256, 512, 1024, 2048, 4096, default=1024)
 
 
+def hidden_block(f: int, block: int) -> int:
+    """Hidden units per step for `block` asked: the largest multiple of 128 up to it dividing f (f if none)."""
+    return next((b for b in range(min(block, f) // 128 * 128, 0, -128) if f % b == 0), f)
+
+
 @autokernel.kernel
-def moe_decode(x, gamma, w_gate, w_up, w_down, counts, weights):
+def moe_decode(x, gamma, w_gate, w_up, w_down, chosen, n_chosen, weights, tiles=DecodeTiles()):
     """A whole MoE layer for a few tokens, without shared experts: x + sum_e weights[e] * expert_e(
-    rmsnorm(x)), a step per expert some token chose (`counts[e] > 0`: a runtime mask), every token through it
-    (weights (E, T, 1) f32: zero for the tokens that didn't choose it)."""
+    rmsnorm(x)) over the experts some token chose (`chosen[:n_chosen[0]]`; the rest of `chosen` is padding):
+    a repeat loop over them streaming each one's weights in blocks of hidden units, the next one's fetched
+    while this one's run, every token through it (weights (E, T, 1) f32: zero for the tokens that didn't
+    choose it)."""
     T, D = x.shape
-    E = w_gate.shape[0]
+    C, F = chosen.shape[0], w_gate.shape[2]
+    be = hidden_block(F, tiles.block_e)
     dtype = x.dtype
     out = jnp.zeros((T, D), dtype)
     for i in range(0, T, T):
@@ -365,25 +382,29 @@ def moe_decode(x, gamma, w_gate, w_up, w_down, counts, weights):
         normed = resid * jax.lax.rsqrt(jnp.mean(resid * resid, axis=1, keepdims=True) + EPS) * gamma[0:1, :]
         normed = normed.astype(dtype)
         acc = jnp.zeros((T, D), jnp.float32)
-        for e in range(E):
-            if counts[e] == 0:  # no token chose it: decided when the kernel runs, its weights never read
-                continue
-            g = normed @ w_gate[e, :, :]
-            u = normed @ w_up[e, :, :]
-            y = (jax.nn.silu(g) * u).astype(dtype) @ w_down[e, :, :]
-            acc += weights[e, :, :] * y.astype(dtype).astype(jnp.float32)
+        for c in range(C):  # a repeat loop over the chosen experts
+            for f in range(0, F, be):  # their hidden units, be per step
+                if c >= n_chosen[0]:  # padding: decided when the kernel runs, no weights read
+                    continue
+                g = normed @ w_gate[chosen[c], :, f : f + be]
+                u = normed @ w_up[chosen[c], :, f : f + be]
+                acc += weights[chosen[c], :, :] * (
+                    (jax.nn.silu(g) * u).astype(dtype) @ w_down[chosen[c], f : f + be, :]
+                )
         out = out.at[i : i + T, :].set((resid + acc).astype(dtype))
     return out
 
 
 @autokernel.kernel
-def moe_decode_shared(x, gamma, w_gate, w_up, w_down, counts, weights, s_gate, s_up, s_down, tiles=DecodeTiles()):
-    """`moe_decode` with shared experts (s_gate, s_up, s_down): a phase over the routed experts some token
-    chose, then one over the shared experts' hidden units."""
+def moe_decode_shared(
+    x, gamma, w_gate, w_up, w_down, chosen, n_chosen, weights, s_gate, s_up, s_down, tiles=DecodeTiles()
+):
+    """`moe_decode` with shared experts (s_gate, s_up, s_down): after the routed experts, a phase over the
+    shared experts' hidden units."""
     T, D = x.shape
-    E = w_gate.shape[0]
-    F = s_gate.shape[1]
-    bf = min(tiles.block_f, F)
+    C, F = chosen.shape[0], w_gate.shape[2]
+    FS = s_gate.shape[1]
+    be, bf = hidden_block(F, tiles.block_e), hidden_block(FS, tiles.block_f)
     dtype = x.dtype
     out = jnp.zeros((T, D), dtype)
     for i in range(0, T, T):
@@ -391,17 +412,19 @@ def moe_decode_shared(x, gamma, w_gate, w_up, w_down, counts, weights, s_gate, s
         normed = resid * jax.lax.rsqrt(jnp.mean(resid * resid, axis=1, keepdims=True) + EPS) * gamma[0:1, :]
         normed = normed.astype(dtype)
         acc = jnp.zeros((T, D), jnp.float32)
-        for e in range(E):
-            if counts[e] == 0:  # no token chose it: decided when the kernel runs, its weights never read
-                continue
-            g = normed @ w_gate[e, :, :]
-            u = normed @ w_up[e, :, :]
-            y = (jax.nn.silu(g) * u).astype(dtype) @ w_down[e, :, :]
-            acc += weights[e, :, :] * y.astype(dtype).astype(jnp.float32)
-        for f in range(0, F, bf):  # the shared experts' hidden units, bf per step
-            g = normed @ s_gate[:, f : f + bf]
-            u = normed @ s_up[:, f : f + bf]
-            acc += (jax.nn.silu(g) * u).astype(dtype) @ s_down[f : f + bf, :]
+        for c in range(C):  # a repeat loop over the chosen experts
+            for f in range(0, F, be):  # their hidden units, be per step
+                if c >= n_chosen[0]:  # padding: decided when the kernel runs, no weights read
+                    continue
+                g = normed @ w_gate[chosen[c], :, f : f + be]
+                u = normed @ w_up[chosen[c], :, f : f + be]
+                acc += weights[chosen[c], :, :] * (
+                    (jax.nn.silu(g) * u).astype(dtype) @ w_down[chosen[c], f : f + be, :]
+                )
+        for f2 in range(0, FS, bf):  # the shared experts' hidden units, bf per step
+            g2 = normed @ s_gate[:, f2 : f2 + bf]
+            u2 = normed @ s_up[:, f2 : f2 + bf]
+            acc += (jax.nn.silu(g2) * u2).astype(dtype) @ s_down[f2 : f2 + bf, :]
         out = out.at[i : i + T, :].set((resid + acc).astype(dtype))
     return out
 
@@ -681,6 +704,11 @@ def experts_call(normed: jax.Array, ids: jax.Array, params: dict[str, Any], conf
     return expert_ffn_blocks, (xs, *weights, b.tile_expert, b.tile_blocks), b.pos
 
 
+def decode_experts(tokens: int, config: MoeConfig) -> int:
+    """The most experts `tokens` tokens can choose: the decode kernels' repeat loop's iterations."""
+    return min(config.experts, tokens * config.top_k)
+
+
 def decode_call(x: jax.Array, params: dict[str, Any], config: MoeConfig) -> tuple[autokernel.Kernel, tuple]:
     """The kernel of a decode layer (`moe_decode`, or `moe_decode_shared`) and its inputs: routing in XLA
     (fused RMSNorm and f32 router, as the baselines'), then each expert's token count and each token's
@@ -690,7 +718,10 @@ def decode_call(x: jax.Array, params: dict[str, Any], config: MoeConfig) -> tupl
     hot = one_hot(ids, config.experts)
     counts = jnp.sum(hot, axis=(0, 1), dtype=jnp.int32)
     expert_weights = jnp.sum(jnp.where(hot, weights[:, :, None], 0.0), axis=1).T[:, :, None]
-    args = (x, params["norm"], params["w_gate"], params["w_up"], params["w_down"], counts, expert_weights)
+    # The chosen experts first (in order), then the others as padding: at most one per slot.
+    order = jnp.argsort(counts == 0, stable=True).astype(jnp.int32)[: decode_experts(x.shape[0], config)]
+    n_chosen = jnp.sum(counts > 0, dtype=jnp.int32)[None]
+    args = (x, params["norm"], params["w_gate"], params["w_up"], params["w_down"], order, n_chosen, expert_weights)
     if not config.shared:
         return moe_decode, args
     s = params["shared"]
@@ -756,7 +787,9 @@ def experts_specs(config: MoeConfig, tokens: int, group: int) -> tuple[autokerne
 
     weights = (spec(e, d, f), spec(e, d, f), spec(e, f, d))
     if tokens <= DECODE_TOKENS:
-        args = (spec(tokens, d), spec(1, d), *weights, spec(e, dtype=jnp.int32), spec(e, tokens, 1, dtype=jnp.float32))
+        c = decode_experts(tokens, config)
+        index = (spec(c, dtype=jnp.int32), spec(1, dtype=jnp.int32))
+        args = (spec(tokens, d), spec(1, d), *weights, *index, spec(e, tokens, 1, dtype=jnp.float32))
         if not config.shared:
             return moe_decode, args
         fs = config.shared_ffn

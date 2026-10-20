@@ -258,6 +258,11 @@ def _load(source: str, filename: str, entry: str) -> Callable[..., Any]:
     return namespace[entry]
 
 
+# Elements `compare` checks at a time: float64 copies of a whole output of several GB (an MoE layer's rows at
+# 16384 tokens) and their temporaries ran a TPU VM's host out of memory.
+COMPARE_CHUNK = 1 << 22
+
+
 def compare(
     what: str,
     got: Any,
@@ -270,7 +275,6 @@ def compare(
     `rtol` and `atol` (default: exact for integers, 1e-4 for f32, 2e-2 of the largest value for 16-bit, also
     for an f32 result computed from 16-bit inputs, the dtypes `inputs`: Mosaic and XLA may round its 16-bit
     intermediates one ulp apart)."""
-    g, w = np.asarray(got, np.float64), np.asarray(want, np.float64)
     dtype = np.dtype(want.dtype)
     narrow = any(jnp.issubdtype(d, jnp.floating) and np.dtype(d).itemsize <= 2 for d in inputs)
     if not jnp.issubdtype(dtype, jnp.inexact):
@@ -280,18 +284,27 @@ def compare(
     else:
         default = 1e-4
     rtol = default if rtol is None else rtol
+    got_all, want_all = np.asarray(got).reshape(-1), np.asarray(want).reshape(-1)
+    chunks = range(0, want_all.size, COMPARE_CHUNK)
     if atol is None:
         # 16-bit results round at every step: their error grows with the output's magnitude.
-        finite = np.abs(w[np.isfinite(w)])
-        scale = float(finite.max()) if default >= 2e-2 and finite.size else 1.0
-        atol = default * max(scale, 1.0)
-    same = (g == w) | (np.isnan(g) & np.isnan(w))
-    with np.errstate(invalid="ignore"):
-        error = float(np.max(np.abs(np.where(same, 0.0, g - w)), initial=0.0))
-    close = np.isclose(g, w, rtol=rtol, atol=atol, equal_nan=True)
-    if not close.all():
+        scale = 1.0
+        if default >= 2e-2:
+            for start in chunks:
+                w = want_all[start : start + COMPARE_CHUNK].astype(np.float64)
+                scale = max(scale, float(np.max(np.abs(w), where=np.isfinite(w), initial=0.0)))
+        atol = default * scale
+    error, differ = 0.0, 0
+    for start in chunks:
+        g = got_all[start : start + COMPARE_CHUNK].astype(np.float64)
+        w = want_all[start : start + COMPARE_CHUNK].astype(np.float64)
+        same = (g == w) | (np.isnan(g) & np.isnan(w))
+        with np.errstate(invalid="ignore"):
+            error = max(error, float(np.max(np.abs(np.where(same, 0.0, g - w)), initial=0.0)))
+        differ += int(np.sum(~np.isclose(g, w, rtol=rtol, atol=atol, equal_nan=True)))
+    if differ:
         raise AssertionError(
-            f"{what}: the kernel and its reference differ in {int((~close).sum())} of {g.size} elements "
+            f"{what}: the kernel and its reference differ in {differ} of {want_all.size} elements "
             f"(largest difference {error:.3g}; rtol={rtol}, atol={atol:.3g})"
         )
     return error
