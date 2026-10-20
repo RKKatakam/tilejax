@@ -775,7 +775,6 @@ def test_a_per_tile_window_consecutive_tiles_share_is_fetched_once():
     assert "def x_moves" not in src and "def w_moves" not in src  # streamed
 
 
-
 def test_a_helpers_generator_expressions_read_globals_too():
     helpers = source_function(
         "def double_it(v):\n"

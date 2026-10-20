@@ -250,11 +250,11 @@ def test_megakernel_lowers_for_v5e(layers, batch, max_len, tiles):
 
 
 @pytest.mark.tpu
-@pytest.mark.parametrize("batch", [1, 8, 64])
-def test_megakernel_natively_matches_the_per_layer_kernels_and_xla(batch):
+@pytest.mark.parametrize(("batch", "s_max"), [(1, 2048), (8, 2048), (64, 2048), (8, 1792), (8, 7168)])
+def test_megakernel_natively_matches_the_per_layer_kernels_and_xla(batch, s_max):
     config = Config(layers=4, d_model=2048, heads=16, kv_heads=8, ffn=6144, vocab=32768)
-    lengths = np.random.default_rng(0).integers(0, 1500, batch).astype(np.int32)
-    tokens, k_cache, v_cache, lengths, params = _step_inputs(batch, lengths, 2048, config)
+    lengths = np.random.default_rng(0).integers(0, s_max * 3 // 4, batch).astype(np.int32)
+    tokens, k_cache, v_cache, lengths, params = _step_inputs(batch, lengths, s_max, config)
     ours, k_new, _, _ = megakernel_step(tokens, k_cache, v_cache, lengths, params)
     layers = layer_weights(params)
     for step in (per_layer_step, xla_step):

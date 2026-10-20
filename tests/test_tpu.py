@@ -153,3 +153,21 @@ def test_transformer_natively_matches_splash_and_xla():
     want = baseline(config, 1024)(tokens, params)
     scale = float(jnp.max(jnp.abs(want.astype(jnp.float32))))
     np.testing.assert_allclose(f64(logits), f64(want), atol=5e-2 * scale)
+
+
+@pytest.mark.parametrize("divisor", [7, 1792, 7168])
+def test_scalar_floor_division_by_any_constant(divisor):
+    # Loop variables divided by a constant that isn't a power of two, as index arithmetic does.
+    kernel = make_kernel(
+        f"""
+        def f(x):
+            out = jnp.zeros((64, 8, 128), jnp.int32)
+            for j in range(64):
+                v = j * 3001 // {divisor} + j * 3001 % {divisor}
+                out = out.at[j, :, :].set(jnp.full((8, 128), v, jnp.int32) + x[0:8, :])
+            return out
+        """
+    )
+    x = jnp.zeros((8, 128), jnp.int32)
+    out = np.asarray(kernel(x))[:, 0, 0]
+    assert out.tolist() == [j * 3001 // divisor + j * 3001 % divisor for j in range(64)]
