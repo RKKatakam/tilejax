@@ -67,6 +67,13 @@ ops instead.
 | `out = out.at[...].set(value)` | output slots copied to HBM asynchronously |
 | `a @ b`, `a @ b.T` | MXU matmuls accumulating in f32, `b.T` read transposed in place |
 | `if cond: continue` | skipped tiles and steps: no copies, no compute, no step |
+| `lengths[b]`: an int32 input read element by element | an index array in SMEM |
+| `if j >= lengths[b]: continue` (a mask reading an index array) | step tables made on the device before the kernel; it loops over only the steps that run |
+| `w[expert[e], :, :]` | a window chosen when the kernel runs |
+| a per-tile window the next tile shares (`w[expert[i // G]]`) | fetched once, not again per tile |
+| `for layer in range(L):` around reduction loops (a repeat loop) | the phases' steps once per layer, the next layer's weights fetched while this one runs |
+| `out = out.at[i : i + C, :].set(y)` in a reduction loop's body | a tile stored per step, its copy overlapping the next steps |
+| `a = a.at[k].set(v)` on a carried value | a store into that part of its VMEM buffer |
 
 Generated code is what runs: `kernel.source(...)` is exactly the module autokernel executes.
 
