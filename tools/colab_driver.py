@@ -7,7 +7,7 @@ shouldn't cost the rest of the run).
 """
 
 import subprocess
-import time
+import threading
 
 REPO = "/content/ak"
 TIMEOUT = 3600
@@ -15,16 +15,16 @@ TIMEOUT = 3600
 
 def sh(command: str, timeout: int = TIMEOUT) -> None:
     print(f"$ {command}", flush=True)
-    start = time.monotonic()
     process = subprocess.Popen(["bash", "-lc", command], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    watchdog = threading.Timer(timeout, process.kill)
+    watchdog.start()
     assert process.stdout is not None
     for line in process.stdout:
         print(line, end="", flush=True)
-        if time.monotonic() - start > timeout:
-            process.kill()
-            print(f"[killed after {timeout} s]", flush=True)
-            break
-    print(f"[exit {process.wait()}]", flush=True)
+    code = process.wait()
+    timed_out = not watchdog.is_alive()
+    watchdog.cancel()
+    print(f"[exit {code}{f', killed after {timeout} s' if timed_out else ''}]", flush=True)
 
 
 sh(
