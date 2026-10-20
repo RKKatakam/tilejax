@@ -4,16 +4,21 @@ Guidance for anyone, human or agent, changing autokernel. Read this before writi
 
 ## What autokernel is, and isn't
 
-autokernel compiles one Python loop nest over tiles into one **gridless** Pallas kernel for a **TPU
-v5e**. The scope is deliberately small:
+autokernel compiles one Python loop nest over tiles, written as plain JAX, into one **gridless** Pallas
+kernel for a **TPU v5e**, and tunes its schedule on the hardware. The scope is deliberately small:
 
 - **One chip.** Everything assumes a TPU v5e (`v5e.py`): 128 MiB VMEM, 1 MiB SMEM, one TensorCore, Mosaic's
   (8, 128) layout. Off a TPU, kernels run in the Pallas TPU interpreter. Don't add other chips.
 - **One loop nest per kernel.** No programs, fusion, vmap/grad rules or sharding.
-- **No tuning knobs.** Block sizes are the user's (they are in the loops). The only thing autokernel
-  chooses about a kernel's performance is its buffering (`pipeline.py`), and it chooses it from
-  `jax.named_scope` trace regions measured on the TPU (`profiling.py`). Don't add cost models, search
-  spaces, caches or options; make the profile say what to do instead.
+- **One object to optimize over.** A kernel's only performance input is its tunable: the
+  `@autokernel.tunable` default of its last parameter, a frozen pytree of `choice(...)` fields
+  (`tunable.py`). The schedule autokernel searches is that tunable plus the buffering (`pipeline.py`).
+  There are no options on `@autokernel.kernel`: called without its tunable, a kernel tunes; given one, it
+  uses it.
+- **Tuning from first principles** (`tune.py`): test every candidate against the plain-JAX reference, time
+  it from a profiler trace, read its `jax.named_scope` regions (`profiling.py`), and let the bottleneck
+  pick the next schedules. Don't add cost models, disk caches or search options; make the profile say what
+  to do instead.
 - **The examples are the spec**: matmul, causal matmul, causal attention (checked against JAX's splash
   attention). A feature earns its place by making one of them better or by a new example that needs it.
 
@@ -21,7 +26,10 @@ v5e**. The scope is deliberately small:
 
 ```
 fn --parse.py--> Nest --plan.py--> Plan --schedule.py--> Schedule --codegen.py--> source --exec--> kernel
-                (syntax)          (shapes, types)       (step tables)           (+ Pipeline)
+                (syntax)       (shapes, tunable,      (step tables)           (+ Pipeline)
+                                 types)
+tune.py: for each candidate Config (tunable, Pipeline): build -> run -> compare with the reference ->
+         profile (trace regions) -> proposals from the bottleneck -> ... -> the fastest Config
 ```
 
 | Module | Responsibility | Never does |
@@ -33,8 +41,10 @@ fn --parse.py--> Nest --plan.py--> Plan --schedule.py--> Schedule --codegen.py--
 | `codegen.py` | emit the source from Plan + Schedule + Pipeline | make semantic decisions |
 | `mxu.py` | the meaning of `@`, shared by kernel, type trace and reference | |
 | `reference.py` | the function as plain JAX (`@` rewritten to `mxu`) | |
-| `api.py` | `Kernel`: per-signature caching, `lower`/`source`/`reference`/`verify` | |
-| `profiling.py` | read device traces, `KernelProfile`, `candidates`, `optimize` | |
+| `tunable.py` | `@tunable`, `choice`, neighbours of a tunable | know about kernels |
+| `tune.py` | `Config`, `search`, `proposals` (bottleneck -> next schedules), testing candidates, `tune` | parse or plan |
+| `api.py` | `Kernel`: per-signature caching, tunable handling, `lower`/`source`/`reference`/`verify`/`tuning` | |
+| `profiling.py` | read device traces into `KernelProfile`; `measure` a lowered kernel | choose anything |
 | `tilecode.py` | name analysis of tile statements; recognising output stores | |
 
 ### Invariants
@@ -70,7 +80,15 @@ Each of these was found on hardware; don't undo them without measuring again.
 - A DMA window with a traced offset is slower than a constant one: loops of one block emit constant
   offsets (`codegen._scaled`).
 - Only single-step tiles drop the accumulator: splitting a multi-step reduction's first step was slower.
-- Three input slots beat two (8192³ bf16, 512³ tiles: 6.30 vs 7.39 ms); `optimize` finds when four help.
+- Three input slots beat two (8192³ bf16, 512³ tiles: 6.30 vs 7.39 ms); four helped where profiles showed
+  exposed waits (8192³ bf16 with 256³ tiles: 13.54 -> 11.86 ms).
+- Tuning must run its kernels outside any trace: when a kernel's first call is under `jax.jit`, JAX's
+  (thread-local) trace would stage the random inputs and test runs. `jax.ensure_compile_time_eval` is not
+  an option (it leaks into the Pallas kernel's own trace); tune.py runs tuning on a thread of its own.
+- Tuning from the defaults on a v5e: 4096³ bf16 from 128³ tiles 7.72 -> 0.736 ms (1024³, 4 buffers);
+  8192³ 6.35 -> 5.77 ms; causal 3.48 -> 3.24 ms; attention 700 -> 685 µs.
+- 128³ matmul tiles are per-step-overhead bound (~0.2 us of fixed cost per step); 512³ bf16 tiles are
+  DMA/MXU balanced. The tuner's proposals follow from these: overhead -> bigger tiles.
 - `jax.named_scope` in a kernel shows up in the profiler as events on the "XLA TraceMe" line, named
   `<kernel>/<region>`, user scopes by their own name, only with
   `LIBTPU_INIT_ARGS=--xla_enable_custom_call_region_trace=true` set before the backend starts. The kernel's
@@ -93,8 +111,10 @@ uv run python examples/matmul.py        # prints the generated source
 
 Tests: `test_parse.py` (every syntax rule), `test_plan.py`, `test_schedule.py`, `test_codegen.py` (every
 emission path runs in the interpreter with the race detector and cross-lowers to Mosaic for a v5e),
-`test_api.py`, `test_profiling.py` (synthetic traces), `test_examples.py`, `test_tpu.py` (`tpu` marker:
-real hardware only). `helpers.make_kernel(source, **globals)` builds a kernel from a source string, which
+`test_api.py`, `test_profiling.py` (synthetic traces), `test_tunable.py`, `test_tune.py` (the search and
+proposals with synthetic profiles; tuning end to end with `tune._can_time` and `profiling.measure` faked,
+kernels really running in the interpreter), `test_examples.py`, `test_tpu.py` (`tpu` marker: real hardware
+only). `helpers.make_kernel(source, **globals)` builds a kernel from a source string, which
 keeps error-case tests short.
 
 ## Running on a TPU v5e (Colab CLI)

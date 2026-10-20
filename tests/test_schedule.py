@@ -10,7 +10,7 @@ from autokernel import KernelError
 
 def schedule_of(source: str, *inputs, **namespace):
     kernel = make_kernel(source, **namespace)
-    return kernel._build(kernel.signature(*inputs)).schedule
+    return kernel.build(kernel.signature(*inputs), None)[1]
 
 
 BANDED = """
@@ -145,11 +145,12 @@ def test_step_arithmetic_stays_in_int32():
 
 
 def test_a_causal_matmul_of_one_tile():
-    from causal_matmul import make_causal_matmul
+    from causal_matmul import causal_matmul
     from helpers import rand, run_checking_races
+    from matmul import MatmulTiles
 
-    kernel = make_causal_matmul(256, 256, 128)
+    tiles = MatmulTiles(tm=256, tn=256, tk=128)
     x, y = rand((256, 256)), rand((256, 256), 1)
-    run_checking_races(kernel, x, y)
-    kernel.verify(x, y)
-    assert kernel.lower(x, y).schedule.tables == {}
+    run_checking_races(causal_matmul, x, y, tiles)
+    causal_matmul.verify(x, y, tiles)
+    assert causal_matmul.lower(x, y, tiles).schedule.tables == {}

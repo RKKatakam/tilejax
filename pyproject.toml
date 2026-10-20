@@ -1,6 +1,6 @@
 [project]
 name = "autokernel"
-version = "0.6.0"
+version = "0.7.0"
 description = "Compile Python tile loops into gridless Pallas kernels for TPU v5e"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -55,6 +55,7 @@ extend-exclude = [".venv", "*.md"]  # Markdown code blocks keep their aligned co
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
 ignore = [
+    "B008",  # tunables are frozen: a tunable instance as a kernel's default parameter is the API
     "RUF001",  # en dashes and similar in prose are fine
     "SIM108",  # ternaries aren't always clearer
 ]

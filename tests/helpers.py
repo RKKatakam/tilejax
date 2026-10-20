@@ -23,12 +23,14 @@ def spec(*shape: int, dtype: Any = jnp.float32) -> jax.ShapeDtypeStruct:
     return jax.ShapeDtypeStruct(shape, dtype)
 
 
-def run_checking_races(kernel: autokernel.Kernel, *inputs: Any) -> Any:
-    """Run a kernel in the Pallas TPU interpreter with its race detector, uninitialized memory as NaN."""
+def run_checking_races(kernel: autokernel.Kernel, *args: Any) -> Any:
+    """Run a kernel (on its inputs, and tunable if given) in the Pallas TPU interpreter with its race
+    detector, uninitialized memory as NaN."""
     from jax._src.pallas.mosaic.interpret import interpret_pallas_call as interpreter
 
     params = pltpu.InterpretParams(detect_races=True, uninitialized_memory="nan")
-    out = jax.block_until_ready(kernel.lower(*inputs).entry(*inputs, interpret=params))
+    arrays = args[: len(kernel.nest.params)]
+    out = jax.block_until_ready(kernel.lower(*args).entry(*arrays, interpret=params))
     assert interpreter.races is not None and not interpreter.races.races_found, "the kernel has data races"
     return out
 

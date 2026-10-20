@@ -12,7 +12,7 @@ import pytest
 from helpers import f64, lower_for_v5e, make_kernel, rand, run_checking_races, source_function, spec
 
 import autokernel
-from autokernel import KernelError, Pipeline
+from autokernel import Config, KernelError, Pipeline
 from autokernel.codegen import _literal
 
 
@@ -203,11 +203,10 @@ def test_three_output_buffers_and_four_input_buffers():
         """
     )
     x = rand((1024, 256))
-    signature = kernel.signature(x)
-    kernel.choose(signature, Pipeline(4, 3))
-    out = check(kernel, x)
-    np.testing.assert_allclose(f64(out), f64(x[:, :128] + x[:, 128:]), rtol=1e-6)
-    src = kernel.source(x)
+    lowered = kernel.lowered(kernel.signature(x), Config(None, Pipeline(4, 3)))
+    np.testing.assert_allclose(f64(lowered.run(x)), f64(x[:, :128] + x[:, 128:]), rtol=1e-6)
+    assert "tpu_custom_call" in lower_for_v5e(lowered, spec(1024, 256))
+    src = lowered.source
     assert "jax.lax.rem(tile, 3)" in src and "(s & 3)" in src and "pltpu.VMEM((4, 128, 128)" in src
 
 
@@ -215,7 +214,7 @@ def test_trace_regions():
     kernel = make_kernel(MASKED)
     x, y = rand((4, 512, 384)), rand((384, 256), 1)
     signature = kernel.signature(x, y)
-    traced = kernel.lowered(signature, kernel.pipeline(signature), trace=True)
+    traced = kernel.lowered(signature, kernel.lower(x, y).config, trace=True)
     for region in ("wait", "out_wait", "compute"):
         assert f"with jax.named_scope('f/{region}'):" in traced.source
     out = traced.run(x, y)
@@ -519,7 +518,7 @@ def test_review_regressions():
         """
     )
     w = rand((128, 128)) / 8
-    lowered = kernel.lowered(kernel.signature(w), Pipeline(), trace=True)
+    lowered = kernel.lowered(kernel.signature(w), Config(None, Pipeline()), trace=True)
     assert "f/wait" not in lowered.source and "_mxu_dot_nt(acc, w_ref[...])" in lowered.source
     np.testing.assert_allclose(f64(lowered.run(w)), f64(w) @ f64(w).T, rtol=1e-5, atol=1e-5)
     assert "tpu_custom_call" in lower_for_v5e(lowered, spec(128, 128))

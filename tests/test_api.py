@@ -7,47 +7,53 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from helpers import make_kernel, rand, spec
-from matmul import make_matmul
+from matmul import MatmulTiles, matmul
 
 import autokernel
 from autokernel import KernelError, Pipeline, mxu, v5e
 from autokernel.api import compare
 from autokernel.pipeline import default_pipeline
 
+TILES = MatmulTiles(tm=128, tn=128, tk=128)
+
 
 def test_lowered_describes_the_kernel():
-    kernel = make_matmul(128, 128, 128)
-    lowered = kernel.lower(spec(256, 384), spec(384, 256))
+    lowered = matmul.lower(spec(256, 384), spec(384, 256), TILES)
     assert (lowered.steps, lowered.tiles, lowered.total_tiles) == (12, 4, 4)
     assert lowered.pipeline == Pipeline(3, 2) and str(lowered.pipeline) == "3 input / 2 output buffers"
+    assert lowered.config.tunable == TILES and str(lowered.config).startswith("MatmulTiles(tm=128")
     # x and y: 3 slots of 128x128 f32 each; out: 2 slots; acc: one.
     assert lowered.vmem_bytes == (3 + 3 + 2 + 1) * 128 * 128 * 4
-    assert kernel.lower(spec(256, 384), spec(384, 256)) is lowered  # built once per signature
-    assert repr(kernel) == "<autokernel.Kernel matmul>" and kernel.__name__ == "matmul"
-    assert kernel.source(spec(256, 384), spec(384, 256)) == lowered.source
+    assert matmul.lower(spec(256, 384), spec(384, 256), TILES) is lowered  # built once per signature
+    assert repr(matmul) == "<autokernel.Kernel matmul>" and matmul.__name__ == "matmul"
+    assert matmul.source(spec(256, 384), spec(384, 256), TILES) == lowered.source
+    assert "MatmulTiles(tm=128, tn=128, tk=128); 3 input / 2 output buffers" in lowered.source
 
 
 def test_inputs_are_arrays_of_the_right_count():
-    kernel = make_matmul(128, 128, 128)
-    with pytest.raises(KernelError, match=r"takes 2 inputs \(x, y\), got 1"):
-        kernel(rand((256, 256)))
+    with pytest.raises(KernelError, match=r"takes 2 input arrays \(x, y\), then optionally `tiles`; got 1"):
+        matmul(rand((256, 256)))
     with pytest.raises(KernelError, match="input `y` must be an array, got float"):
-        kernel(rand((256, 256)), 1.0)
+        matmul(rand((256, 256)), 1.0)
     with pytest.raises(KernelError, match="input `y` must be an array"):
-        kernel(rand((256, 256)), jnp.float32(1))
+        matmul(rand((256, 256)), jnp.float32(1))
+    with pytest.raises(KernelError, match="`tiles` must be a MatmulTiles, not tuple"):
+        matmul(rand((256, 256)), rand((256, 256)), (128, 128, 128))
+    with pytest.raises(KernelError, match=r"takes 1 input arrays \(x\); got 2"):
+        make_kernel(SCALE_SOURCE, SCALE=2.0)(rand((8, 128)), rand((8, 128)))
+
+
+SCALE_SOURCE = """
+def f(x):
+    out = jnp.zeros((8, 128))
+    for i in range(0, 8, 8):
+        out = out.at[i : i + 8, :].set(x[i : i + 8, :] * SCALE)
+    return out
+"""
 
 
 def test_constants_are_read_when_a_signature_is_first_built():
-    kernel = make_kernel(
-        """
-        def f(x):
-            out = jnp.zeros((8, 128))
-            for i in range(0, 8, 8):
-                out = out.at[i : i + 8, :].set(x[i : i + 8, :] * SCALE)
-            return out
-        """,
-        SCALE=2.0,
-    )
+    kernel = make_kernel(SCALE_SOURCE, SCALE=2.0)
     x = rand((8, 128))
     first = kernel(x)
     kernel.fn.__globals__["SCALE"] = 3.0
@@ -73,9 +79,9 @@ def test_closures_are_read_too():
 
 
 def test_verify_returns_the_largest_difference():
-    kernel = make_matmul(128, 128, 128)
+    kernel = matmul
     x, y = rand((256, 256)), rand((256, 256), 1)
-    assert kernel.verify(x, y, rtol=0.0, atol=0.0) == 0.0  # the interpreter computes exactly what JAX does
+    assert kernel.verify(x, y, TILES, rtol=0.0, atol=0.0) == 0.0  # the interpreter computes exactly what JAX does
 
 
 def test_compare_tolerances():
@@ -108,8 +114,7 @@ def test_buffering_falls_back_to_two_slots_then_fails():
                 return out
             """
         )
-        build = kernel._build(kernel.signature(spec(2 * tile, 256)))
-        return default_pipeline(build.plan, build.schedule)
+        return default_pipeline(*kernel.build(kernel.signature(spec(2 * tile, 256)), None))
 
     assert big(32768) == Pipeline(3, 2)  # six 16 MiB buffers: exactly the 96 MiB budget
     assert big(36864) == Pipeline(2, 2)  # 18 MiB buffers: five fit, six don't
@@ -172,17 +177,6 @@ def test_pipelines_are_checked():
         Pipeline(5, 2)
     with pytest.raises(KernelError, match="1 to 3 output buffers"):
         Pipeline(2, 0)
-    kernel = make_kernel(
-        """
-        def f(x):
-            out = jnp.zeros((65536, 128))
-            for i in range(0, 65536, 32768):
-                out = out.at[i : i + 32768, :].set(x[i : i + 32768, :])
-            return out
-        """
-    )
-    with pytest.raises(KernelError, match="don't fit in VMEM"):
-        kernel.choose(kernel.signature(spec(65536, 128)), Pipeline(4, 3))
 
 
 def test_prologue_comprehensions_see_globals():

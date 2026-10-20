@@ -68,14 +68,14 @@ def test_parameters_are_positional():
     def f(x, *rest):
         pass
 
-    def g(x, y=1):
+    def g(x, y=1, z=2):
         pass
 
     def h(x, *, y):
         pass
 
     for fn in (f, g, h):
-        assert "plain positional parameters" in error(fn)
+        assert "its input arrays, then optionally a tunable" in error(fn)
 
 
 def test_the_function_shape():
@@ -258,6 +258,17 @@ def _tile(*lines: str) -> str:
 )
 def test_tile_statements(lines, message):
     assert message in _tile(*lines)
+
+
+def test_the_tunable_is_read_by_its_fields():
+    def f(x, tiles=None):
+        out = jnp.zeros((8, 128))
+        for i in range(0, 8, 8):
+            t = tiles
+            out = out.at[i : i + 8, :].set(x[i : i + 8, :])
+        return out
+
+    assert "`tiles` is the kernel's tunable: tile code reads its fields" in error(f)
 
 
 def test_stores():

@@ -119,6 +119,7 @@ class Plan:
 
     nest: Nest
     inputs: tuple[jax.ShapeDtypeStruct, ...]
+    tunable: Any  # the tunable's values it was planned with (None: the kernel has none)
     parallel: tuple[Range, ...]  # outermost first
     reduction: Range | None
     operands: tuple[Operand, ...]
@@ -163,19 +164,21 @@ def read_key(node: ast.Subscript) -> str:
     return ast.dump(node)
 
 
-def make_plan(nest: Nest, fn: Callable, inputs: Sequence[jax.ShapeDtypeStruct]) -> Plan:
-    """Resolve `nest` (parsed from `fn`) for inputs of these shapes and dtypes."""
-    return _Planner(nest, fn, tuple(inputs)).plan()
+def make_plan(nest: Nest, fn: Callable, inputs: Sequence[jax.ShapeDtypeStruct], tunable: Any = None) -> Plan:
+    """Resolve `nest` (parsed from `fn`) for inputs of these shapes and dtypes, and its tunable's values."""
+    return _Planner(nest, fn, tuple(inputs), tunable).plan()
 
 
 class _Planner:
-    def __init__(self, nest: Nest, fn: Callable, inputs: tuple[jax.ShapeDtypeStruct, ...]) -> None:
+    def __init__(self, nest: Nest, fn: Callable, inputs: tuple[jax.ShapeDtypeStruct, ...], tunable: Any) -> None:
         self.nest, self.fn, self.inputs = nest, fn, inputs
         closure = inspect.getclosurevars(fn).nonlocals
         # One namespace (code in the prologue, masks and bounds sees its names from lambdas and generator
         # expressions too): the module's values, the closure's over them, the prologue's over those.
         self.env: dict[str, Any] = {"__builtins__": builtins, **fn.__globals__, **closure}
         self.env.update(zip(nest.params, inputs, strict=True))
+        if nest.tunable:
+            self.env[nest.tunable] = tunable
         self.ranges: dict[str, Range] = {}
 
     def error(self, message: str, node: ast.AST | None = None) -> KernelError:
@@ -202,6 +205,7 @@ class _Planner:
         return Plan(
             nest=self.nest,
             inputs=self.inputs,
+            tunable=self.env.get(self.nest.tunable) if self.nest.tunable else None,
             parallel=parallel,
             reduction=reduction,
             operands=operands,

@@ -25,6 +25,7 @@ def make_reference(nest: Nest, fn: Callable) -> Callable[..., Any]:
     are now (as the kernel built now does)."""
     fdef = copy.deepcopy(nest.function)
     fdef.decorator_list = []
+    fdef.args.defaults = []  # the reference is always given its tunable: its default needn't evaluate again
     at = nest.function.body.index(nest.parallel[0].node)
     fdef.body[at] = mxu.rewrite_matmuls(fdef.body[at])
 

@@ -2,10 +2,10 @@
 
 A kernel function is
 
-    def f(x, y):                                   # positional parameters: the input arrays
+    def f(x, y, tiles=Tiles()):                    # the input arrays; optionally last, a tunable
         <prologue>                                 # assignments on shapes, run when the kernel is planned
         out = jnp.zeros((M, N), dtype)             # each output allocated once in the prologue
-        for i in range(0, M, TM):                  # parallel loops: every iteration writes its own tiles
+        for i in range(0, M, tiles.tm):            # parallel loops: every iteration writes its own tiles
             for j in range(0, N, TN):
                 if <mask>:                         # optional: skip this output tile
                     continue
@@ -53,7 +53,8 @@ class Nest:
     name: str
     filename: str
     function: ast.FunctionDef  # line numbers are the file's
-    params: tuple[str, ...]
+    params: tuple[str, ...]  # the input arrays
+    tunable: str | None  # the last parameter, if it has a default: the tunable autokernel optimizes over
     prologue: tuple[ast.stmt, ...]
     allocations: dict[str, ast.Assign]  # output -> the prologue statement allocating it
     outputs: tuple[str, ...]  # in the order the function returns them
@@ -114,7 +115,7 @@ class _Parser:
         return _error(self.name, self.filename, message, node)
 
     def parse(self) -> Nest:
-        params = self._params()
+        params, tunable = self._params()
         body = self.fdef.body
         if isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
             body = body[1:]  # the docstring
@@ -139,6 +140,7 @@ class _Parser:
             filename=self.filename,
             function=self.fdef,
             params=params,
+            tunable=tunable,
             prologue=prologue,
             allocations=allocations,
             outputs=outputs,
@@ -154,11 +156,16 @@ class _Parser:
 
     # ------------------------------------------------------------------ the signature and the outputs
 
-    def _params(self) -> tuple[str, ...]:
+    def _params(self) -> tuple[tuple[str, ...], str | None]:
+        """The input arrays' parameters, and the tunable's (the last parameter, given a default)."""
         args = self.fdef.args
-        if args.vararg or args.kwarg or args.kwonlyargs or args.defaults:
-            raise self.error("a kernel's parameters are plain positional parameters, one per input array", args)
-        return tuple(a.arg for a in [*args.posonlyargs, *args.args])
+        names = tuple(a.arg for a in [*args.posonlyargs, *args.args])
+        if args.vararg or args.kwarg or args.kwonlyargs or len(args.defaults) > 1:
+            raise self.error(
+                "a kernel's parameters are its input arrays, then optionally a tunable with a default, `tiles=Tiles()`",
+                args,
+            )
+        return (names[:-1], names[-1]) if args.defaults else (names, None)
 
     def _outputs(self, ret: ast.Return) -> tuple[str, ...]:
         value = ret.value
@@ -300,11 +307,18 @@ class _Parser:
                     for n in ast.walk(part)
                     if isinstance(n, ast.Subscript) and isinstance(n.value, ast.Name) and n.value.id in params
                 }
+                fields = {
+                    id(n.value)
+                    for n in ast.walk(part)
+                    if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == nest.tunable
+                }
                 for n in ast.walk(part):
                     if not isinstance(n, ast.Name):
                         continue
                     if n.id in params and id(n) not in bases:
                         raise self.error(f"`{n.id}` is an input: kernel code reads tiles of it, `{n.id}[...]`", n)
+                    if n.id == nest.tunable and id(n) not in fields:
+                        raise self.error(f"`{n.id}` is the kernel's tunable: tile code reads its fields, `{n.id}.x`", n)
                     if n.id in outputs:
                         what = "can't be read" if store else f"are written as `{n.id} = {n.id}.at[...].set(...)`"
                         raise self.error(f"output `{n.id}`'s tiles {what}", n)

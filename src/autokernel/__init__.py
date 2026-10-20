@@ -1,11 +1,11 @@
-"""autokernel: write a TPU v5e kernel as Python loops over tiles; get a gridless Pallas kernel.
+"""autokernel: write a TPU v5e kernel as plain JAX loops over tiles; get a gridless Pallas kernel, tuned.
 
-- `@autokernel.kernel` compiles a loop nest over output tiles (see README.md); call the result like the
-  function: it runs the generated kernel (in the Pallas TPU interpreter off-TPU).
-- `kernel.source(*inputs)` is the generated Pallas source; `kernel.verify(*inputs)` checks the kernel
-  against the loop nest run as plain JAX.
-- `autokernel.profile(kernel, *inputs)` says where the time goes on a v5e, from `jax.named_scope` trace
-  regions; `autokernel.optimize(kernel, *inputs)` chooses the kernel's buffering from them.
+- `@autokernel.kernel` compiles a loop nest over output tiles (see README.md); the result is called like
+  the function. Its last parameter may be a tunable (`@autokernel.tunable`): a small pytree of block sizes
+  and other choices. Pass one and the kernel uses it; leave it out and autokernel tunes it on the TPU.
+- `kernel.source(...)` is the generated Pallas source; `kernel.verify(...)` checks the kernel against the
+  loop nest run as plain JAX; `kernel.tuning(...)` is what tuning tried and chose.
+- `autokernel.profile(kernel, ...)` says where the time goes on a v5e, from `jax.named_scope` regions.
 """
 
 from __future__ import annotations
@@ -16,31 +16,34 @@ from . import profiling
 from .api import Kernel, Lowered, kernel
 from .errors import KernelError
 from .pipeline import Pipeline
-from .profiling import KernelProfile, Optimization, enable_profiling
+from .profiling import KernelProfile, enable_profiling
+from .tunable import choice, tunable
+from .tune import Config, Trial, Tuning
 
 __all__ = [
+    "Config",
     "Kernel",
     "KernelError",
     "KernelProfile",
     "Lowered",
-    "Optimization",
     "Pipeline",
+    "Trial",
+    "Tuning",
+    "choice",
     "enable_profiling",
     "kernel",
-    "optimize",
     "profile",
+    "tunable",
 ]
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
+
+# Tuning reads trace regions, which libtpu records only if told before JAX starts its TPU backend.
+if not profiling._backend_started():
+    enable_profiling()
 
 
-def profile(kernel: Kernel, *inputs: Any, runs: int = 5) -> KernelProfile:
-    """Where `kernel`'s time goes on a TPU v5e for these inputs: device time, input waits, compute, output
-    waits and the tile code's own `jax.named_scope`s. Call `enable_profiling()` first for the breakdown."""
-    return profiling.profile(kernel, inputs, runs=runs)
-
-
-def optimize(kernel: Kernel, *inputs: Any, runs: int = 5) -> Optimization:
-    """Choose `kernel`'s buffering for inputs like these from its profiles on a TPU v5e (needs
-    `enable_profiling()`); the kernel uses it from then on."""
-    return profiling.optimize(kernel, inputs, runs=runs)
+def profile(kernel: Kernel, *args: Any, runs: int = 5) -> KernelProfile:
+    """Where `kernel`'s time goes on a TPU v5e for these inputs (and tunable, if given): device time, input
+    waits, compute, output waits and the tile code's own `jax.named_scope`s."""
+    return profiling.profile(kernel, args, runs=runs)

@@ -14,7 +14,7 @@ X = spec(256, 256)
 
 def plan(source: str, *inputs, **namespace):
     kernel = make_kernel(source, **namespace)
-    return kernel._build(kernel.signature(*(inputs or (X,)))).plan
+    return kernel.build(kernel.signature(*(inputs or (X,))), None)[0]
 
 
 def plan_error(source: str, *inputs, **namespace) -> str:

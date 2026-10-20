@@ -1,41 +1,50 @@
 # autokernel
 
-Write a TPU kernel as ordinary Python loops over tiles; get a fast, **gridless**
-[Pallas](https://docs.jax.dev/en/latest/pallas/index.html) kernel for a **TPU v5e**.
+Write a TPU kernel as plain JAX: Python loops over tiles. Get a fast, **gridless**
+[Pallas](https://docs.jax.dev/en/latest/pallas/index.html) kernel for a **TPU v5e**, with its schedule
+tuned on the hardware.
 
 ```python
 import jax.numpy as jnp
 import autokernel
 
-TM, TN, TK = 512, 512, 512
+
+@autokernel.tunable
+class MatmulTiles:  # what autokernel may choose: a frozen pytree of choices
+    tm: int = autokernel.choice(128, 256, 512, 1024, 2048, default=512)
+    tn: int = autokernel.choice(128, 256, 512, 1024, 2048, default=512)
+    tk: int = autokernel.choice(128, 256, 512, 1024, 2048, default=512)
 
 
 @autokernel.kernel
-def matmul(x, y):
+def matmul(x, y, tiles=MatmulTiles()):
     M, K = x.shape
     N = y.shape[1]
-    dtype = x.dtype
-    out = jnp.zeros((M, N), dtype)
-    for i in range(0, M, TM):
-        for j in range(0, N, TN):
-            acc = jnp.zeros((TM, TN), jnp.float32)
-            for k in range(0, K, TK):
-                acc += x[i : i + TM, k : k + TK] @ y[k : k + TK, j : j + TN]
-            out = out.at[i : i + TM, j : j + TN].set(acc.astype(dtype))
+    tm, tn, tk = min(tiles.tm, M), min(tiles.tn, N), min(tiles.tk, K)
+    out = jnp.zeros((M, N), x.dtype)
+    for i in range(0, M, tm):
+        for j in range(0, N, tn):
+            acc = jnp.zeros((tm, tn), jnp.float32)
+            for k in range(0, K, tk):
+                acc += x[i : i + tm, k : k + tk] @ y[k : k + tk, j : j + tn]
+            out = out.at[i : i + tm, j : j + tn].set(acc.astype(x.dtype))
     return out
 
 
-out = matmul(x, y)          # runs the generated kernel
-print(matmul.source(x, y))  # the generated Pallas source: plain, standalone, readable
-matmul.verify(x, y)         # checks the kernel against the loops run as plain JAX
+out = matmul(x, y)                     # tunes the schedule on the first call, then runs the kernel
+print(matmul.tuning(x, y))             # what tuning tried and chose
+out = matmul(x, y, MatmulTiles(tm=256))  # or choose it yourself
+print(matmul.source(x, y))             # the generated Pallas source: plain, standalone, readable
+matmul.verify(x, y)                    # checks the kernel against the loops run as plain JAX
 ```
 
-The Python function is the specification: `verify` runs it as ordinary JAX and compares. The one thing a
-kernel does differently from plain JAX is `@`, which accumulates in f32 (i32 for integers) as the MXU does,
-instead of rounding `bf16 @ bf16` to bf16; `verify` uses the same rule.
+The function is plain JAX and is the specification: `matmul.fn(x, y)` runs it as written (under
+`jax.jit` too: a tunable is a pytree with no leaves), and `verify` compares the kernel with it. The one
+thing a kernel does differently from plain JAX is `@`, which accumulates in f32 (i32 for integers) as the
+MXU does, instead of rounding `bf16 @ bf16` to bf16; `verify` uses the same rule.
 
-autokernel targets **one chip, the TPU v5e**. Without a TPU, kernels run in the Pallas TPU interpreter, so
-you can develop and test them anywhere.
+autokernel targets **one chip, the TPU v5e**. Without a TPU, kernels run in the Pallas TPU interpreter
+with their default schedules, so you can develop and test them anywhere.
 
 ## How it works
 
@@ -90,8 +99,9 @@ The causal kernel skips every tile above the diagonal, so it does half of XLA's 
 
 ```python
 @autokernel.kernel
-def f(x, y):                                  # positional parameters: the input arrays
+def f(x, y, tiles=Tiles()):                   # the input arrays; optionally last, a tunable
     M, K = x.shape                            # prologue: Python on shapes, run when the kernel is built
+    TM, TN, TK = tiles.tm, tiles.tn, tiles.tk # (the tunable's fields are plain Python values)
     out = jnp.zeros((M, N), jnp.float32)      # each output allocated once: jnp.zeros or jnp.full
     for i in range(0, M, TM):                 # parallel loops: each iteration stores its own tiles
         for j in range(0, N, TN):
@@ -106,8 +116,10 @@ def f(x, y):                                  # positional parameters: the input
     return out
 ```
 
+- **Parameters** are the input arrays, then optionally a tunable with a default instance of an
+  `@autokernel.tunable` class; tile code reads its fields (`tiles.tm`).
 - **Loops** are `range(start, stop, step)` with ints known when the kernel is built (constants, closures,
-  shapes), a whole number of steps, starting at a multiple of the step.
+  shapes, the tunable's fields), a whole number of steps, starting at a multiple of the step.
 - **Inputs are read as tiles.** Each index is `v : v + size` or `v` for a loop variable `v`, `:`, a constant
   slice (`8:16`) or a constant int. Integer indices come before sliced dims (`q[b, h, i : i + T, :]`).
   Tiles follow the TPU layout: the last dim a multiple of 128, the second-to-last a multiple of 8 (16 for
@@ -137,21 +149,57 @@ Anything else is rejected with a `KernelError` naming the line, before anything 
 The [examples](examples/) are matmul, causal matmul, and causal multi-head (splash) attention, tested
 against NumPy and against JAX's own splash attention.
 
-## Profiling with named scopes
+## Tuning: test, trace, change the schedule
 
-Profiling is the one way autokernel looks at performance. There are no tuning knobs: block sizes are what
-you write in the loops, and buffering is chosen from profiles.
+A kernel's schedule is its tunable (the `@autokernel.tunable` default of its last parameter: block sizes,
+or anything the loops read from it) and its buffering (VMEM slots per copy). Call a kernel without its
+tunable and, the first time it sees inputs of a shape, autokernel tunes the schedule on the TPU, on random
+inputs of that shape, from first principles:
+
+1. **Test** each candidate: its output must match the loops run as plain JAX, or it's out (as is one that
+   doesn't build, doesn't fit in VMEM, or Mosaic can't compile).
+2. **Trace** it: run it under the JAX profiler. Its device time ranks it, and its trace regions say what
+   limits it (below).
+3. **Change the schedule** the way the bottleneck says, keeping what's faster: exposed input copies → more
+   input buffers, then the neighbouring tiles that move fewer bytes; exposed output copies → more output
+   buffers; per-step overhead → the neighbouring tiles with fewer, bigger steps; compute-bound → every
+   neighbour, fewest steps first. A neighbour moves one field one step along its choices.
+
+It climbs from the defaults until nothing proposed is faster (at most 12 candidates), and remembers the
+result for inputs of that shape. Passing a tunable skips tuning; off a TPU the defaults are used. Tuning
+also works when the first call is traced (`jax.jit(matmul)(x, y)`): it runs on a thread of its own.
+
+On a v5e (bf16; device time of the chosen schedule; `benchmarks/`):
+
+| Kernel | defaults | tuned | chosen |
+| --- | --- | --- | --- |
+| matmul 4096³ from 128³ tiles (`tests/test_tpu.py`) | 7.72 ms | **0.736 ms** (187 TFLOP/s) | 1024³, 4 input buffers |
+| matmul 8192³ | 6.35 ms | **5.77 ms** (XLA: 5.90) | 2048 × 1024 × 512 |
+| causal matmul 8192³ | 3.48 ms | **3.24 ms** (XLA: 5.91) | 512 × 512 × 1024 |
+| attention 4 × 16 × 2048 | 0.700 ms | **0.685 ms** (splash at its best: 0.872) | 512 × 512, 4 input buffers |
+
+The 128³ run, as `kernel.tuning(x, y)` prints it: the defaults were DMA-bound, so the first move was a
+fourth input buffer; then each step of tiles (compute-bound, but with tiny steps) cut the time, until
+1024³ tiles, where nothing proposed was faster:
+
+```
+chose Small(tm=1024, tn=1024, tk=1024), 4 input / 2 output buffers
+   Small(tm=128, tn=128, tk=128), 3 input / 2 output buffers        7722.6 us  dma
+   Small(tm=128, tn=128, tk=128), 4 input / 2 output buffers        6021.9 us  compute
+   Small(tm=256, tn=128, tk=128), 4 input / 2 output buffers        3428.2 us  compute
+   ...
+ * Small(tm=1024, tn=1024, tk=1024), 4 input / 2 output buffers      736.1 us  compute
+```
+
+### Trace regions
 
 ```python
-import autokernel
-autokernel.enable_profiling()              # first thing: before JAX starts its TPU backend
-
-report = autokernel.profile(matmul, x, y)  # on a TPU v5e
+report = autokernel.profile(matmul, x, y, MatmulTiles(tm=256, tn=256, tk=256))  # on a TPU v5e
 print(report)
 ```
 
 ```
-matmul (3 input / 2 output buffers): 13541.7 us per call over 5 calls
+matmul (MatmulTiles(tm=256, tn=256, tk=256), 3 input / 2 output buffers): 13541.7 us per call over 5 calls
   steps               32768     (0.41 us each)
   compute            9356.9 us
   input waits        2912.4 us  (+0.8 us filling the pipeline)
@@ -165,40 +213,24 @@ matmul (3 input / 2 output buffers): 13541.7 us per call over 5 calls
 To profile, the kernel is generated with **trace regions**: in every step its input waits
 (`<kernel>/wait`), its output-slot waits (`<kernel>/out_wait`) and the tile code (`<kernel>/compute`) are
 `jax.named_scope`s, which Pallas lowers to Mosaic trace regions and libtpu records with
-`--xla_enable_custom_call_region_trace=true` (what `enable_profiling` sets). Scopes you open in tile code,
+`--xla_enable_custom_call_region_trace=true`. Importing autokernel sets that flag (if JAX's backend hasn't
+started yet; else call `autokernel.enable_profiling()` first thing). Scopes you open in tile code,
 `with jax.named_scope("softmax"):`, are reported too. The trace stays in `report.logdir` for TensorBoard
 or XProf.
-
-`autokernel.optimize` uses those regions to make the kernel faster:
-
-```python
-result = autokernel.optimize(matmul, x, y)  # the kernel keeps the result for inputs like these
-print(result)
-```
-
-While a profile shows exposed input waits it adds an input slot (fetches start a step further ahead), and
-while it shows output waits an output slot, keeping each change that makes the kernel faster. On a v5e
-(device time, trace regions on):
-
-| Kernel | before | after |
-| --- | --- | --- |
-| matmul 8192³, 256³ tiles | 13.54 ms | **11.86 ms** (4 input buffers) |
-| causal matmul 8192³, 512³ tiles | 3.50 ms | **3.37 ms** (4 input buffers) |
-| attention 4×16×2048, 512 × 512 blocks | 700 µs | **685 µs** (4 input buffers) |
-| matmul 8192³, 512³ tiles | 6.36 ms | 6.36 ms (compute-bound: unchanged) |
 
 ## API
 
 | | |
 | --- | --- |
-| `@autokernel.kernel` | compile a loop nest; the result is called like the function |
-| `kernel.lower(*inputs)` | the `Lowered` kernel for inputs like these (arrays or `jax.ShapeDtypeStruct`s): `source`, `plan`, `schedule`, `pipeline`, `steps`, `tiles`, `vmem_bytes` |
-| `kernel.source(*inputs)` | the generated Pallas source |
-| `kernel.reference(*inputs)` | the loop nest run as plain JAX |
-| `kernel.verify(*inputs, rtol=None, atol=None)` | run both and compare; the largest difference |
-| `autokernel.enable_profiling()` | have libtpu record trace regions (before JAX starts) |
-| `autokernel.profile(kernel, *inputs)` | a `KernelProfile` from the device trace |
-| `autokernel.optimize(kernel, *inputs)` | buffering chosen from profiles: an `Optimization` |
+| `@autokernel.tunable`, `autokernel.choice(...)` | declare what a kernel's schedule may be |
+| `@autokernel.kernel` | compile a loop nest; the result is called like the function, with or without its tunable |
+| `kernel.tuning(*inputs)` | the `Tuning` for inputs like these: every trial, and the `config` chosen |
+| `kernel.lower(*args)` | the `Lowered` kernel for inputs like these (arrays or `jax.ShapeDtypeStruct`s) and tunable: `source`, `plan`, `schedule`, `config`, `steps`, `tiles`, `vmem_bytes` |
+| `kernel.source(*args)` | the generated Pallas source |
+| `kernel.reference(*args)` | the loop nest run as plain JAX |
+| `kernel.verify(*args, rtol=None, atol=None)` | run both and compare; the largest difference |
+| `autokernel.profile(kernel, *args)` | a `KernelProfile` from the device trace |
+| `autokernel.enable_profiling()` | have libtpu record trace regions (if autokernel was imported after JAX started) |
 
 ## Development
 
@@ -212,7 +244,7 @@ uv run python benchmarks/attention.py    # on a TPU v5e
 
 On CPU the tests run every kernel in the TPU interpreter with its race detector, and cross-lower every
 kind of kernel to Mosaic for a v5e, which catches what the interpreter can't. `tests/test_tpu.py` runs on a
-v5e only: kernels natively, against splash attention, and real profiles. [AGENTS.md](AGENTS.md) describes
+v5e only: kernels natively, against splash attention, real profiles, and tuning. [AGENTS.md](AGENTS.md) describes
 the architecture, the conventions, and how to run on a TPU.
 
 ```
@@ -220,12 +252,14 @@ src/autokernel/
   parse.py      the loop-nest language: Python source -> Nest (syntax only)
   plan.py       a Nest for concrete shapes: loops, tiles, operands, carried values, types
   schedule.py   step order; masks evaluated into SMEM step and tile tables
+  tunable.py    @autokernel.tunable: the pytree of choices a kernel gives autokernel
+  tune.py       the autotuner: test, trace, change the schedule
   pipeline.py   buffering (slots per copy) and VMEM accounting
   codegen.py    the gridless Pallas source
   mxu.py        what `@` means, for kernels and references alike
   reference.py  the function as plain JAX
   api.py        @autokernel.kernel, Kernel, Lowered, verify
-  profiling.py  trace regions -> KernelProfile; optimize
+  profiling.py  trace regions -> KernelProfile
   tilecode.py   names tile code reads and assigns; output stores
   v5e.py        the chip: memories and layout rules
   errors.py     KernelError

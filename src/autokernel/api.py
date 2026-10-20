@@ -17,10 +17,12 @@ from jax.experimental.pallas import tpu as pltpu
 from . import codegen, v5e
 from .errors import KernelError
 from .parse import Nest, parse
-from .pipeline import Pipeline, default_pipeline, fits, vmem_bytes
+from .pipeline import Pipeline, default_pipeline, vmem_bytes
 from .plan import Plan, make_plan
 from .reference import make_reference
 from .schedule import Schedule, make_schedule
+from .tunable import is_tunable
+from .tune import Config, Tuning, tune
 
 __all__ = ["Kernel", "Lowered", "kernel"]
 
@@ -31,14 +33,18 @@ _generated = itertools.count()  # numbers the generated sources' file names, whi
 
 @dataclass(frozen=True)
 class Lowered:
-    """A kernel generated for one input signature: its plan, schedule, pipeline and Pallas source."""
+    """A kernel generated for one input signature and schedule: its plan, schedule and Pallas source."""
 
     plan: Plan
     schedule: Schedule
-    pipeline: Pipeline
+    config: Config
     source: str
     trace: bool  # does it mark trace regions (for profiling)
     entry: Callable[..., Any] = field(repr=False)  # entry(*inputs, interpret=False): the pallas_call
+
+    @property
+    def pipeline(self) -> Pipeline:
+        return self.config.pipeline
 
     @property
     def steps(self) -> int:
@@ -64,15 +70,6 @@ class Lowered:
         return jax.jit(functools.partial(self.entry, interpret=interpret_mode()))
 
 
-@dataclass(frozen=True)
-class _Build:
-    """What one input signature fixes: the plan, its schedule, and the reference (constants read now)."""
-
-    plan: Plan
-    schedule: Schedule
-    reference: Callable[..., Any]
-
-
 def interpret_mode() -> Any:
     """How kernels run here: natively on a TPU v5e, in the Pallas TPU interpreter without a TPU."""
     if not v5e.on_tpu():
@@ -86,42 +83,64 @@ def interpret_mode() -> Any:
 class Kernel:
     """A loop nest compiled to a gridless Pallas kernel. Call it like the function it was made from.
 
-    The kernel is built when it is first called with inputs of a new shape and dtype, reading the
-    constants its code uses at that moment (as `jax.jit` does). It runs natively on a TPU v5e and in the
-    Pallas TPU interpreter elsewhere.
+    Given its tunable (`matmul(x, y, MatmulTiles(tm=256))`), the kernel uses it. Without it, the kernel is
+    tuned for the inputs' shapes when first called with them (tune.py), and remembers the result. A kernel
+    is built when it is first called with a new shape and schedule, reading the constants its code uses at
+    that moment (as `jax.jit` does).
     """
 
     def __init__(self, fn: Callable[..., Any]) -> None:
         self.fn = fn
         self.nest: Nest = parse(fn)
         functools.update_wrapper(self, fn)
-        self._builds: dict[Signature, _Build] = {}
-        self._lowered: dict[tuple[Signature, Pipeline, bool], Lowered] = {}
-        self._pipelines: dict[Signature, Pipeline] = {}  # what `optimize` chose
+        self.default_tunable = fn.__defaults__[-1] if self.nest.tunable else None
+        if self.nest.tunable and not is_tunable(self.default_tunable):
+            raise self.nest.error(
+                f"`{self.nest.tunable}`'s default must be an @autokernel.tunable, not {self.default_tunable!r}",
+                self.nest.function.args,
+            )
+        self._builds: dict[tuple[Signature, Any], tuple[Plan, Schedule]] = {}
+        self._references: dict[Signature, Callable[..., Any]] = {}
+        self._lowered: dict[tuple[Signature, Config, bool], Lowered] = {}
+        self._tunings: dict[Signature, Tuning] = {}
 
     def __repr__(self) -> str:
         return f"<autokernel.Kernel {self.nest.name}>"
 
-    def __call__(self, *inputs: Any) -> Any:
-        return self.lower(*inputs).run(*inputs)
+    def __call__(self, *args: Any) -> Any:
+        arrays, _ = self._split(args)
+        return self.lower(*args).run(*arrays)
 
-    def lower(self, *inputs: Any) -> Lowered:
-        """The kernel for inputs like these (arrays or `jax.ShapeDtypeStruct`s)."""
-        signature = self.signature(*inputs)
-        return self.lowered(signature, self.pipeline(signature))
+    def lower(self, *args: Any) -> Lowered:
+        """The kernel for inputs like these (arrays or `jax.ShapeDtypeStruct`s), and the tunable if given."""
+        arrays, tunable = self._split(args)
+        signature = self.signature(*arrays)
+        if tunable is None:
+            return self.lowered(signature, self.tuning(*arrays).config)
+        plan, schedule = self.build(signature, tunable)
+        return self.lowered(signature, Config(tunable, default_pipeline(plan, schedule)))
 
-    def source(self, *inputs: Any) -> str:
+    def source(self, *args: Any) -> str:
         """The generated Pallas source for inputs like these."""
-        return self.lower(*inputs).source
+        return self.lower(*args).source
 
-    def reference(self, *inputs: Any) -> Any:
-        """What the kernel computes, by running the loop nest as plain JAX (with `@` on the MXU)."""
-        return self._build(self.signature(*inputs)).reference(*inputs)
+    def reference(self, *args: Any) -> Any:
+        """What the kernel computes: the loop nest run as plain JAX (with `@` on the MXU)."""
+        arrays, tunable = self._split(args)
+        signature = self.signature(*arrays)
+        self.build(signature, tunable if tunable is not None else self.default_tunable)  # reads the constants
+        if self.nest.tunable:
+            tunable = tunable if tunable is not None else self.lower(*arrays).config.tunable
+            return self._references[signature](*arrays, tunable)
+        return self._references[signature](*arrays)
 
-    def verify(self, *inputs: Any, rtol: float | None = None, atol: float | None = None) -> float:
-        """Run the kernel and its reference on `inputs`; raise AssertionError unless they agree (within
-        tolerances for the dtypes, or `rtol` and `atol`). Returns the largest absolute difference."""
-        got, want = self(*inputs), self.reference(*inputs)
+    def verify(self, *args: Any, rtol: float | None = None, atol: float | None = None) -> float:
+        """Run the kernel and its reference; raise AssertionError unless they agree (within tolerances for the
+        dtypes, or `rtol` and `atol`). Returns the largest absolute difference."""
+        arrays, tunable = self._split(args)
+        if self.nest.tunable:
+            arrays = (*arrays, tunable if tunable is not None else self.lower(*arrays).config.tunable)
+        got, want = self(*arrays), self.reference(*arrays)
         got, want = (got, want) if isinstance(got, tuple) else ((got,), (want,))
         errors = [
             compare(f"{self.nest.name} output {name!r}", g, w, rtol, atol)
@@ -129,52 +148,67 @@ class Kernel:
         ]
         return max(errors)
 
-    # ------------------------------------------------------------------ building (used by profiling too)
+    def tuning(self, *arrays: Any) -> Tuning:
+        """The schedule for inputs like these: tuned on the TPU when first asked (see tune.py), the
+        defaults elsewhere."""
+        signature = self.signature(*arrays)
+        if signature not in self._tunings:
+            self._tunings[signature] = tune(self, signature)
+        return self._tunings[signature]
 
-    def signature(self, *inputs: Any) -> Signature:
+    # ------------------------------------------------------------------ building (used by tune.py too)
+
+    def signature(self, *arrays: Any) -> Signature:
         """What the kernel is built for: the inputs' shapes and dtypes."""
-        if len(inputs) != len(self.nest.params):
-            raise KernelError(
-                f"{self.nest.name} takes {len(self.nest.params)} inputs ({', '.join(self.nest.params)}), "
-                f"got {len(inputs)}"
-            )
         signature = []
-        for name, x in zip(self.nest.params, inputs, strict=True):
+        for name, x in zip(self.nest.params, arrays, strict=True):
             if not (hasattr(x, "shape") and hasattr(x, "dtype")) or not tuple(x.shape):
                 raise KernelError(f"{self.nest.name}: input `{name}` must be an array, got {type(x).__name__}")
             signature.append((tuple(x.shape), np.dtype(x.dtype)))
         return tuple(signature)
 
-    def pipeline(self, signature: Signature) -> Pipeline:
-        """The buffering for inputs of this signature: what `optimize` chose, else the default."""
-        if signature not in self._pipelines:
-            build = self._build(signature)
-            self._pipelines[signature] = default_pipeline(build.plan, build.schedule)
-        return self._pipelines[signature]
+    def default_config(self, signature: Signature) -> Config:
+        """The tunable's defaults, with the default buffering for them."""
+        return Config(self.default_tunable, default_pipeline(*self.build(signature, self.default_tunable)))
 
-    def choose(self, signature: Signature, pipeline: Pipeline) -> None:
-        """Use `pipeline` for inputs of this signature from now on; raises KernelError if it doesn't fit."""
-        build = self._build(signature)
-        if not fits(build.plan, build.schedule, pipeline):
-            raise KernelError(f"{self.nest.name}: {pipeline} don't fit in VMEM for these inputs")
-        self._pipelines[signature] = pipeline
+    def build(self, signature: Signature, tunable: Any) -> tuple[Plan, Schedule]:
+        """The plan and schedule for this signature and tunable."""
+        key = (signature, tunable)
+        if signature not in self._references:  # read the constants once per signature, with the plan
+            self._references[signature] = make_reference(self.nest, self.fn)
+        if key not in self._builds:
+            specs = [jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in signature]
+            plan = make_plan(self.nest, self.fn, specs, tunable)
+            self._builds[key] = (plan, make_schedule(plan))
+        return self._builds[key]
 
-    def lowered(self, signature: Signature, pipeline: Pipeline, trace: bool = False) -> Lowered:
-        """The kernel for this signature with this buffering (and trace regions, for profiling)."""
-        key = (signature, pipeline, trace)
+    def lowered(self, signature: Signature, config: Config, trace: bool = False) -> Lowered:
+        """The kernel for this signature and schedule (with trace regions, for profiling)."""
+        key = (signature, config, trace)
         if key not in self._lowered:
-            build = self._build(signature)
-            source, entry_name = codegen.generate(build.plan, build.schedule, pipeline, trace=trace)
+            plan, schedule = self.build(signature, config.tunable)
+            source, entry_name = codegen.generate(plan, schedule, config.pipeline, trace=trace)
             entry = _load(source, f"<autokernel {self.nest.name} #{next(_generated)}>", entry_name)
-            self._lowered[key] = Lowered(build.plan, build.schedule, pipeline, source, trace, entry)
+            self._lowered[key] = Lowered(plan, schedule, config, source, trace, entry)
         return self._lowered[key]
 
-    def _build(self, signature: Signature) -> _Build:
-        if signature not in self._builds:
-            specs = [jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in signature]
-            plan = make_plan(self.nest, self.fn, specs)
-            self._builds[signature] = _Build(plan, make_schedule(plan), make_reference(self.nest, self.fn))
-        return self._builds[signature]
+    def _split(self, args: tuple[Any, ...]) -> tuple[tuple[Any, ...], Any]:
+        """The input arrays, and the tunable if one was passed."""
+        n = len(self.nest.params)
+        if self.nest.tunable and len(args) == n + 1:
+            tunable = args[-1]
+            if type(tunable) is not type(self.default_tunable):
+                raise KernelError(
+                    f"{self.nest.name}: `{self.nest.tunable}` must be a {type(self.default_tunable).__name__}, "
+                    f"not {type(tunable).__name__}"
+                )
+            return args[:-1], tunable
+        if len(args) != n:
+            more = f", then optionally `{self.nest.tunable}`" if self.nest.tunable else ""
+            raise KernelError(
+                f"{self.nest.name} takes {n} input arrays ({', '.join(self.nest.params)}){more}; got {len(args)}"
+            )
+        return args, None
 
 
 def _load(source: str, filename: str, entry: str) -> Callable[..., Any]:
@@ -218,17 +252,25 @@ def compare(what: str, got: Any, want: Any, rtol: float | None = None, atol: flo
 def kernel(fn: Callable[..., Any]) -> Kernel:
     """Compile a Python loop nest over tiles into a gridless Pallas kernel for a TPU v5e.
 
+        @autokernel.tunable
+        class Tiles:
+            tm: int = autokernel.choice(128, 256, 512, 1024, default=512)
+            tn: int = autokernel.choice(128, 256, 512, 1024, default=512)
+            tk: int = autokernel.choice(128, 256, 512, 1024, default=512)
+
         @autokernel.kernel
-        def matmul(x, y):
-            out = jnp.zeros((M, N), x.dtype)
-            for i in range(0, M, TM):
-                for j in range(0, N, TN):
-                    acc = jnp.zeros((TM, TN))
-                    for k in range(0, K, TK):
-                        acc += x[i : i + TM, k : k + TK] @ y[k : k + TK, j : j + TN]
-                    out = out.at[i : i + TM, j : j + TN].set(acc)
+        def matmul(x, y, tiles=Tiles()):
+            M, K = x.shape
+            out = jnp.zeros((M, y.shape[1]), jnp.float32)
+            for i in range(0, M, tiles.tm):
+                for j in range(0, y.shape[1], tiles.tn):
+                    acc = jnp.zeros((tiles.tm, tiles.tn), jnp.float32)
+                    for k in range(0, K, tiles.tk):
+                        acc += x[i : i + tiles.tm, k : k + tiles.tk] @ y[k : k + tiles.tk, j : j + tiles.tn]
+                    out = out.at[i : i + tiles.tm, j : j + tiles.tn].set(acc)
             return out
 
-    Raises KernelError, naming the line, for code it can't compile.
+    Called without its tunable, a kernel tunes it on the TPU (see tune.py). Raises KernelError, naming the
+    line, for code it can't compile.
     """
     return Kernel(fn)

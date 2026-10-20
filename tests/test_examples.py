@@ -4,39 +4,62 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from causal_attention import make_causal_attention, make_splash_attention
-from causal_matmul import make_causal_matmul
+from causal_attention import AttentionBlocks, causal_attention, splash_attention
+from causal_matmul import causal_matmul
 from conftest import ON_TPU
 from helpers import f64, lower_for_v5e, rand, run_checking_races, spec
-from matmul import make_matmul
+from matmul import MatmulTiles, matmul
+
+
+def tiles(tm, tn, tk):
+    return MatmulTiles(tm=tm, tn=tn, tk=tk)
 
 
 @pytest.mark.parametrize(
-    ("dtype", "tiles"),
+    ("dtype", "shape"),
     [
         (jnp.float32, (128, 128, 128)),
         (jnp.bfloat16, (128, 256, 128)),
-        (jnp.float32, (256, 128, 384)),  # one reduction step: no accumulator
-        (jnp.bfloat16, (128, 128, 384)),  # three steps per tile: a ring that isn't a power of two
+        (jnp.float32, (256, 128, 512)),  # one reduction step: no accumulator
+        (jnp.bfloat16, (128, 128, 128)),
     ],
 )
-def test_matmul(dtype, tiles):
+def test_matmul(dtype, shape):
     x, y = rand((256, 384), 0, dtype), rand((384, 256), 1, dtype)
-    kernel = make_matmul(*tiles)
-    out = run_checking_races(kernel, x, y)
+    out = run_checking_races(matmul, x, y, tiles(*shape))
     assert out.dtype == dtype
     np.testing.assert_allclose(f64(out), f64(x) @ f64(y), rtol=2e-2 if dtype == jnp.bfloat16 else 1e-4, atol=0.2)
-    assert kernel.verify(x, y) < 1e-3
+    assert matmul.verify(x, y, tiles(*shape)) < 1e-3
+
+
+def test_three_reduction_steps_a_ring_that_isnt_a_power_of_two():
+    x, y = rand((256, 384), 0), rand((384, 256), 1)
+    lowered = matmul.lower(x, y, tiles(128, 128, 128))
+    assert lowered.schedule.steps_per_tile == 3 and "jax.lax.rem(s, 3)" in lowered.source
+    out = run_checking_races(matmul, x, y, tiles(128, 128, 128))
+    np.testing.assert_allclose(f64(out), f64(x) @ f64(y), rtol=1e-4, atol=1e-4)
+
+
+def test_plain_jax_with_the_default_tiles():
+    # Without a tunable, off a TPU, the kernel uses the defaults (clamped to the arrays by its prologue).
+    x, y = rand((256, 256)), rand((256, 256), 1)
+    np.testing.assert_allclose(f64(matmul(x, y)), f64(x) @ f64(y), rtol=1e-4, atol=1e-3)
+    if not ON_TPU:
+        assert matmul.tuning(x, y).config.tunable == MatmulTiles()
+    # The function itself is plain JAX: the tunable is a pytree with no leaves, so jit passes it through.
+    assert jax.tree_util.tree_leaves(MatmulTiles()) == []
+    np.testing.assert_allclose(f64(jax.jit(matmul)(x, y, tiles(128, 128, 128))), f64(x) @ f64(y), rtol=1e-4, atol=1e-3)
+    with jax.default_matmul_precision("highest"):  # plain JAX's f32 `@` is one bf16 pass on a TPU
+        np.testing.assert_allclose(f64(jax.jit(matmul.fn)(x, y)), f64(x) @ f64(y), rtol=1e-3, atol=1e-2)
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 def test_causal_matmul(dtype):
     x, y = rand((512, 256), 0, dtype), rand((256, 512), 1, dtype)
-    kernel = make_causal_matmul(128, 128, 128)
-    out = run_checking_races(kernel, x, y)
+    out = run_checking_races(causal_matmul, x, y, tiles(128, 128, 128))
     np.testing.assert_allclose(f64(out), np.tril(f64(x) @ f64(y)), rtol=2e-2, atol=0.2)
-    kernel.verify(x, y)
-    lowered = kernel.lower(x, y)
+    causal_matmul.verify(x, y, tiles(128, 128, 128))
+    lowered = causal_matmul.lower(x, y, tiles(128, 128, 128))
     assert (lowered.tiles, lowered.total_tiles, lowered.steps) == (10, 16, 20)
 
 
@@ -57,16 +80,16 @@ def _attention(q, k, v):
 @pytest.mark.parametrize(("block_q", "block_kv"), [(128, 128), (256, 128), (128, 256)])
 def test_causal_attention_matches_splash(block_q, block_kv):
     q, k, v = _attention_inputs(2, 2, 512, 128)
-    kernel = make_causal_attention(block_q, block_kv)
-    out = run_checking_races(kernel, q, k, v)
-    splash = make_splash_attention(2, 512, block_q, block_kv, interpret=not ON_TPU)(q, k, v)
+    blocks = AttentionBlocks(block_q=block_q, block_kv=block_kv)
+    out = run_checking_races(causal_attention, q, k, v, blocks)
+    splash = splash_attention(2, 512, block_q, block_kv, interpret=not ON_TPU)(q, k, v)
     np.testing.assert_allclose(f64(out), f64(splash), atol=2e-2)
     np.testing.assert_allclose(f64(out), _attention(q, k, v), atol=2e-2)
-    kernel.verify(q, k, v)
+    causal_attention.verify(q, k, v, blocks)
 
 
 def test_causal_attention_skips_future_blocks():
-    lowered = make_causal_attention(128, 128).lower(*_attention_inputs(2, 4, 512, 128))
+    lowered = causal_attention.lower(*_attention_inputs(2, 4, 512, 128), AttentionBlocks(block_q=128, block_kv=128))
     assert lowered.steps == 2 * 4 * (1 + 2 + 3 + 4)
     # The masks don't read the batch and head loops: the step tables hold one batch-head's pattern.
     assert lowered.schedule.repeats == 8 and len(lowered.schedule.tables["step_tile"]) == 10
@@ -74,27 +97,22 @@ def test_causal_attention_skips_future_blocks():
 
 def test_causal_attention_f32():
     q, k, v = _attention_inputs(1, 1, 256, 128, jnp.float32)
-    out = run_checking_races(make_causal_attention(128, 128), q, k, v)
+    out = run_checking_races(causal_attention, q, k, v, AttentionBlocks(block_q=128, block_kv=128))
     np.testing.assert_allclose(f64(out), _attention(q, k, v), atol=1e-4)
 
 
 @pytest.mark.parametrize("trace", [False, True])
 def test_examples_lower_to_mosaic_for_v5e(trace):
     b16 = jnp.bfloat16
+    big = (spec(1024, 1024, dtype=b16), spec(1024, 1024, dtype=b16))
     cases = [
-        (make_matmul(256, 256, 256), (spec(1024, 1024, dtype=b16), spec(1024, 1024, dtype=b16))),
-        (make_matmul(256, 256, 1024), (spec(1024, 1024, dtype=b16), spec(1024, 1024, dtype=b16))),
-        (make_causal_matmul(256, 256, 256), (spec(1024, 1024), spec(1024, 1024))),
-        (make_causal_attention(256, 256), (spec(2, 4, 1024, 128, dtype=b16),) * 3),
+        (matmul, big, tiles(256, 256, 256)),
+        (matmul, big, tiles(256, 256, 1024)),
+        (causal_matmul, (spec(1024, 1024), spec(1024, 1024)), tiles(256, 256, 256)),
+        (causal_attention, (spec(2, 4, 1024, 128, dtype=b16),) * 3, AttentionBlocks(block_q=256, block_kv=256)),
     ]
-    for kernel, specs in cases:
-        signature = kernel.signature(*specs)
-        lowered = kernel.lowered(signature, kernel.pipeline(signature), trace=trace)
+    for kernel, specs, tunable in cases:
+        config = kernel.lower(*specs, tunable).config
+        lowered = kernel.lowered(kernel.signature(*specs), config, trace=trace)
         assert ("named_scope" in lowered.source) == trace
         assert "tpu_custom_call" in lower_for_v5e(lowered, *specs)
-
-
-def test_examples_run_under_jit():
-    x, y = rand((256, 256)), rand((256, 256), 1)
-    out = jax.jit(make_matmul(128, 128, 128))(x, y)
-    np.testing.assert_allclose(f64(out), f64(x) @ f64(y), rtol=1e-4, atol=1e-3)

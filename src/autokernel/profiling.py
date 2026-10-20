@@ -1,32 +1,30 @@
-"""Profile kernels on a TPU v5e through `jax.named_scope` trace regions, and choose buffering from them.
+"""Profile kernels on a TPU v5e through `jax.named_scope` trace regions: what the autotuner measures.
 
-    autokernel.enable_profiling()          # first thing: before JAX starts its TPU backend
     report = autokernel.profile(matmul, x, y)
-    print(report)                          # device time, input waits, compute, output waits, your scopes
-    result = autokernel.optimize(matmul, x, y)   # the kernel keeps the buffering the profiles chose
+    print(report)              # device time, input waits, compute, output waits, the tile code's own scopes
 
 For profiling, a kernel is generated with trace regions: in every step its input waits
 (`<kernel>/wait`), its output-slot waits (`<kernel>/out_wait`) and its tile code (`<kernel>/compute`)
 are `jax.named_scope`s. Scopes the tile code opens itself (`with jax.named_scope("softmax"):`) are
 reported too. Pallas lowers named scopes in a kernel to Mosaic trace regions, which libtpu records only
-with `--xla_enable_custom_call_region_trace=true` in `LIBTPU_INIT_ARGS` (what `enable_profiling` adds);
-without it a profile has only the kernel's device time.
+with `--xla_enable_custom_call_region_trace=true` in `LIBTPU_INIT_ARGS`, read when JAX starts its TPU
+backend: importing autokernel adds it (if JAX hasn't started yet), as does `enable_profiling()`. Without it
+a profile has only the kernel's device time.
 
 A wait region's length is copy time the pipeline did not hide behind compute. The first step's wait is
 the pipeline filling; every later wait is exposed DMA, which more input slots can hide (fetches start
 further ahead). Output-slot waits are copies to HBM still in flight when their slot comes round again, which
-another output slot can hide. `optimize` adds slots while the profile shows exposed waits and the kernel
-gets faster.
+another output slot can hide. Time outside every region is per-step overhead (decoding steps, starting
+copies), which bigger tiles amortize. tune.py turns these into the next schedules to try.
 """
 
 from __future__ import annotations
 
-import dataclasses
 import glob
 import os
 import re
 import tempfile
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -35,19 +33,16 @@ import jax
 from . import v5e
 from .codegen import COMPUTE, OUT_WAIT, REGIONS, WAIT
 from .errors import KernelError
-from .pipeline import MAX_INPUT_BUFFERS, MAX_OUTPUT_BUFFERS, Pipeline, fits
 
 if TYPE_CHECKING:
-    from .api import Kernel
+    from .api import Kernel, Lowered
 
 __all__ = [
     "REGION_FLAG",
     "Event",
     "KernelProfile",
-    "Optimization",
-    "candidates",
     "enable_profiling",
-    "optimize",
+    "measure",
     "profile",
     "regions_enabled",
     "summarize",
@@ -55,12 +50,9 @@ __all__ = [
 
 REGION_FLAG = "--xla_enable_custom_call_region_trace=true"
 OPS_LINE = "XLA Ops"  # the trace line XLA ops (kernel calls among them) are on
-# Shares of the device time above which waits count as exposed, and steps as overhead-bound.
-EXPOSED_SHARE = 0.03
+# Shares of the device time above which a kernel counts as DMA-bound, and as overhead-bound.
 DMA_BOUND_SHARE = 0.2
 OVERHEAD_BOUND_SHARE = 0.3
-# A pipeline must be this much faster to replace the one before it.
-MIN_GAIN = 0.01
 
 
 def regions_enabled() -> bool:
@@ -105,7 +97,7 @@ class KernelProfile:
     """A kernel's time per call on the device, averaged over the calls profiled (seconds)."""
 
     name: str
-    pipeline: Pipeline
+    config: Any  # the schedule profiled (tune.Config)
     calls: int
     device_s: float
     regions: bool = False  # were trace regions recorded (else only `device_s` is known)
@@ -141,7 +133,7 @@ class KernelProfile:
 
     def __str__(self) -> str:
         us = lambda s: f"{s * 1e6:10.1f} us"  # noqa: E731
-        lines = [f"{self.name} ({self.pipeline}): {us(self.device_s).strip()} per call over {self.calls} calls"]
+        lines = [f"{self.name} ({self.config}): {us(self.device_s).strip()} per call over {self.calls} calls"]
         if not self.regions:
             lines.append(
                 f"  no trace regions: call autokernel.enable_profiling() first (LIBTPU_INIT_ARGS={REGION_FLAG})"
@@ -160,22 +152,6 @@ class KernelProfile:
         if self.logdir:
             lines.append(f"  trace: {self.logdir}")
         return "\n".join(lines)
-
-
-@dataclass
-class Optimization:
-    """What `optimize` measured: the profile of each pipeline it tried, and the one the kernel now uses."""
-
-    profile: KernelProfile
-    tried: list[KernelProfile]
-
-    @property
-    def pipeline(self) -> Pipeline:
-        return self.profile.pipeline
-
-    def __str__(self) -> str:
-        rows = [f"  {p.pipeline}: {p.device_s * 1e6:.1f} us, bottleneck {p.bottleneck}" for p in self.tried]
-        return "\n".join([f"{self.profile.name}: chose {self.pipeline}", *rows])
 
 
 # --------------------------------------------------------------------------- reading a trace
@@ -203,7 +179,7 @@ def _named(event_name: str, name: str) -> bool:
     return event_name == name or event_name.endswith("/" + name)
 
 
-def summarize(events: Sequence[Event], kernel: str, pipeline: Pipeline, scopes: Sequence[str] = ()) -> KernelProfile:
+def summarize(events: Sequence[Event], kernel: str, config: Any, scopes: Sequence[str] = ()) -> KernelProfile:
     """The profile of the pallas_call named `kernel` from a device trace's events."""
     op = re.compile(rf"^%?{re.escape(kernel)}(\.\S*)?(\s|$)")  # `name.3`, `name.1.out_hbm`, `%name.3 = ...`
     calls = [e for e in events if e.line == OPS_LINE and op.match(e.name)]
@@ -231,7 +207,7 @@ def summarize(events: Sequence[Event], kernel: str, pipeline: Pipeline, scopes: 
     n = len(calls)
     return KernelProfile(
         name=kernel,
-        pipeline=pipeline,
+        config=config,
         calls=n,
         device_s=sum(c.seconds for c in calls) / n,
         regions=steps > 0,
@@ -244,23 +220,6 @@ def summarize(events: Sequence[Event], kernel: str, pipeline: Pipeline, scopes: 
     )
 
 
-# --------------------------------------------------------------------------- choosing buffering
-
-
-def candidates(profile: KernelProfile, fits: Callable[[Pipeline], bool]) -> list[Pipeline]:
-    """The buffering worth trying after `profile`'s, most promising first: one more input slot if inputs
-    waited, one more output slot if outputs waited (each if it fits in VMEM)."""
-    if not profile.regions:
-        return []
-    pipeline, exposed = profile.pipeline, EXPOSED_SHARE * profile.device_s
-    found = []
-    if profile.exposed_wait_s > exposed and pipeline.input_buffers < MAX_INPUT_BUFFERS:
-        found.append(dataclasses.replace(pipeline, input_buffers=pipeline.input_buffers + 1))
-    if profile.out_wait_s > exposed and pipeline.output_buffers < MAX_OUTPUT_BUFFERS:
-        found.append(dataclasses.replace(pipeline, output_buffers=pipeline.output_buffers + 1))
-    return [p for p in found if fits(p)]
-
-
 # --------------------------------------------------------------------------- running on the TPU
 
 
@@ -269,50 +228,28 @@ def _require_tpu() -> None:
         raise KernelError("profiling needs a TPU v5e: it reads the device's own trace")
 
 
-def _measure(kernel: Kernel, inputs: Sequence[Any], pipeline: Pipeline, runs: int, trace: bool) -> KernelProfile:
-    """Run the kernel `runs` times under the JAX profiler (after a warm-up call) and summarize the trace."""
-    lowered = kernel.lowered(kernel.signature(*inputs), pipeline, trace=trace)
+def measure(lowered: Lowered, inputs: Sequence[Any], runs: int) -> KernelProfile:
+    """Run a generated kernel `runs` times under the JAX profiler (after a warm-up call) and summarize the
+    device trace; the trace stays in the profile's `logdir`."""
+    name = lowered.plan.nest.name
     jax.block_until_ready(lowered.run(*inputs))
-    logdir = tempfile.mkdtemp(prefix=f"autokernel-{kernel.nest.name}-")
+    logdir = tempfile.mkdtemp(prefix=f"autokernel-{name}-")
     jax.profiler.start_trace(logdir)
     try:
         for _ in range(runs):
             jax.block_until_ready(lowered.run(*inputs))
     finally:
         jax.profiler.stop_trace()
-    result = summarize(device_events(logdir), kernel.nest.name, pipeline, lowered.plan.scopes)
+    result = summarize(device_events(logdir), name, lowered.config, lowered.plan.scopes)
     result.logdir = logdir
     return result
 
 
-def profile(kernel: Kernel, inputs: Sequence[Any], runs: int = 5) -> KernelProfile:
-    """Where `kernel`'s time goes on the TPU for these inputs (see the module docstring). Without trace
-    regions enabled, only its device time."""
+def profile(kernel: Kernel, args: Sequence[Any], runs: int = 5) -> KernelProfile:
+    """Where `kernel`'s time goes on the TPU for these inputs (and tunable, if given; else the schedule the
+    kernel uses for them). See the module docstring."""
     _require_tpu()
-    return _measure(kernel, inputs, kernel.pipeline(kernel.signature(*inputs)), runs, trace=regions_enabled())
-
-
-def optimize(kernel: Kernel, inputs: Sequence[Any], runs: int = 5) -> Optimization:
-    """Profile `kernel` on these inputs and add buffer slots where its copies are exposed, keeping each
-    change that makes it faster; the kernel uses the result for inputs like these from then on."""
-    _require_tpu()
-    if not regions_enabled():
-        raise KernelError(
-            "autokernel.optimize reads trace regions: call autokernel.enable_profiling() before JAX starts "
-            f"(or start with LIBTPU_INIT_ARGS={REGION_FLAG})"
-        )
-    signature = kernel.signature(*inputs)
-    lowered = kernel.lowered(signature, kernel.pipeline(signature))
-    best = _measure(kernel, inputs, lowered.pipeline, runs, trace=True)
-    tried = [best]
-    improved = True
-    while improved:  # from the best so far, try what its profile suggests until something is faster
-        improved = False
-        for candidate in candidates(best, lambda p: fits(lowered.plan, lowered.schedule, p)):
-            result = _measure(kernel, inputs, candidate, runs, trace=True)
-            tried.append(result)
-            if result.device_s < best.device_s * (1 - MIN_GAIN):
-                best, improved = result, True
-                break
-    kernel.choose(signature, best.pipeline)
-    return Optimization(best, tried)
+    arrays, _ = kernel._split(tuple(args))
+    config = kernel.lower(*args).config
+    lowered = kernel.lowered(kernel.signature(*arrays), config, trace=regions_enabled())
+    return measure(lowered, arrays, runs)

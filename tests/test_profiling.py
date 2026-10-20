@@ -1,19 +1,19 @@
-"""Profiling from trace regions, and buffering chosen from profiles.
+"""Profiling from trace regions.
 
-The trace reading and the choices are tested on synthetic device traces; `test_tpu.py` runs them on a
-TPU v5e. Off a TPU the drivers run the kernel in the interpreter under the JAX profiler, with the device
-trace replaced by synthetic events."""
+Trace reading is tested on synthetic device traces; `test_tpu.py` profiles on a TPU v5e. Off a TPU the
+driver runs the kernel in the interpreter under the JAX profiler, with the device trace replaced by
+synthetic events."""
 
 import os
 
 import jax
 import pytest
 from helpers import rand
-from matmul import make_matmul
+from matmul import MatmulTiles, matmul
 
 import autokernel
 from autokernel import KernelError, Pipeline, profiling
-from autokernel.profiling import Event, candidates, summarize
+from autokernel.profiling import Event, summarize
 
 US = 1e-6
 
@@ -45,7 +45,7 @@ def trace(name="matmul", calls=2, steps=4, wait=1.0, first_wait=5.0, out_wait=0.
 
 
 def test_summarize_a_trace():
-    p = summarize(trace(scopes=("mxu",)), "matmul", Pipeline(), scopes=("mxu", "absent"))
+    p = summarize(trace(scopes=("mxu",)), "matmul", "a schedule", scopes=("mxu", "absent"))
     assert p.calls == 2 and p.regions and p.steps == 4
     assert p.device_s == pytest.approx((2 + 5 + 3 * 1 + 4 * 10 + 3) * US)
     assert p.wait_s == pytest.approx(8 * US) and p.fill_s == pytest.approx(5 * US)
@@ -57,10 +57,10 @@ def test_summarize_a_trace():
 
 
 def test_bottlenecks():
-    assert summarize(trace(wait=10.0), "matmul", Pipeline()).bottleneck == "dma"
-    assert summarize(trace(compute=0.5, first_wait=0.5, wait=0.1), "matmul", Pipeline()).bottleneck == "overhead"
+    assert summarize(trace(wait=10.0), "matmul", "a schedule").bottleneck == "dma"
+    assert summarize(trace(compute=0.5, first_wait=0.5, wait=0.1), "matmul", "a schedule").bottleneck == "overhead"
     without_regions = [e for e in trace() if e.line == "XLA Ops"]
-    p = summarize(without_regions, "matmul", Pipeline())
+    p = summarize(without_regions, "matmul", "a schedule")
     assert not p.regions and p.bottleneck is None and "no trace regions" in str(p)
 
 
@@ -71,33 +71,11 @@ def test_a_trace_without_the_kernel():
 
 def test_kernel_ops_named_after_their_outputs_match():
     events = [Event("XLA Ops", "matmul.3.out_hbm", 0.0, 1.0), Event("XLA Ops", "matmul_kernel.1", 0.0, 9.0)]
-    assert summarize(events, "matmul", Pipeline()).device_s == 1.0
+    assert summarize(events, "matmul", "a schedule").device_s == 1.0
 
 
 def profile_with(**regions):
-    return summarize(trace(**regions), "matmul", Pipeline())
-
-
-def test_candidates():
-    fits = lambda p: True  # noqa: E731
-    assert candidates(profile_with(wait=10.0), fits) == [Pipeline(4, 2)]
-    assert candidates(profile_with(out_wait=5.0, wait=0.0), fits) == [Pipeline(3, 3)]
-    both = profile_with(wait=10.0, out_wait=5.0)
-    assert candidates(both, fits) == [Pipeline(4, 2), Pipeline(3, 3)]
-    assert candidates(both, lambda p: p.output_buffers == 3) == [Pipeline(3, 3)]
-    assert candidates(profile_with(wait=0.0), fits) == []
-    both.pipeline = Pipeline(4, 3)
-    assert candidates(both, fits) == []
-    both.regions = False
-    assert candidates(both, fits) == []
-
-
-def test_optimization_report():
-    first, second = profile_with(wait=10.0), profile_with()
-    second.pipeline = Pipeline(4, 2)
-    result = autokernel.Optimization(second, [first, second])
-    assert result.pipeline == Pipeline(4, 2)
-    assert str(result).splitlines()[0] == "matmul: chose 4 input / 2 output buffers"
+    return summarize(trace(**regions), "matmul", "a schedule")
 
 
 def test_enable_profiling(monkeypatch):
@@ -140,44 +118,26 @@ def fake_tpu(monkeypatch):
 
 @pytest.mark.cpu
 def test_profile(fake_tpu):
-    kernel = make_matmul(128, 128, 128)
     x, y = rand((256, 256)), rand((256, 256), 1)
     fake_tpu.append(trace())
-    p = autokernel.profile(kernel, x, y, runs=1)
-    assert p.regions and p.logdir and p.pipeline == Pipeline(3, 2) and f"trace: {p.logdir}" in str(p)
+    p = autokernel.profile(matmul, x, y, MatmulTiles(tm=128, tn=128, tk=128), runs=1)
+    assert p.regions and p.logdir and p.config.pipeline == Pipeline(3, 2) and f"trace: {p.logdir}" in str(p)
+    fake_tpu.append(trace())
+    assert autokernel.profile(matmul, x, y, runs=1).config.tunable == MatmulTiles()  # the kernel's schedule
 
 
-@pytest.mark.cpu
-def test_optimize_keeps_what_helps(fake_tpu):
-    kernel = make_matmul(128, 128, 128)
-    x, y = rand((256, 256)), rand((256, 256), 1)
-    fake_tpu += [trace(wait=10.0), trace(wait=10.0, compute=5.0), trace(wait=10.0, compute=4.9)]
-    result = autokernel.optimize(kernel, x, y, runs=1)
-    # 3 -> 4 input buffers helped; 4 is the most there are, so it stops there.
-    assert [p.pipeline for p in result.tried] == [Pipeline(3, 2), Pipeline(4, 2)]
-    assert result.pipeline == Pipeline(4, 2) and kernel.lower(x, y).pipeline == Pipeline(4, 2)
-    assert len(fake_tpu) == 1
-
-
-@pytest.mark.cpu
-def test_optimize_tries_every_suggestion_then_stops(fake_tpu):
-    kernel = make_matmul(128, 128, 128)
-    x, y = rand((256, 256)), rand((256, 256), 1)
-    fake_tpu += [trace(wait=10.0, out_wait=5.0)] * 3
-    result = autokernel.optimize(kernel, x, y, runs=1)
-    assert [p.pipeline for p in result.tried] == [Pipeline(3, 2), Pipeline(4, 2), Pipeline(3, 3)]
-    assert result.pipeline == Pipeline(3, 2) and not fake_tpu
-
-
-def test_profiling_needs_a_tpu_and_regions(monkeypatch):
-    kernel = make_matmul(128, 128, 128)
-    x, y = rand((256, 256)), rand((256, 256), 1)
+def test_profiling_needs_a_tpu(monkeypatch):
     monkeypatch.setattr(profiling.v5e, "on_tpu", lambda: False)
     with pytest.raises(KernelError, match="needs a TPU v5e"):
-        autokernel.profile(kernel, x, y)
+        autokernel.profile(matmul, rand((256, 256)), rand((256, 256), 1))
     monkeypatch.setattr(profiling.v5e, "on_tpu", lambda: True)
     profiling._require_tpu()
-    monkeypatch.setattr(profiling, "_require_tpu", lambda: None)
+
+
+def test_importing_autokernel_turns_trace_regions_on(monkeypatch):
+    import importlib
+
     monkeypatch.setenv("LIBTPU_INIT_ARGS", "")
-    with pytest.raises(KernelError, match="reads trace regions"):
-        autokernel.optimize(kernel, x, y)
+    monkeypatch.setattr(profiling, "_backend_started", lambda: False)
+    importlib.reload(autokernel)
+    assert profiling.regions_enabled()
