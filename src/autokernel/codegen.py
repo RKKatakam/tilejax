@@ -11,7 +11,11 @@ The kernel is a single `pl.loop` over its steps (schedule.py). Each step
    the code after it at the last step, whose stores fill output slots and start their copies to HBM.
 
 Values carried between steps live in VMEM scratch. Tiles a mask skips are written with the output's fill
-value by DMAs from a constant VMEM tile, a few at every tile, so they overlap the compute.
+value by DMAs from a constant VMEM tile, a few at every tile, so they overlap the compute. An empty step (a
+reduction loop whose mask skips all of a tile's blocks) fetches nothing and runs no body.
+
+Index arrays (inputs read element by element) are SMEM inputs. When masks read them, the entry function
+first finds the steps that run on the device (`<name>_steps`, plain JAX), and the kernel loops over those.
 
 The source is plain Pallas, standalone: it defines the constants the tile code reads, the step tables and
 the helpers it calls. With `trace=True`, steps 3, 4 and 5 are `jax.named_scope` regions, which libtpu
@@ -45,7 +49,7 @@ from .errors import KernelError
 from .parse import Nest
 from .pipeline import TILE_SLOTS, Pipeline
 from .plan import Kind, Operand, Plan, Range, Tile, read_key
-from .schedule import FILL_TABLE, STEP_CODE, STEP_TILE, TILE_TABLE, Schedule
+from .schedule import CODE_SHIFT, FILL_TABLE, STEP_CODE, STEP_COUNT, STEP_TILE, TILE_TABLE, Schedule
 from .tilecode import assigned, flatten, reads
 from .tunable import choices, is_tunable
 
@@ -59,6 +63,7 @@ FILLS_IN_FLIGHT = 4
 # What the generated code imports, by the names it uses.
 MODULES = {"jax": jax, "jnp": jnp, "np": np, "pl": pl, "pltpu": pltpu}
 _WEAK = "_weak"
+_PHASE_STEPS = "_phase_steps"
 
 
 def generate(plan: Plan, schedule: Schedule, pipeline: Pipeline, *, trace: bool = False) -> tuple[str, str]:
@@ -145,18 +150,31 @@ class _Generator:
             raise nest.error(f"the generated kernel uses the name `{name}` itself; rename your `{name}`", node)
         tile_names = {n for stmt in flatten(nest.tile) for n in reads(stmt)} | bound | set(plan.constants)
 
+        self.indices = [index.name for index in plan.indices]
+        self.arrays = [p for p in nest.params if p not in self.indices]  # the inputs in HBM
         self.definitions = _Definitions(plan.constants, nest)
-        self.module = _Namer({*self.definitions.defined, *MODULES, *mxu.FUNCTIONS, _WEAK})
+        # (The steps function reads the module's names with the loop variables and index arrays as locals.)
+        self.module = _Namer(
+            {*self.definitions.defined, *MODULES, *mxu.FUNCTIONS, _WEAK, _PHASE_STEPS, *self.indices}
+            | {r.var for r in plan.loops}
+        )
         self.kernel_name = self.module(f"{nest.name}_kernel")
         self.entry_name = self.module(nest.name)
         self.tables = {name: self.module(name.upper()) for name in schedule.tables}
+        self.runtime = [STEP_TILE, STEP_CODE, STEP_COUNT] if schedule.runtime else []  # made on the device
+        if schedule.runtime:
+            self.steps_name = self.module(f"{nest.name}_steps")
+            self.tile_values = {var: self.module(f"{var.upper()}_OF_TILE") for var in schedule.tile_values}
+            self.static_runs = {p: self.module(f"PHASE{p}_RUNS") for p in schedule.static_runs}
         # The entry function's parameters mustn't hide the module's names it uses.
-        entry = _Namer({*self.module.taken, "interpret"})
+        # (Index arrays keep their names: the module defines no name of theirs.)
+        entry = self.entry_namer = _Namer({*self.module.taken, "interpret"} - set(self.indices))
         self.entry_params = [entry(p) for p in nest.params]
 
         n = self.local = _Namer(tile_names | self.module.taken)
-        self.table_params = {name: n(name) for name in schedule.tables}
-        self.hbm = {name: n(f"{name}_hbm") for name in (*nest.params, *nest.outputs)}
+        self.table_params = {name: n(name) for name in [*schedule.tables, *self.runtime]}
+        self.smem = {name: n(f"{name}_smem") for name in self.indices}
+        self.hbm = {name: n(f"{name}_hbm") for name in (*self.arrays, *nest.outputs)}
         self.bufs = {
             op.name: n(f"{op.name}_buf" if op.kind is Kind.ONCE else f"{op.name}_bufs") for op in plan.operands
         }
@@ -176,7 +194,7 @@ class _Generator:
         # The kernel's own locals and helper functions.
         self.n_step, self.n_blocks, self.n_fill_blocks = n("step"), n("blocks"), n("fill_blocks")
         self.n_s, self.n_tile, self.n_kb, self.n_first, self.n_last = n("s"), n("tile"), n("kb"), n("first"), n("last")
-        self.n_ph = n("ph")
+        self.n_ph, self.n_empty, self.n_steps = n("ph"), n("empty"), n("n_steps")
         self.n_at, self.n_rep, self.n_code, self.n_c, self.n_slot = n("at"), n("rep"), n("code"), n("c"), n("slot")
 
     # ------------------------------------------------------------------ the module
@@ -205,6 +223,8 @@ class _Generator:
             w("", "# Step tables (SMEM): the tiles and steps that run, as the masks say.")
             for name, table in self.schedule.tables.items():
                 w(f"{self.tables[name]} = np.array({table.tolist()}, np.int32)")
+        if self.runtime:
+            self._steps_definitions(w)
         for fn_source in definitions.functions:
             w("", "", *fn_source.splitlines())
         if self._uses_mxu(kernel):
@@ -219,6 +239,63 @@ class _Generator:
         w("", "")
         return w.text() + kernel + "\n\n" + entry
 
+    def _steps_definitions(self, w: _Writer) -> None:
+        """The function that finds the steps the kernel runs when masks read index arrays, before it runs."""
+        plan, sch = self.plan, self.schedule
+        w("", "# For each tile the step tables cover: its loops' values, and the blocks that run of the loops")
+        w("# whose masks read no index array.")
+        for var, values in sch.tile_values.items():
+            w(f"{self.tile_values[var]} = np.array({values.tolist()}, np.int32)")
+        for p, runs in sch.static_runs.items():
+            w(f"{self.static_runs[p]} = np.array({runs.tolist()})")
+        w("", "")
+        with w.block(f"def {_PHASE_STEPS}(run, phase, phases):"):
+            w('"""A reduction loop\'s steps for each tile: the blocks that run, in order, or else one empty step')
+            w("(at its first block); and each step's code, (block * phases + phase) << shift | empty << 2 | first << 1")
+            w('| last."""')
+            w("blocks = np.arange(run.shape[1])[None, :]")
+            w("empty = jnp.logical_not(run.any(axis=1, keepdims=True)) & (blocks == 0)")
+            w("keep = run | empty")
+            w("first = blocks == jnp.argmax(keep, axis=1, keepdims=True)")
+            w("last = blocks == run.shape[1] - 1 - jnp.argmax(keep[:, ::-1], axis=1, keepdims=True)")
+            w(f"code = (blocks * phases + phase) << {CODE_SHIFT} | empty.astype(int) << 2 | first.astype(int) << 1")
+            w("code = code | last")
+            w("return keep, code.astype(jnp.int32)")
+        w("", "")
+        n = _Namer({*self.module.taken, *plan.constants, *self.indices} | {r.var for r in plan.loops})
+        with w.block(f"def {self.steps_name}({', '.join(self.indices)}):"):
+            w('"""The steps the kernel runs, from its masks evaluated on the index arrays: each tile\'s steps of')
+            w("each reduction loop, in order, packed into tables (the steps' tiles and codes), and how many there")
+            w('are."""')
+            tiles = sch.pattern_tiles
+            for var in sch.tile_values:
+                w(f"{var} = {self.tile_values[var]}[:, None]")
+            keeps, codes = [], []
+            for p, phase in enumerate(plan.phases):
+                r = phase.range
+                run, keep, code = n(f"run{p}"), n(f"keep{p}"), n(f"code{p}")
+                if r.runtime:
+                    w(f"{r.var} = {r.start} + {r.step} * np.arange({r.count})[None, :]")
+                    mask = ast.unparse(_Vectorize().visit(copy.deepcopy(r.mask)))
+                    w(f"{run} = jnp.broadcast_to(jnp.logical_not({mask}), ({tiles}, {r.count}))")
+                elif p in sch.static_runs:
+                    w(f"{run} = {self.static_runs[p]}")
+                else:
+                    w(f"{run} = np.ones(({tiles}, {r.count}), bool)")
+                w(f"{keep}, {code} = {_PHASE_STEPS}({run}, {p}, {len(plan.phases)})")
+                keeps.append(keep)
+                codes.append(code)
+            keep, code, at, tile = n("keep"), n("code"), n("at"), n("tile")
+            w(f"{keep} = jnp.concatenate([{', '.join(keeps)}], axis=1).reshape(-1)")
+            w(f"{code} = jnp.concatenate([{', '.join(codes)}], axis=1).reshape(-1)")
+            w(f"{at} = jnp.where({keep}, jnp.cumsum({keep}, dtype=jnp.int32) - 1, {sch.pattern_steps})")
+            w(f"{tile} = np.repeat(np.arange({tiles}, dtype=np.int32), {sum(sch.phase_counts)})")
+            with w.block("return ("):
+                w(f"jnp.zeros({sch.pattern_steps}, jnp.int32).at[{at}].set({tile}, mode='drop'),")
+                w(f"jnp.zeros({sch.pattern_steps}, jnp.int32).at[{at}].set({code}, mode='drop'),")
+                w(f"jnp.sum({keep}, dtype=jnp.int32).reshape(1),")
+            w(")")
+
     def _uses_mxu(self, kernel: str) -> bool:
         return mxu.DOT in kernel or mxu.DOT_NT in kernel
 
@@ -228,14 +305,20 @@ class _Generator:
         params = ", ".join(self.entry_params)
         with w.block(f"def {self.entry_name}({params}, *, interpret=False):"):
             tiles = f"{schedule.tiles} of {schedule.total_tiles}" if schedule.fills else str(schedule.tiles)
-            w(f'"""`{self.nest.name}` as one gridless kernel: a loop over {schedule.steps} steps of {tiles} tiles."""')
+            steps = f"at most {schedule.steps}" if schedule.runtime else str(schedule.steps)
+            w(f'"""`{self.nest.name}` as one gridless kernel: a loop over {steps} steps of {tiles} tiles."""')
+            param = dict(zip(self.nest.params, self.entry_params, strict=True))
+            runtime = [self.entry_namer(name) for name in self.runtime]
+            if runtime:
+                w(f"{', '.join(runtime)} = {self.steps_name}({', '.join(param[i] for i in self.indices)})")
             with w.block("return pl.pallas_call("):
                 w(f"{self.kernel_name},")
                 shapes = [f"jax.ShapeDtypeStruct({out.shape}, jnp.{out.dtype.name})" for out in plan.outputs]
                 w(f"out_shape={shapes[0] if len(shapes) == 1 else '(' + ', '.join(shapes) + ',)'},")
                 with w.block("in_specs=["):
-                    w(*["pl.BlockSpec(memory_space=pltpu.SMEM),"] * len(self.tables))
-                    w(*["pl.BlockSpec(memory_space=pl.ANY),"] * len(self.nest.params))
+                    smem = len(self.tables) + len(runtime) + len(self.indices)
+                    w(*["pl.BlockSpec(memory_space=pltpu.SMEM),"] * smem)
+                    w(*["pl.BlockSpec(memory_space=pl.ANY),"] * len(self.arrays))
                 w("],")
                 specs = ["pl.BlockSpec(memory_space=pl.ANY)"] * len(plan.outputs)
                 w(f"out_specs={specs[0] if len(specs) == 1 else '(' + ', '.join(specs) + ',)'},")
@@ -245,7 +328,9 @@ class _Generator:
                 w(f"compiler_params=pltpu.CompilerParams(vmem_limit_bytes={v5e.VMEM_LIMIT}),")
                 w("interpret=interpret,")
                 w(f"name={self.nest.name!r},")
-            w(f")({', '.join([*self.tables.values(), *self.entry_params])})")
+            inputs = [*self.tables.values(), *runtime, *(param[i] for i in self.indices)]
+            inputs += [param[a] for a in self.arrays]
+            w(f")({', '.join(inputs)})")
         return w.text()
 
     def _scratch_shapes(self) -> list[str]:
@@ -282,7 +367,8 @@ class _Generator:
         w = _Writer()
         params = [
             *self.table_params.values(),
-            *(self.hbm[p] for p in nest.params),
+            *self.smem.values(),
+            *(self.hbm[p] for p in self.arrays),
             *(self.hbm[o] for o in nest.outputs),
         ]
         for op in plan.operands:
@@ -313,7 +399,7 @@ class _Generator:
         phases = len(sch.phase_counts)
         with w.block(f"def {self.n_step}({s}):"):
             w('"""Step s: its tile, its phase (reduction loop), the loop\'s block, and whether that is the phase\'s')
-            w('first and last step."""')
+            w("first and last step" + (', and empty."""' if sch.empty else '."""'))
             if not sch.step_tables and phases == 1:
                 r = sch.steps_per_tile
                 w(f"{tile}, {kb} = {_int_expr(s, '//', r)}, {_int_expr(s, '%', r)}")
@@ -333,18 +419,24 @@ class _Generator:
                 step_tile, step_code = self.table_params[STEP_TILE], self.table_params[STEP_CODE]
                 r = s
                 if sch.repeats > 1:  # the tables hold one combination of the outer loops' steps
-                    w(f"{self.n_rep} = {_int_expr(s, '//', sch.pattern_steps)}")
+                    if sch.runtime:  # as many steps as the device found
+                        per = f"{self.table_params[STEP_COUNT]}[0]"
+                        w(f"{self.n_rep} = jax.lax.div({s}, {per})")
+                    else:
+                        per = str(sch.pattern_steps)
+                        w(f"{self.n_rep} = {_int_expr(s, '//', sch.pattern_steps)}")
                     r = self.local("r")
-                    w(f"{r} = {s} - {self.n_rep} * {sch.pattern_steps}")
+                    w(f"{r} = {s} - {self.n_rep} * {per}")
                     w(f"{tile} = {self.n_rep} * {sch.pattern_tiles} + {step_tile}[{r}]")
                 else:
                     w(f"{tile} = {step_tile}[{r}]")
                 code = self.n_code
                 w(f"{code} = {step_code}[{r}]")
-                block = f"({code} >> 2)"
+                block = f"({code} >> {CODE_SHIFT})"
+                empty = f", ({code} & 4) != 0" if sch.empty else ""
                 w(
                     f"return {tile}, {_int_expr(block, '%', phases)}, {_int_expr(block, '//', phases)}, "
-                    f"({code} & 2) != 0, ({code} & 1) != 0"
+                    f"({code} & 2) != 0, ({code} & 1) != 0{empty}"
                 )
 
     def _radix(self, w: _Writer, index: str, ranges: tuple[Range, ...]) -> list[str]:
@@ -387,7 +479,9 @@ class _Generator:
         dims = []
         for window, dim in zip(tile.windows, self._array_shape(tile.array), strict=True):
             r = self._range(window.loop) if window.loop else None
-            if r is None:
+            if window.index is not None:
+                dims.append(self._runtime_index(window.index, block_of, dim))
+            elif r is None:
                 if window.size is None:
                     dims.append(str(window.offset))
                 elif window.offset == 0 and window.size == dim:
@@ -398,6 +492,19 @@ class _Generator:
                 start = _scaled(block_of[r.var], r)
                 dims.append(start if window.size is None else f"pl.ds({start}, {window.size})")
         return ", ".join(dims)
+
+    def _runtime_index(self, element: ast.Subscript, block_of: dict[str, str], dim: int) -> str:
+        """An index read from an index array when the kernel runs, at the loops' values for these blocks,
+        clamped to the dim (as JAX clamps indices)."""
+        gen = self
+
+        class Values(ast.NodeTransformer):
+            def visit_Name(self, node: ast.Name) -> ast.expr:
+                if node.id in block_of:
+                    return _parse_expr(f"({_scaled(block_of[node.id], gen._range(node.id))})")
+                return ast.Name(gen.smem[node.id], ast.Load()) if node.id in gen.smem else node
+
+        return f"jnp.clip({ast.unparse(Values().visit(copy.deepcopy(element)))}, 0, {dim - 1})"
 
     def _array_shape(self, array: str) -> tuple[int, ...]:
         if array in self.nest.params:
@@ -456,6 +563,9 @@ class _Generator:
     def _setup(self, w: _Writer) -> None:
         plan, sch = self.plan, self.schedule
         w("")
+        if sch.runtime:
+            count = f"{self.table_params[STEP_COUNT]}[0]"
+            w(f"{self.n_steps} = {count}" if sch.repeats == 1 else f"{self.n_steps} = {sch.repeats} * {count}")
         if sch.fills:
             w("# The fill value of the tiles the masks skip.")
             for out in plan.outputs:
@@ -473,14 +583,27 @@ class _Generator:
             w(*[f"{self.copy_fns[op.name]}({at0}, 0).start()" for op in per_tile])
         streamed = [op for op in plan.operands if op.kind is Kind.STREAM]
         ahead = min(self.pipeline.input_buffers - 1, sch.steps)
-        if streamed and ahead:
-            w(f"# The first {ahead} step(s)' inputs.")
+        if not (streamed and ahead):
+            return
+        w(f"# The first {ahead} step(s)' inputs.")
+        if sch.runtime:  # the steps are known only now
+            tile, ph, kb, empty = (self.local(name) for name in ("first_tile", "first_ph", "first_kb", "first_empty"))
             for step in range(ahead):
-                tile, phase, kb = sch.step_at(step)
-                at = sch.blocks_at(tile)
-                for op in streamed:
-                    if op.phase in (None, phase):
-                        w(f"{self.copy_fns[op.name]}({at}, {kb}, {step}).start()")
+                with self._when(w, f"{step} < {self.n_steps}", f"_first_inputs{step}"):
+                    w(f"{tile}, {ph}, {kb}, _, _, {empty} = {self.n_step}({step})")
+                    for phase, ops in self._by_phase(streamed).items():
+                        with self._when(w, self._runs(ph, phase, empty), f"_first_phase{phase}"):
+                            for op in ops:
+                                w(f"{self.copy_fns[op.name]}({self.n_blocks}({tile}), {kb}, {step}).start()")
+            return
+        for step in range(ahead):
+            tile, phase, kb = sch.step_at(step)
+            if sch.empty_at(step):
+                continue
+            at = sch.blocks_at(tile)
+            for op in streamed:
+                if op.phase in (None, phase):
+                    w(f"{self.copy_fns[op.name]}({at}, {kb}, {step}).start()")
 
     def _region(self, w: _Writer, region: str) -> Any:
         if not self.trace:
@@ -505,38 +628,47 @@ class _Generator:
         """The condition that a step of phase `ph` is in `phase` (None: always)."""
         return None if phase is None or len(self.plan.phases) == 1 else f"{ph} == {phase}"
 
+    def _runs(self, ph: str, phase: int | None, empty: str) -> str | None:
+        """The condition that a step of phase `ph` (and emptiness `empty`) runs `phase`'s body (None: always)."""
+        conditions = [c for c in (self._in_phase(ph, phase),) if c]
+        if self.schedule.empty and phase is not None:
+            conditions.append(f"jnp.logical_not({empty})")
+        return " & ".join(f"({c})" if len(conditions) > 1 else c for c in conditions) or None
+
     def _loop(self, w: _Writer) -> None:
         plan, sch, pipe = self.plan, self.schedule, self.pipeline
         s, tile, ph, kb, at = self.n_s, self.n_tile, self.n_ph, self.n_kb, self.n_at
-        first, last = self.n_first, self.n_last
+        first, last, empty = self.n_first, self.n_last, self.n_empty
         phases = len(plan.phases)
+        steps = self.n_steps if sch.runtime else str(sch.steps)
         if self.single:  # a step is a tile: it is every phase's first and last step
             tile_first = tile_last = None
         else:
             tile_first = first if phases == 1 else f"({ph} == 0) & {first}"
             tile_last = last if phases == 1 else f"({ph} == {phases - 1}) & {last}"
         w("")
-        w(f"@pl.loop(0, {sch.steps})")
+        w(f"@pl.loop(0, {steps})")
         with w.block(f"def {self.local('_steps')}({s}):"):
             if self.single:
                 w(f"{tile}, {kb} = {s}, 0")
             else:
-                w(f"{tile}, {ph}, {kb}, {first}, {last} = {self.n_step}({s})")
+                w(f"{tile}, {ph}, {kb}, {first}, {last}{f', {empty}' if sch.empty else ''} = {self.n_step}({s})")
             w(f"{at} = {self.n_blocks}({tile})")
 
             streamed = [op for op in plan.operands if op.kind is Kind.STREAM]
             depth = pipe.input_buffers
             if streamed:
-                with self._when(w, f"{s} + {depth - 1} < {sch.steps}", "_fetch_ahead"):
+                with self._when(w, f"{s} + {depth - 1} < {steps}", "_fetch_ahead"):
                     ahead_tile, ahead_ph = self.local("ahead_tile"), self.local("ahead_ph")
-                    ahead_kb = self.local("ahead_kb")
+                    ahead_kb, ahead_empty = self.local("ahead_kb"), self.local("ahead_empty")
                     if self.single:
                         w(f"{ahead_tile}, {ahead_kb} = {s} + {depth - 1}, 0")
                     else:
-                        w(f"{ahead_tile}, {ahead_ph}, {ahead_kb}, _, _ = {self.n_step}({s} + {depth - 1})")
+                        rest = f", {ahead_empty}" if sch.empty else ""
+                        w(f"{ahead_tile}, {ahead_ph}, {ahead_kb}, _, _{rest} = {self.n_step}({s} + {depth - 1})")
                     ahead_slot = _int_expr(f"{s} + {depth - 1}", "%", depth)
                     for phase, ops in self._by_phase(streamed).items():
-                        with self._when(w, self._in_phase(ahead_ph, phase), f"_fetch_phase{phase}"):
+                        with self._when(w, self._runs(ahead_ph, phase, ahead_empty), f"_fetch_phase{phase}"):
                             for op in ops:
                                 blocks = f"{self.n_blocks}({ahead_tile})"
                                 w(f"{self.copy_fns[op.name]}({blocks}, {ahead_kb}, {ahead_slot}).start()")
@@ -553,7 +685,7 @@ class _Generator:
                         for op in per_tile:
                             w(f"{self.copy_fns[op.name]}({at}, {slots[Kind.TILE]}).wait()")
                 for phase, ops in self._by_phase(streamed).items():
-                    with self._when(w, self._in_phase(ph, phase), f"_wait_phase{phase}"):
+                    with self._when(w, self._runs(ph, phase, empty), f"_wait_phase{phase}"):
                         for op in ops:
                             w(f"{self.copy_fns[op.name]}({at}, {kb}, {slots[Kind.STREAM]}).wait()")
             for op in plan.operands:
@@ -579,8 +711,8 @@ class _Generator:
 
     def _tile_code(self, w: _Writer, tile_first: str | None) -> None:
         """The segments and the phase bodies: the code before the phases at a tile's first step; each
-        phase's body at its steps, with the code after it at its last step (where the body's values are
-        still in scope)."""
+        phase's body at its steps (not at an empty one), with the code after it at its last step (where the
+        body's values are still in scope)."""
         plan, code = self.plan, _TileCode(self)
         if self.single:
             w(*code.emit(plan.segments[0], "start", set()))
@@ -590,7 +722,9 @@ class _Generator:
                 w(*code.emit(plan.segments[0], "start", set()))
         for p, phase in enumerate(plan.phases):
             with self._when(w, self._in_phase(self.n_ph, p), f"_phase{p}"):
-                w(*code.emit(phase.body, "body", set()))
+                empty = f"jnp.logical_not({self.n_empty})" if self.schedule.empty else None
+                with self._when(w, empty, f"_body{p}"):
+                    w(*code.emit(phase.body, "body", set()))
                 after = plan.segments[p + 1]
                 if after:
                     final = p == len(plan.phases) - 1
@@ -750,6 +884,8 @@ class _TileCode:
                 if operand is not None:
                     return _parse_expr(f"{gen.views[operand.name]}[...]")
                 base = node.value
+                if isinstance(base, ast.Name) and base.id in gen.smem:  # an element of an index array
+                    return ast.Subscript(ast.Name(gen.smem[base.id], ast.Load()), self.visit(node.slice), ast.Load())
                 if (
                     isinstance(base, ast.Name)
                     and base.id in plan.carried
@@ -779,6 +915,38 @@ class _TileCode:
         if have.dtype != dtype:
             value = _parse_expr(f"VALUE.astype({dtype_expr})", VALUE=value)
         return value
+
+
+class _Vectorize(ast.NodeTransformer):
+    """A mask as a condition on arrays of loop values (evaluated for every step at once): Python's `and`,
+    `or`, `not`, chained comparisons and `x if c else y` as their elementwise forms."""
+
+    def visit_BoolOp(self, node: ast.BoolOp) -> ast.expr:
+        self.generic_visit(node)
+        fn = "jnp.logical_and" if isinstance(node.op, ast.And) else "jnp.logical_or"
+        out = node.values[0]
+        for value in node.values[1:]:
+            out = _parse_expr(f"{fn}(A, B)", A=out, B=value)
+        return out
+
+    def visit_UnaryOp(self, node: ast.UnaryOp) -> ast.expr:
+        self.generic_visit(node)
+        return _parse_expr("jnp.logical_not(A)", A=node.operand) if isinstance(node.op, ast.Not) else node
+
+    def visit_Compare(self, node: ast.Compare) -> ast.expr:
+        self.generic_visit(node)
+        if len(node.ops) == 1:
+            return node
+        left, out = node.left, None
+        for op, right in zip(node.ops, node.comparators, strict=True):
+            pair = ast.Compare(left, [op], [right])
+            out = pair if out is None else _parse_expr("jnp.logical_and(A, B)", A=out, B=pair)
+            left = right
+        return out  # type: ignore[return-value]
+
+    def visit_IfExp(self, node: ast.IfExp) -> ast.expr:
+        self.generic_visit(node)
+        return _parse_expr("jnp.where(C, A, B)", C=node.test, A=node.body, B=node.orelse)
 
 
 def _parse_expr(source: str, **holes: ast.expr) -> ast.expr:

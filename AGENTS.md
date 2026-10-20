@@ -39,7 +39,7 @@ tune.py: for each candidate Config (tunable, Pipeline): build -> run -> compare 
 | --- | --- | --- |
 | `parse.py` | the language's syntax; every syntactic error | evaluate anything |
 | `plan.py` | run the prologue; loop ranges; tile windows; operand kinds; carried values; type trace | order steps |
-| `schedule.py` | step order; evaluate masks into tables; `step_at`/`blocks_at` | know about buffers |
+| `schedule.py` | step order; evaluate masks into tables (or describe the steps runtime masks choose from); `step_at`/`blocks_at` | know about buffers |
 | `pipeline.py` | `Pipeline` (slots per copy); VMEM accounting; default buffering | measure |
 | `codegen.py` | emit the source from Plan + Schedule + Pipeline | make semantic decisions |
 | `mxu.py` | the meaning of `@`, shared by kernel, type trace and reference | |
@@ -62,12 +62,14 @@ tune.py: for each candidate Config (tunable, Pipeline): build -> run -> compare 
 4. **Constants are read once per input signature**, when the kernel is first built (as `jax.jit` does).
 5. **100% line and branch coverage**, enforced by `pyproject.toml`. Unreachable code is deleted, not
    excluded; no `pragma: no cover`.
-6. Masks are evaluated at build time, on loop values and constants only (they can't read arrays).
+6. Masks are evaluated at build time, on loop values and constants, except reduction masks that read
+   elements of index arrays (runtime masks): the entry function evaluates those on the device, vectorized,
+   into step tables, and the kernel's step loop runs to a count read from SMEM.
 
 ### How a step runs (codegen.py)
 
-Decode the step into (tile, phase, block, first/last of the phase) (arithmetic, or SMEM tables when
-masked) → start the fetch of the step `input_buffers - 1` ahead (its phase's operands: prefetch crosses
+Decode the step into (tile, phase, block, first/last of the phase, empty) (arithmetic, or SMEM tables when
+masked; with runtime masks, tables the entry function made on the device) → start the fetch of the step `input_buffers - 1` ahead (its phase's operands: prefetch crosses
 phase and tile boundaries) → at a tile's first step, start the next tile's per-tile inputs and wait for
 this tile's → wait for this phase's inputs → at a tile's last step, wait for the output slot → the code
 before the phases (tile's first step) / the phase's body / the code after it (phase's last step; after the
@@ -134,7 +136,7 @@ uv run python examples/matmul.py        # prints the generated source
 
 Tests: `test_parse.py` (every syntax rule), `test_plan.py`, `test_schedule.py`, `test_codegen.py` (every
 emission path runs in the interpreter with the race detector and cross-lowers to Mosaic for a v5e),
-`test_api.py`, `test_profiling.py` (synthetic traces), `test_tunable.py`, `test_tune.py` (the search and
+`test_index_arrays.py` (SMEM index arrays, runtime masks and windows), `test_api.py`, `test_profiling.py` (synthetic traces), `test_tunable.py`, `test_tune.py` (the search and
 proposals with synthetic profiles; tuning end to end with `tune._can_time` and `profiling.measure` faked,
 kernels really running in the interpreter), `test_examples.py`, `test_tpu.py` (`tpu` marker: real hardware
 only). `helpers.make_kernel(source, **globals)` builds a kernel from a source string, which

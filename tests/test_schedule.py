@@ -2,6 +2,7 @@
 
 import itertools
 
+import numpy as np
 import pytest
 from helpers import make_kernel, spec
 
@@ -74,7 +75,6 @@ def test_without_masks_steps_are_arithmetic():
     ("tile_mask", "step_mask", "message"),
     [
         ("True", "False", "the masks skip every output tile"),
-        ("False", "k >= 0 * i", "skips every step of `k`'s loop for the tile at i=0"),
         ("False", "undefined", "can't evaluate `undefined`"),
         ("False", "jnp.ones(2) > 0", "masks are Python conditions on loop variables"),
     ],
@@ -98,21 +98,62 @@ def test_mask_errors(tile_mask, step_mask, message):
         schedule_of(source, spec(256, 256))
 
 
-def test_a_constant_mask_that_skips_every_step_names_every_tile():
+@pytest.mark.parametrize("skip", ["True", "i == 0", "i == 128 and k == 0"])
+def test_a_phase_whose_mask_skips_all_of_a_tiles_blocks_takes_one_empty_step(skip):
+    from helpers import f64, rand, run_checking_races
+
+    kernel = make_kernel(
+        f"""
+        def f(x):
+            out = jnp.zeros((256, 128))
+            for i in range(0, 256, 128):
+                acc = jnp.full((128, 128), 2.0)
+                for k in range(0, 256, 128):
+                    if {skip}:
+                        continue
+                    acc += x[i : i + 128, k : k + 128]
+                out = out.at[i : i + 128, :].set(acc + 1)
+            return out
+        """
+    )
+    x = rand((256, 256))
+    sch = kernel.lower(x).schedule
+    runs = {(i, k) for i in (0, 128) for k in (0, 128) if not eval(skip, {"i": i, "k": k})}
+    assert sch.empty == (len({i for i, _ in runs}) < 2)
+    steps = [(sch.step_at(s), sch.empty_at(s)) for s in range(sch.steps)]
+    for i in (0, 128):
+        mine = [k for (tile, _, k), empty in steps if tile == i // 128 and not empty]
+        assert mine == [k // 128 for ii, k in sorted(runs) if ii == i]
+    out = run_checking_races(kernel, x)
+    want = np.full((256, 128), 3.0)
+    for i, k in runs:
+        want[i : i + 128] += f64(x[i : i + 128, k : k + 128])
+    np.testing.assert_allclose(f64(out), want, rtol=1e-5, atol=1e-5)
+    kernel.verify(x)
+
+
+def test_values_a_masked_phase_makes_for_the_code_after_it_are_carried():
+    # The phase may take an empty step, whose body doesn't run: the code after it reads them from VMEM.
     source = """
         def f(x):
             out = jnp.zeros((256, 128))
             for i in range(0, 256, 128):
                 acc = jnp.zeros((128, 128))
                 for k in range(0, 256, 128):
-                    if SKIP:
+                    if k > i:
                         continue
                     acc += x[i : i + 128, k : k + 128]
-                out = out.at[i : i + 128, :].set(acc)
+                    twice = acc * 2
+                out = out.at[i : i + 128, :].set(twice)
             return out
         """
-    with pytest.raises(KernelError, match="the tile at every tile"):
-        schedule_of(source, spec(256, 256), SKIP=True)
+    from helpers import f64, rand, run_checking_races
+
+    kernel = make_kernel(source)
+    x = rand((256, 256))
+    assert set(kernel.lower(x).plan.carried) == {"acc", "twice"}
+    want = 2 * np.concatenate([f64(x[:128, :128]), f64(x[128:, :128]) + f64(x[128:, 128:])])
+    np.testing.assert_allclose(f64(run_checking_races(kernel, x)), want, rtol=1e-5, atol=1e-5)
 
 
 def test_tables_must_fit_in_smem():

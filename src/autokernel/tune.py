@@ -1,7 +1,9 @@
 """The autotuner: find the fastest schedule for a kernel by running it, from first principles.
 
 A schedule (`Config`) is the kernel's tunable (its block sizes, or whatever its fields mean) and its
-buffering (`Pipeline`). Tuning runs on the TPU, on random inputs of the kernel's shapes:
+buffering (`Pipeline`). Tuning runs on the TPU, on the inputs of the call that asked for it (random inputs of
+their shapes if they are being traced, under `jax.jit`): a kernel whose masks read index arrays runs the
+steps those inputs need.
 
 1. **Test.** Every candidate's output is compared with the loop nest run as plain JAX; a schedule that
    computes something else (or doesn't build, or doesn't compile) is out.
@@ -260,15 +262,23 @@ def _can_time() -> bool:
     return v5e.on_tpu()
 
 
-def tune(kernel: Kernel, signature: Signature, budget: int = BUDGET) -> Tuning:
-    """Tune `kernel` for inputs of this signature (see the module docstring)."""
+def _concrete(arrays: Sequence[Any] | None) -> bool:
+    """Are these arrays with values (not tracers, not shapes)?"""
+    return arrays is not None and all(
+        isinstance(a, np.ndarray | jax.Array) and not isinstance(a, jax.core.Tracer) for a in arrays
+    )
+
+
+def tune(kernel: Kernel, signature: Signature, arrays: Sequence[Any] | None = None, budget: int = BUDGET) -> Tuning:
+    """Tune `kernel` for inputs of this signature, on `arrays` if they have values (see the module
+    docstring)."""
     start = kernel.default_config(signature)
     kernel.lowered(signature, start)  # the default schedule builds, before anything runs
     if not _can_time():
         return Tuning(Trial(start))
 
     def run() -> Tuning:
-        inputs = random_inputs(signature)
+        inputs = list(arrays) if _concrete(arrays) else random_inputs(signature)  # type: ignore[arg-type]
         args = [_reference_config(kernel, signature, start)] if start.tunable is not None else []
         want = kernel.reference(*inputs, *args)
         return search(

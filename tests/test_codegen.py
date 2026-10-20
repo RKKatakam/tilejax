@@ -661,7 +661,8 @@ def test_masked_phases_and_a_loop_of_one_iteration():
         (1, 1, 1),
     ]
     src = lowered.source
-    assert "y2 = y * 2" in src and "a_ref[...] = a_ref[...] + y2" in src  # the phase's `y`, renamed after it
+    # The masked phase's `y`, read after it, is carried (an empty step wouldn't make it).
+    assert "y_ref[...] = y_ref[...] * 2" in src and "a_ref[...] = a_ref[...] + y_ref[...]" in src
     assert "c = 0" in src and "w_buf" in src  # the loop of one iteration runs inline; its window is fetched once
 
 

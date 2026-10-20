@@ -153,7 +153,7 @@ class Kernel:
         defaults elsewhere."""
         signature = self.signature(*arrays)
         if signature not in self._tunings:
-            self._tunings[signature] = tune(self, signature)
+            self._tunings[signature] = tune(self, signature, arrays)
         return self._tunings[signature]
 
     # ------------------------------------------------------------------ building (used by tune.py too)

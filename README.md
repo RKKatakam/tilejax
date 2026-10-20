@@ -149,6 +149,16 @@ def f(x, y, tiles=Tiles()):                   # the input arrays; optionally las
   constants, evaluated once per combination of the loop values they read when the kernel is built; the
   kernel walks SMEM tables of only the tiles and steps that run. Tables cover only the loops a mask reads:
   causal attention's masks don't read the batch and head loops, so its tables hold one batch-head pattern.
+  A tile whose mask skips every block of a reduction loop takes one empty step of it (no copies, no body).
+- **Index arrays** are int32 inputs read element by element, `lengths[b]` (integer indices only, loop
+  variables and constants): the kernel keeps them in SMEM. Their elements are values in tile code
+  (`cols < lengths[b]`), integer indices of tile reads (`w[expert[t], :, j : j + tn]`: the window is
+  chosen when the kernel runs, clamped to the array as JAX clamps), and conditions in reduction masks
+  (`if j >= lengths[b]: continue`). Such **runtime masks** are evaluated on the device just before the
+  kernel, for every step at once (Python's `and`, `or`, `not` become their elementwise forms), and the
+  kernel loops over only the steps that run: a KV-cache read stops at each sequence's length, a grouped
+  matmul visits only the experts whose tokens meet a tile. The function itself branches on array values
+  there, so it runs as plain JAX eagerly (not under `jax.jit`); the kernel runs anywhere.
 - **Constants** the tile code reads (module globals, closure values, prologue names) are read when a kernel
   is first built for an input shape, as `jax.jit` does, and written into the generated source: numbers,
   strings, dtypes, tuples, modules, and functions (imported, or their source copied).

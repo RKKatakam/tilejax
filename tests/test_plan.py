@@ -160,7 +160,7 @@ def test_loop_ranges(loops, message):
         ("x[i : i + 256, :]", "reads elements 0 to 383"),
         ("x[-1, :]", "reads elements -1 to -1"),
         ("x[i : i + 128]", "index every one of x's 2 dims"),
-        ("x[0, 0]", "keeps at least one dim"),
+        ("x[0, 0]", "an index array (kept in SMEM): it must be int32, not float32"),
         ("x[i : i + 128, 0]", "integer indices go before every sliced dim"),
         ("x[i : i + 128, 0:100]", "multiple of 128 or all 256"),
         ("x[i : i + 4, :]", "multiple of 8 for float32"),
@@ -175,6 +175,7 @@ def test_input_windows(read, message):
     [
         ("out = out.at[:, :].set(1.0)", "`i` indexes exactly one dim"),
         ("out = out.at[i : i + 128, 0:128].set(1.0)", "stored whole, with `:`"),
+        ("out = out.at[i, 0].set(1.0)", "keeps at least one dim"),
         ("out = out.at[i : i + 64, :].set(1.0)", "must cover the dim of 256 exactly"),
         ("out = out.at[i : i + 128, :].set((1, 2))", "must be an array or a number"),
         ("out = out.at[i : i + 128, :].set(jnp.ones(3))", "can't store a value of shape (3,)"),

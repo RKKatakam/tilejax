@@ -11,8 +11,8 @@ A kernel function is
                     continue
                 <segment>                          # straight-line code, run once per tile
                 for k in range(0, K, TK):          # any number of reduction loops, one after another:
-                    if <mask>:                     #   optional: skip this step
-                        continue
+                    if <mask>:                     #   optional: skip this step (it may read elements of
+                        continue                   #   index arrays, `k >= lengths[b]`: decided at run time)
                     <body>                         #   runs once per step
                 <segment>                          # between and after them, more straight-line code
                 out = out.at[i : i + TM, j : j + TN].set(value)   # each output stored once, at the end
@@ -20,6 +20,10 @@ A kernel function is
 
 A tile's reduction loops run one after another (the kernel's steps for a tile are those of its first
 reduction loop, then its second's, ...): a phase each.
+
+An input read only element by element, `lengths[b]` (integer indices, no slices), is an index array: the
+kernel keeps it whole in SMEM, and tile code, reduction masks and the indices of tile reads
+(`w[expert[e], :, :]`) read its elements when the kernel runs.
 """
 
 from __future__ import annotations
@@ -31,7 +35,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
 from .errors import KernelError
-from .tilecode import Store, as_store, assigned, flatten, reads
+from .tilecode import Store, as_store, assigned, element_reads, flatten, reads
 
 __all__ = ["Loop", "Nest", "parse"]
 
@@ -82,6 +86,11 @@ class Nest:
     @property
     def loops(self) -> tuple[Loop, ...]:
         return self.parallel + self.reductions
+
+    @property
+    def runtime_masks(self) -> bool:
+        """Do masks read elements of index arrays? Then they are evaluated when the kernel runs."""
+        return any(loop.mask is not None and element_reads(loop.mask, self.params) for loop in self.reductions)
 
     def store(self, stmt: ast.stmt) -> Store | None:
         """The output store `stmt` is, if it is one."""
@@ -339,12 +348,24 @@ class _Parser:
             if loop.mask is None:
                 continue
             # A parallel loop's mask sees the loops around it; a reduction's, the parallel loops and its own.
-            visible = set(parallel_vars[: depth + 1]) if depth < len(parallel_vars) else {*parallel_vars, loop.var}
-            arrays = reads(loop.mask) & (params | outputs)
+            reduction = depth >= len(parallel_vars)
+            visible = {*parallel_vars, loop.var} if reduction else set(parallel_vars[: depth + 1])
+            elements = {id(n.value) for n in element_reads(loop.mask, params)} if reduction else set()
+            arrays = [
+                n.id
+                for n in ast.walk(loop.mask)
+                if isinstance(n, ast.Name) and n.id in params | outputs and id(n) not in elements
+            ]
+            if arrays and reduction:
+                raise self.error(
+                    f"a reduction loop's mask reads loop variables, constants and elements of index arrays "
+                    f"(`lengths[b]`), not `{arrays[0]}` itself",
+                    loop.mask,
+                )
             if arrays:
                 raise self.error(
                     f"masks are evaluated when the kernel is built, on loop variables and constants: this one reads "
-                    f"`{sorted(arrays)[0]}`",
+                    f"`{arrays[0]}`",
                     loop.mask,
                 )
             inner = reads(loop.mask) & (loop_vars - visible)

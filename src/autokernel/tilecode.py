@@ -11,7 +11,7 @@ import ast
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 
-__all__ = ["Store", "as_store", "assigned", "first_reads", "flatten", "reads"]
+__all__ = ["Store", "as_store", "assigned", "element_reads", "first_reads", "flatten", "reads"]
 
 
 @dataclass(frozen=True)
@@ -41,6 +41,19 @@ def as_store(stmt: ast.stmt) -> Store | None:
             dims = tuple(index.elts) if isinstance(index, ast.Tuple) else (index,)
             return Store(output, dims, value, stmt)
     return None
+
+
+def element_reads(node: ast.AST, arrays: Iterable[str]) -> list[ast.Subscript]:
+    """The reads of single elements of `arrays` in `node`: subscripts without slices, `lengths[b]`."""
+    names = set(arrays)
+    return [
+        n
+        for n in ast.walk(node)
+        if isinstance(n, ast.Subscript)
+        and isinstance(n.value, ast.Name)
+        and n.value.id in names
+        and not any(isinstance(i, ast.Slice) for i in (n.slice.elts if isinstance(n.slice, ast.Tuple) else [n.slice]))
+    ]
 
 
 def flatten(stmts: Iterable[ast.stmt]) -> Iterator[ast.stmt]:

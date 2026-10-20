@@ -9,6 +9,10 @@ A tile's reduction loops become its phases: the steps of the first, then of the 
 loop of one iteration (and no mask) takes no step of its own: its body runs inline, in the code around it,
 with its variable bound to its one value. So a tunable block size that covers a whole dim turns a loop
 into straight-line code, and the windows it moved into ones fetched once.
+
+Inputs read element by element (`lengths[b]`) are index arrays, kept whole in SMEM: their elements are
+values in tile code, conditions in reduction masks (which the kernel then evaluates when it runs: runtime
+masks), and integer indices of tile reads (`w[expert[e], :, :]`: runtime windows).
 """
 
 from __future__ import annotations
@@ -17,6 +21,7 @@ import ast
 import builtins
 import copy
 import inspect
+import itertools
 import traceback
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -32,9 +37,21 @@ from jax._src import source_info_util
 from . import mxu, v5e
 from .errors import KernelError
 from .parse import Loop, Nest
-from .tilecode import assigned, first_reads, flatten, reads
+from .tilecode import assigned, element_reads, first_reads, flatten, reads
 
-__all__ = ["Carried", "Kind", "Operand", "Output", "Phase", "Plan", "Range", "Tile", "Window", "make_plan"]
+__all__ = [
+    "Carried",
+    "Index",
+    "Kind",
+    "Operand",
+    "Output",
+    "Phase",
+    "Plan",
+    "Range",
+    "Tile",
+    "Window",
+    "make_plan",
+]
 
 
 @dataclass(frozen=True)
@@ -46,6 +63,7 @@ class Range:
     step: int
     count: int
     mask: ast.expr | None  # `if mask: continue` opening the loop's body
+    runtime: bool = False  # does the mask read index arrays (so it is evaluated when the kernel runs)?
 
     def value(self, block: int) -> int:
         return self.start + block * self.step
@@ -54,11 +72,14 @@ class Range:
 @dataclass(frozen=True)
 class Window:
     """How a tile indexes one array dim: from element `offset` (plus the value of `loop`, if any), `size`
-    elements; `size` None is an integer index, which drops the dim from the tile."""
+    elements; `size` None is an integer index, which drops the dim from the tile. An integer index may be an
+    element of an index array (`index`, `expert[e]`), read when the kernel runs: `index_loops` move it."""
 
     loop: str | None
     offset: int
     size: int | None
+    index: ast.Subscript | None = None
+    index_loops: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -78,7 +99,7 @@ class Tile:
     @property
     def loops(self) -> frozenset[str]:
         """The loop variables that move the window."""
-        return frozenset(w.loop for w in self.windows if w.loop)
+        return frozenset(w.loop for w in self.windows if w.loop).union(*(w.index_loops for w in self.windows))
 
 
 class Kind(Enum):
@@ -98,6 +119,16 @@ class Operand:
     tile: Tile
     kind: Kind
     phase: int | None = None  # a streamed operand of a phase: the phase (None: it streams every step)
+
+
+@dataclass(frozen=True)
+class Index:
+    """An index array: an input read element by element, kept whole in SMEM."""
+
+    name: str
+    param: int  # which input
+    shape: tuple[int, ...]
+    dtype: np.dtype
 
 
 @dataclass(frozen=True)
@@ -141,6 +172,7 @@ class Plan:
     phases: tuple[Phase, ...]  # the reduction loops that take steps
     segments: tuple[tuple[ast.stmt, ...], ...]  # the code before, between and after the phases: one more
     operands: tuple[Operand, ...]
+    indices: tuple[Index, ...]  # the index arrays, in parameter order
     reads: Mapping[str, Operand]  # `read_key` of a tile read -> its operand
     outputs: tuple[Output, ...]
     carried: Mapping[str, Carried]
@@ -157,6 +189,11 @@ class Plan:
     @property
     def loops(self) -> tuple[Range, ...]:
         return self.parallel + self.reductions
+
+    @property
+    def runtime(self) -> bool:
+        """Do masks read index arrays, so the kernel's steps are found when it runs?"""
+        return any(phase.range.runtime for phase in self.phases)
 
     def eval(self, node: ast.expr, values: Mapping[str, Any] | None = None) -> Any:
         """Evaluate an expression of the function on the prologue's names (and `values`, e.g. loop values)."""
@@ -194,6 +231,7 @@ class _Planner:
         if nest.tunable:
             self.env[nest.tunable] = tunable
         self.ranges: dict[str, Range] = {}
+        self.indices: dict[str, Index] = {}
 
     def error(self, message: str, node: ast.AST | None = None) -> KernelError:
         return self.nest.error(message, node)
@@ -203,9 +241,11 @@ class _Planner:
 
     def plan(self) -> Plan:
         outputs = self._prologue()
+        self.indices = {index.name: index for index in self._index_arrays()}
         parallel = tuple(self._range(loop) for loop in self.nest.parallel)
         reductions = tuple(self._range(loop) for loop in self.nest.reductions)
         self.ranges = {r.var: r for r in (*parallel, *reductions)}
+        self._check_element_bounds()
         phases, segments = self._phases(reductions)
         operands, reads_ = self._operands(phases)
         output_tiles = {name: self._output_tile(name, *outputs[name], parallel) for name in self.nest.outputs}
@@ -225,6 +265,7 @@ class _Planner:
             phases=phases,
             segments=segments,
             operands=operands,
+            indices=tuple(self.indices.values()),
             reads=reads_,
             outputs=tuple(
                 Output(name, *outputs[name], output_tiles[name], types.stores[name]) for name in self.nest.outputs
@@ -290,7 +331,8 @@ class _Planner:
             )
         if r.start % r.step:
             raise self.error(f"`{loop.var}` loops over {r}: it must start at a multiple of its step", loop.node)
-        return Range(loop.var, r.start, r.step, len(r), loop.mask)
+        runtime = loop.mask is not None and bool(element_reads(loop.mask, self.indices))
+        return Range(loop.var, r.start, r.step, len(r), loop.mask, runtime)
 
     # ------------------------------------------------------------------ tiles
 
@@ -300,6 +342,8 @@ class _Planner:
             f"{text}: each index is `v:v + size` or `v` for a loop variable v, `:`, or constants (`start:stop`, an int)"
         )
         loop_vars = reads(index) & self.ranges.keys()
+        if isinstance(index, ast.Subscript) and isinstance(index.value, ast.Name) and index.value.id in self.indices:
+            return Window(None, 0, None, index, frozenset(loop_vars))  # bounds: clamped when the kernel runs
         if isinstance(index, ast.Slice):
             lower, upper = index.lower, index.upper
             if index.step is not None:
@@ -384,7 +428,8 @@ class _Planner:
         params = {name: i for i, name in enumerate(self.nest.params)}
         subscripts = [n for stmt in self.nest.tile for n in ast.walk(stmt) if isinstance(n, ast.Subscript)]
         for node in sorted(subscripts, key=lambda n: (n.lineno, n.col_offset)):  # in source order
-            param = params.get(node.value.id) if isinstance(node.value, ast.Name) else None
+            is_index = isinstance(node.value, ast.Name) and node.value.id in self.indices
+            param = params.get(node.value.id) if isinstance(node.value, ast.Name) and not is_index else None
             key = read_key(node)
             if param is None or key in by_key:
                 continue
@@ -405,6 +450,71 @@ class _Planner:
             operands.append(operand)
             by_key[key] = operand
         return tuple(operands), by_key
+
+    def _index_arrays(self) -> list[Index]:
+        """The inputs read element by element (`lengths[b]`), in parameter order: int32, read only that way,
+        indexed by loop variables and constants."""
+        nest, params = self.nest, set(self.nest.params)
+        trees: list[ast.AST] = [*nest.tile, *(loop.mask for loop in nest.reductions if loop.mask is not None)]
+        elements = [n for tree in trees for n in element_reads(tree, params)]
+        found = []
+        for p, name in enumerate(nest.params):
+            mine = [n for n in elements if n.value.id == name]  # type: ignore[attr-defined]
+            if not mine:
+                continue
+            ids = {id(n) for n in mine}
+            tiles = [
+                n
+                for tree in trees
+                for n in ast.walk(tree)
+                if isinstance(n, ast.Subscript) and isinstance(n.value, ast.Name) and n.value.id == name
+                if id(n) not in ids
+            ]
+            if tiles:
+                raise self.error(
+                    f"`{name}` is read element by element (an index array, kept in SMEM) and as tiles: read it one "
+                    "way or the other",
+                    tiles[0],
+                )
+            spec = self.inputs[p]
+            if np.dtype(spec.dtype) != np.int32:
+                raise self.error(
+                    f"`{name}` is read element by element, an index array (kept in SMEM): it must be int32, not "
+                    f"{np.dtype(spec.dtype).name}",
+                    mine[0],
+                )
+            for node in mine:
+                index = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
+                text = ast.unparse(node)
+                if len(index) != len(spec.shape):
+                    raise self.error(f"{text}: index every one of {name}'s {len(spec.shape)} dims", node)
+                if any(isinstance(n, ast.Subscript) for i in index for n in ast.walk(i)):
+                    raise self.error(
+                        f"{text}: an index array's elements are indexed by loop variables and constants", node
+                    )
+            found.append(Index(name, p, tuple(spec.shape), np.dtype(spec.dtype)))
+        return found
+
+    def _check_element_bounds(self) -> None:
+        """Elements of index arrays read at loop values outside the array are errors, found when planning by
+        evaluating each index at every value of the loops it reads (index arrays are in SMEM, unchecked)."""
+        nest = self.nest
+        trees: list[ast.AST] = [*nest.tile, *(loop.mask for loop in nest.reductions if loop.mask is not None)]
+        for node in (n for tree in trees for n in element_reads(tree, self.indices)):
+            index = self.indices[node.value.id]  # type: ignore[attr-defined]
+            dims = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
+            for expr, dim in zip(dims, index.shape, strict=True):
+                loops = [self.ranges[v] for v in sorted(reads(expr) & self.ranges.keys())]
+                for values in itertools.product(*(range(r.count) for r in loops)):
+                    at = {r.var: r.value(b) for r, b in zip(loops, values, strict=True)}
+                    value = evaluate(nest, self.env, expr, at)
+                    if not 0 <= value < dim:
+                        where = ", ".join(f"{k}={v}" for k, v in at.items())
+                        raise self.error(
+                            f"{ast.unparse(node)}: reads element {value} of a dim of {dim}"
+                            + (f" at {where}" if where else ""),
+                            node,
+                        )
 
     def _output_tile(
         self, name: str, shape: tuple[int, ...], dtype: np.dtype, fill: Any, parallel: tuple[Range, ...]
@@ -460,12 +570,15 @@ class _Planner:
     def _carried_names(self, phases: tuple[Phase, ...], segments: tuple[tuple[ast.stmt, ...], ...]) -> set[str]:
         """Values a tile carries from one step to another (kept in VMEM): read by a phase's body before it
         assigns them; or read by the code after a phase, but made before that phase. (The code after a phase
-        runs in the phase's last step, after its body: it sees the body's values.)"""
+        runs in the phase's last step, after its body: it sees the body's values; but where a mask may leave
+        a tile's phase one empty step, whose body doesn't run, it reads them from VMEM.)"""
         carried: set[str] = set()
         made = assigned(segments[0])
         for phase, after in zip(phases, segments[1:], strict=True):
             carried |= first_reads(phase.body) & (made | assigned(phase.body))
             carried |= (first_reads(after) & made) - assigned(phase.body)
+            if phase.range.mask is not None:
+                carried |= first_reads(after) & assigned(phase.body)
             made |= assigned(phase.body) | assigned(after)
         return carried
 
@@ -473,7 +586,8 @@ class _Planner:
         """The names tile code reads that aren't its own: the module's, the closure's and the prologue's."""
         nest = self.nest
         own = assigned(nest.tile) | {r.var for r in nest.loops} | set(nest.params) | set(nest.outputs)
-        names = set().union(*(reads(stmt) for stmt in flatten(nest.tile))) - own
+        masks = [r.mask for r in self.ranges.values() if r.runtime]  # evaluated in the generated source
+        names = set().union(*(reads(stmt) for stmt in flatten(nest.tile)), *(reads(m) for m in masks)) - own
         return {name: self.env[name] for name in sorted(names) if name in self.env}
 
     def _scopes(self) -> tuple[str, ...]:
@@ -528,8 +642,9 @@ class _TypeTrace:
         fn = self._function()
         specs = [jax.ShapeDtypeStruct(op.tile.shape, op.tile.dtype) for op in self.operands]
         loop_vars = [jax.ShapeDtypeStruct((), jnp.int32, weak_type=True) for _ in self.planner.ranges]
+        indices = [jax.ShapeDtypeStruct(index.shape, index.dtype) for index in self.planner.indices.values()]
         try:
-            traced = jax.make_jaxpr(fn)(*specs, *loop_vars)
+            traced = jax.make_jaxpr(fn)(*specs, *loop_vars, *indices)
         except Exception as e:
             frame = next(
                 (f for f in reversed(traceback.extract_tb(e.__traceback__)) if f.filename == self.nest.filename),
@@ -558,7 +673,7 @@ class _TypeTrace:
         body: list[ast.stmt] = []
         for label, stmts in self.regions:
             body += [s for stmt in stmts for s in self._instrument(stmt, label)]
-        args = [f"__operand{i}" for i in range(len(self.operands))] + list(self.planner.ranges)
+        args = [f"__operand{i}" for i in range(len(self.operands))] + [*self.planner.ranges, *self.planner.indices]
         fdef = ast.FunctionDef(
             name="__tile__",
             args=ast.arguments([], [ast.arg(a) for a in args], None, [], [], None, []),
