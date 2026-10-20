@@ -116,3 +116,50 @@ def test_examples_lower_to_mosaic_for_v5e(trace):
         lowered = kernel.lowered(kernel.signature(*specs), config, trace=trace)
         assert ("named_scope" in lowered.source) == trace
         assert "tpu_custom_call" in lower_for_v5e(lowered, *specs)
+
+
+def _rmsnorm_matmul(x, gamma, w, eps=1e-6):
+    """rmsnorm(x) @ w in float64 NumPy."""
+    x, gamma, w = f64(x), f64(gamma), f64(w)
+    return x / np.sqrt(np.mean(x * x, axis=-1, keepdims=True) + eps) * gamma @ w
+
+
+def _norm_inputs(m, d, n, dtype):
+    x = rand((m, d), 0, dtype)
+    gamma = (1 + 0.1 * rand((1, d), 1)).astype(dtype)
+    w = (rand((d, n), 2) / np.sqrt(d)).astype(dtype)
+    return x, gamma, w
+
+
+@pytest.mark.parametrize(
+    ("dtype", "shape"),
+    [
+        (jnp.float32, (128, 128, 128)),
+        (jnp.bfloat16, (256, 128, 256)),
+        (jnp.bfloat16, (128, 256, 512)),  # the whole model dim in one step: no carried values
+    ],
+)
+def test_rmsnorm_matmul(dtype, shape):
+    from rmsnorm_matmul import NormMatmulTiles, rmsnorm_matmul, rmsnorm_then_matmul
+
+    x, gamma, w = _norm_inputs(256, 512, 512, dtype)
+    tiles = NormMatmulTiles(tm=shape[0], tn=shape[1], tk=shape[2])
+    out = run_checking_races(rmsnorm_matmul, x, gamma, w, tiles)
+    want = _rmsnorm_matmul(x, gamma, w)
+    tol = 2e-2 if dtype == jnp.bfloat16 else 1e-4
+    np.testing.assert_allclose(f64(out), want, rtol=tol, atol=tol * np.abs(want).max())
+    with jax.default_matmul_precision("highest"):  # plain JAX's f32 `@` is one bf16 pass on a TPU
+        plain = rmsnorm_then_matmul(x, gamma, w)
+    np.testing.assert_allclose(f64(out), f64(plain), rtol=tol, atol=tol * np.abs(want).max())
+    rmsnorm_matmul.verify(x, gamma, w, tiles)
+    lowered = rmsnorm_matmul.lower(x, gamma, w, tiles)
+    assert set(lowered.plan.carried) == ({"acc", "sum_sq"} if shape[2] < 512 else set())
+
+
+def test_rmsnorm_matmul_lowers_to_mosaic_for_v5e():
+    from rmsnorm_matmul import NormMatmulTiles, rmsnorm_matmul
+
+    b16 = jnp.bfloat16
+    specs = (spec(2048, 1024, dtype=b16), spec(1, 1024, dtype=b16), spec(1024, 1024, dtype=b16))
+    for tiles in (NormMatmulTiles(), NormMatmulTiles(tm=256, tn=1024, tk=1024)):
+        assert "tpu_custom_call" in lower_for_v5e(rmsnorm_matmul.lower(*specs, tiles), *specs)

@@ -112,3 +112,19 @@ def test_tuning_under_jit():
     x = rand((2048, 1024))
     np.testing.assert_allclose(f64(jax.jit(scale)(x)), 2 * f64(x))
     assert len(scale.tuning(x).trials) >= 2
+
+
+def test_rmsnorm_matmul_tunes_and_matches_plain_jax():
+    from rmsnorm_matmul import NormMatmulTiles, rmsnorm_matmul, rmsnorm_then_matmul
+
+    x = rand((4096, 2048), 0, jnp.bfloat16)
+    gamma = (1 + 0.1 * rand((1, 2048), 1)).astype(jnp.bfloat16)
+    w = (rand((2048, 2048), 2) / 45).astype(jnp.bfloat16)
+    out = jax.jit(rmsnorm_matmul)(x, gamma, w)  # tunes on this first call
+    tuning = rmsnorm_matmul.tuning(x, gamma, w)
+    print(tuning)
+    assert tuning.trials[0].config.tunable == NormMatmulTiles()
+    assert tuning.best.seconds <= tuning.trials[0].seconds
+    want = f64(rmsnorm_then_matmul(x, gamma, w))
+    np.testing.assert_allclose(f64(out), want, rtol=2e-2, atol=2e-2 * np.abs(want).max())
+    rmsnorm_matmul.verify(x, gamma, w)

@@ -241,3 +241,14 @@ def test_a_kernel_and_its_tunable_can_be_local():
 
     x = rand((32, 128))
     assert double.verify(x) == 0.0 and double.verify(x, Local(tm=16)) == 0.0
+
+
+def test_neighbours_that_build_the_same_kernel_arent_proposed():
+    from matmul import MatmulTiles, matmul
+
+    x = rand((512, 512))
+    sig = matmul.signature(x, x)
+    start = matmul.default_config(sig)  # tm=tn=tk=512: the whole array
+    proposed = proposals(matmul, sig, Trial(start, profile(start, seconds=10.0)))
+    # The kernel clamps 1024 to the array's 512: only the smaller tiles change the kernel.
+    assert [c.tunable for c in proposed] == [MatmulTiles(tm=256), MatmulTiles(tn=256), MatmulTiles(tk=256)]

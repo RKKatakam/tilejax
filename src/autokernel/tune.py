@@ -136,6 +136,11 @@ def _stats(plan: Plan, schedule: Schedule) -> _Stats:
     return _Stats(schedule.steps, moved)
 
 
+def _loop_steps(plan: Plan) -> tuple[tuple[str, int, int], ...]:
+    """What a tunable changes in a kernel: its loops' ranges."""
+    return tuple((r.var, r.step, r.count) for r in plan.loops)
+
+
 def _bytes(shape: tuple[int, ...], dtype: Any) -> int:
     return math.prod(shape) * np.dtype(dtype).itemsize
 
@@ -146,7 +151,7 @@ def proposals(kernel: Kernel, signature: Signature, trial: Trial) -> list[Config
     assert trial.profile is not None
     config, profile = trial.config, trial.profile
     plan, schedule = kernel.build(signature, config.tunable)
-    here, pipe = _stats(plan, schedule), config.pipeline
+    here, pipe, loops = _stats(plan, schedule), config.pipeline, _loop_steps(plan)
     exposed = EXPOSED_SHARE * profile.device_s
     buffering = []
     if profile.regions and profile.exposed_wait_s > exposed and pipe.input_buffers < MAX_INPUT_BUFFERS:
@@ -163,6 +168,8 @@ def proposals(kernel: Kernel, signature: Signature, trial: Trial) -> list[Config
             pipeline = pipe if fits(plan, schedule, pipe) else default_pipeline(plan, schedule)
         except KernelError:
             continue  # breaks a layout rule, doesn't divide a loop, doesn't fit in VMEM, ...
+        if _loop_steps(plan) == loops:
+            continue  # the same kernel (the code clamps the field to the array, say)
         near.append((_stats(plan, schedule), Config(tunable, pipeline)))
     if profile.bottleneck == "dma":
         near = sorted((n for n in near if n[0].dma_bytes < here.dma_bytes), key=lambda n: n[0].dma_bytes)

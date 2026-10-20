@@ -20,7 +20,7 @@ kernel for a **TPU v5e**, and tunes its schedule on the hardware. The scope is d
   pick the next schedules. Don't add cost models, disk caches or search options; make the profile say what
   to do instead.
 - **The examples are the spec**: matmul, causal matmul, causal attention (checked against JAX's splash
-  attention). A feature earns its place by making one of them better or by a new example that needs it.
+  attention), RMSNorm fused with a projection (checked against plain JAX). A feature earns its place by making one of them better or by a new example that needs it.
 
 ## The pipeline
 
@@ -86,7 +86,10 @@ Each of these was found on hardware; don't undo them without measuring again.
   (thread-local) trace would stage the random inputs and test runs. `jax.ensure_compile_time_eval` is not
   an option (it leaks into the Pallas kernel's own trace); tune.py runs tuning on a thread of its own.
 - Tuning from the defaults on a v5e: 4096³ bf16 from 128³ tiles 7.72 -> 0.736 ms (1024³, 4 buffers);
-  8192³ 6.35 -> 5.77 ms; causal 3.48 -> 3.24 ms; attention 700 -> 685 µs.
+  8192³ 6.35 -> 5.77 ms; causal 3.48 -> 3.24 ms; attention 700 -> 685 µs; RMSNorm + projection
+  8192×4096→4096 1.66 -> 1.49 ms (XLA unfused 1.61), 16384×2048→2048 0.876 -> 0.778 ms (XLA 0.907).
+  A kernel that clamps a tunable field to the array (`min(tiles.tm, M)`) makes some neighbours the same
+  kernel: proposals skip neighbours whose loops step as the current schedule's do.
 - 128³ matmul tiles are per-step-overhead bound (~0.2 us of fixed cost per step); 512³ bf16 tiles are
   DMA/MXU balanced. The tuner's proposals follow from these: overhead -> bigger tiles.
 - `jax.named_scope` in a kernel shows up in the profiler as events on the "XLA TraceMe" line, named

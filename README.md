@@ -146,8 +146,14 @@ def f(x, y, tiles=Tiles()):                   # the input arrays; optionally las
 
 Anything else is rejected with a `KernelError` naming the line, before anything runs.
 
-The [examples](examples/) are matmul, causal matmul, and causal multi-head (splash) attention, tested
-against NumPy and against JAX's own splash attention.
+The [examples](examples/) are matmul, causal matmul, causal multi-head (splash) attention, and RMSNorm
+fused with the projection after it, tested against NumPy, JAX's own splash attention, and plain JAX.
+
+**RMSNorm fused with a projection** ([examples/rmsnorm_matmul.py](examples/rmsnorm_matmul.py)): the row
+scale commutes with the matmul, `rmsnorm(x) @ w = (1 / rms(x)) * ((x * gamma) @ w)`, so one reduction
+over the model dimension accumulates `(x * gamma) @ w` on the MXU and each row's sum of squares, and the
+tile is scaled once at the end. The normalized activations never go to HBM; tuned, it is 1.08–1.16×
+faster than XLA's `rmsnorm(x) @ w` on large inputs, and even with it on 512 rows.
 
 ## Tuning: test, trace, change the schedule
 
@@ -177,6 +183,9 @@ On a v5e (bf16; device time of the chosen schedule; `benchmarks/`):
 | matmul 8192³ | 6.35 ms | **5.77 ms** (XLA: 5.90) | 2048 × 1024 × 512 |
 | causal matmul 8192³ | 3.48 ms | **3.24 ms** (XLA: 5.91) | 512 × 512 × 1024 |
 | attention 4 × 16 × 2048 | 0.700 ms | **0.685 ms** (splash at its best: 0.872) | 512 × 512, 4 input buffers |
+| RMSNorm + projection 8192 × 4096 → 4096 | 1.66 ms | **1.49 ms** (XLA unfused: 1.61) | 2048 × 1024 × 512 |
+| RMSNorm + projection 16384 × 2048 → 2048 | 0.876 ms | **0.778 ms** (XLA unfused: 0.907) | 2048 × 1024 × 512 |
+| RMSNorm + projection 512 × 4096 → 4096 | 0.114 ms | **0.110 ms** (XLA unfused: 0.109) | 512 × 1024 × 512 |
 
 The 128³ run, as `kernel.tuning(x, y)` prints it: the defaults were DMA-bound, so the first move was a
 fourth input buffer; then each step of tiles (compute-bound, but with tiny steps) cut the time, until
@@ -263,7 +272,7 @@ src/autokernel/
   tilecode.py   names tile code reads and assigns; output stores
   v5e.py        the chip: memories and layout rules
   errors.py     KernelError
-examples/       matmul, causal matmul, causal attention (+ JAX splash for comparison)
+examples/       matmul, causal matmul, causal attention (+ JAX splash), RMSNorm fused with a projection
 benchmarks/     timing and profiling scripts for a TPU v5e
 tests/
 ```
