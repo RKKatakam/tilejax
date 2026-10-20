@@ -78,6 +78,7 @@ Run with `uv run python examples/deepseek.py`; without a TPU it runs in the Pall
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from typing import Any
 
@@ -90,9 +91,11 @@ from mla import LANES, NOPE, QK, ROPE, THETA, MlaConfig, mla_attention, mla_down
 from mla import init_params as init_attention
 from mla import pack as pack_attention
 from moe import (
+    DECODE_TOKENS,
     MoeConfig,
     choose_group,
     combine,
+    decode_call,
     default_group,
     expert_ffn,
     expert_inputs,
@@ -505,11 +508,16 @@ def tail(x: jax.Array, o_c: jax.Array, attn: dict[str, jax.Array], ffn: tuple[ja
 
 def moe_decode(x: jax.Array, o_c: jax.Array, attn: dict[str, jax.Array], moe: dict[str, Any], config: MoeConfig):
     """The end of an MoE layer for decode rows: `tail` (the output projection, the residual, and the shared
-    expert), then the routed experts on the residual (routing in XLA, `expert_ffn`), added."""
+    expert), then the routed experts on the residual, added: up to moe.DECODE_TOKENS rows, one kernel
+    (`moe.decode_call`: a step per expert some row chose); more, the dispatched `expert_ffn`."""
     s = moe["shared"]
     resid, out = tail(x, o_c, attn, (moe["norm"], s["w_gate"], s["w_up"], s["w_down"]))
-    inputs, d, weights = expert_inputs(resid, moe, config, moe_group(resid, moe, config))
-    routed = combine(expert_ffn(*inputs), d.pos, weights)
+    if resid.shape[0] <= DECODE_TOKENS:
+        kernel, args = decode_call(resid, moe, dataclasses.replace(config, shared=0))
+        routed = kernel(*args).astype(jnp.float32) - resid.astype(jnp.float32)  # (it adds the residual)
+    else:
+        inputs, d, weights = expert_inputs(resid, moe, config, moe_group(resid, moe, config))
+        routed = combine(expert_ffn(*inputs), d.pos, weights)
     return (out.astype(jnp.float32) + routed).astype(x.dtype)
 
 

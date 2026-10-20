@@ -53,6 +53,7 @@ interpreter.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from typing import Any
 
@@ -82,16 +83,18 @@ from mla import LANES, NOPE, ROPE, THETA, MlaConfig, mla_attention, mla_down, pa
 from mla import init_params as mla_init_params
 from mla import rope_tables as mla_rope_tables
 from moe import (
+    DECODE_TOKENS,
     EPS,
     MoeConfig,
     SharedTiles,
     combine,
+    decode_call,
     default_group,
     dispatch,
     expert_ffn,
     expert_inputs,
-    finish,
     gather,
+    moe_layer,
     ragged_rows,
     rmsnorm,
     route,
@@ -666,10 +669,14 @@ def moe_ffn(x: jax.Array, p: dict[str, Any], config: HybridConfig, impl: Impl) -
     mc = config.moe
     gated = config.kind == "qwen3-next"
     if impl.kernels:
-        inputs, d, weights = expert_inputs(x, p, mc, default_group(x.shape[0]))
-        routed = combine(expert_ffn(*inputs), d.pos, weights)
-        if not gated:
-            return finish(x, routed, p, mc)
+        if not gated:  # moe.py's layer: one kernel at decode sizes, dispatched expert tiles above
+            return moe_layer(x, p, mc)
+        if x.shape[0] <= DECODE_TOKENS:  # one kernel for the routed experts (it adds the residual)
+            kernel, args = decode_call(x, p, dataclasses.replace(mc, shared=0))
+            routed = kernel(*args).astype(jnp.float32) - x.astype(jnp.float32)
+        else:
+            inputs, d, weights = expert_inputs(x, p, mc, default_group(x.shape[0]))
+            routed = combine(expert_ffn(*inputs), d.pos, weights)
         s = p["shared"]
         return gated_shared_experts(
             x, p["norm"], s["w_gate"], s["w_up"], s["w_down"], p["shared_gate"], routed.astype(x.dtype)
