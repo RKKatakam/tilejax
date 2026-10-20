@@ -105,8 +105,11 @@ def main() -> None:
         runs, vocab, runs_per_timing = [((1, 256, 4, 2, 512), 1, 256, args.window, args.next)], 512, 1
     else:
         require_tpu()
-        model = (tuple(map(int, args.model.split(","))), args.batch, args.seq, args.window, args.next)
-        runs = [model] if args.model else RUNS
+        runs = (
+            [(tuple(map(int, args.model.split(","))), args.batch, args.seq, args.window, args.next)]
+            if args.model
+            else RUNS
+        )
         vocab, runs_per_timing = VOCAB, 5
 
     def timed(fn: Any, *inputs: Any) -> float:
