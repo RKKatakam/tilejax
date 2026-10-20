@@ -104,6 +104,19 @@ class HeadTiles:
     block_d: int = autokernel.choice(256, 512, 768, 1536, default=1536)
 
 
+@autokernel.tunable
+class MegaTiles:
+    """gemma4_megakernel.py's, per step: d_model rows of the q / k / v weights, cache positions of a sequence,
+    rows of Wo, MLP hidden units, per-layer-embedding units, vocabulary rows."""
+
+    block_d: int = autokernel.choice(128, 256, 512, 768, 1536, default=256)
+    block_kv: int = autokernel.choice(128, 256, 512, default=128)
+    block_a: int = autokernel.choice(256, 512, 1024, 2048, default=512)
+    block_f: int = autokernel.choice(256, 512, 1024, 2048, default=256)
+    block_p: int = autokernel.choice(128, 256, default=128)
+    block_v: int = autokernel.choice(512, 1024, 2048, 4096, default=1024)
+
+
 # --------------------------------------------------------------------------- helpers (plain JAX, in the kernels)
 
 

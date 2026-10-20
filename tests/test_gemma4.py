@@ -27,6 +27,7 @@ from gemma4 import (
     decode_loop,
     decode_step,
     embed_tokens,
+    empty_caches,
     fill_caches,
     forward,
     generate,
@@ -43,6 +44,7 @@ from gemma4 import (
 from gemma4_kernels import (
     AttentionTiles,
     HeadTiles,
+    MegaTiles,
     PostTiles,
     QkvTiles,
     lm_head,
@@ -52,6 +54,7 @@ from gemma4_kernels import (
     q_projection,
     qkv_projection,
 )
+from gemma4_megakernel import gemma4_megakernel, kernel_inputs, mega_loop, mega_step, stack_caches
 from helpers import f64, lower_for_v5e, rand, run_checking_races, spec
 
 from autokernel import v5e
@@ -367,16 +370,88 @@ def _greedy_numpy_agrees(params, prompt, tokens, tie=0.05):
         sequence.append(token)
 
 
-def test_greedy_generation_matches_numpy(tiny_bf16):
+@pytest.mark.parametrize("mega", [True, False], ids=["megakernel", "per-layer"])
+def test_greedy_generation_matches_numpy(tiny_bf16, mega):
     prompts = jax.random.randint(jax.random.key(4), (2, 160), 0, TINY.vocab)
     lengths = jnp.array([160, 90], I32)
-    tokens, timings = generate(tiny_bf16, prompts, 6, lengths)
+    tokens, timings = generate(tiny_bf16, prompts, 6, lengths, mega=mega)
     assert tokens.shape == (2, 6) and timings.decode_tokens_per_s > 0
     for b, n in enumerate(lengths.tolist()):
         _greedy_numpy_agrees(tiny_bf16, prompts[b, :n], tokens[b])
 
 
-def test_decode_loop_runs_the_steps():
+# Two or more steps of each phase at TINY's sizes.
+MEGA_SMALL = MegaTiles(block_d=128, block_kv=128, block_a=256, block_f=256, block_p=128, block_v=256)
+
+
+@pytest.mark.cpu
+def test_megakernel_steps_match_the_per_layer_steps(tiny_f32):
+    # Ragged lengths; the long sequence's sliding rings (128 slots) are full and wrap.
+    ids = jax.random.randint(jax.random.key(7), (3, 300), 0, TINY.vocab)
+    lengths = jnp.array([300, 126, 3], I32)
+    logits, caches, lens = jax.jit(prefill, static_argnums=3)(tiny_f32, ids, lengths, 384)
+    stacked = stack_caches(TINY, caches)
+    assert stacked["ring_k"].shape == (2, 3, 128, 128) and stacked["full_k"].shape == (1, 3, 384, 256)
+    tokens = jnp.argmax(logits, -1).astype(I32)
+    inputs = kernel_inputs(tiny_f32, tokens, stacked, lens)
+    run_checking_races(gemma4_megakernel, *inputs, MEGA_SMALL)
+    assert gemma4_megakernel.verify(*inputs, MEGA_SMALL) < 1e-5
+    sequences = [[*np.asarray(ids[b, :n]).tolist(), int(tokens[b])] for b, n in enumerate(lengths.tolist())]
+    for _ in range(3):
+        ours, stacked, new_lens = mega_step(tiny_f32, tokens, stacked, lens, MEGA_SMALL)
+        _, caches, _ = jax.jit(decode_step)(tiny_f32, tokens, caches, lens)
+        # The caches the two paths write agree; the tokens are float64's argmax (or a near-tie).
+        for name, cache in stack_caches(TINY, caches).items():
+            np.testing.assert_allclose(f64(stacked[name]), f64(cache), atol=1e-5)
+        for b, sequence in enumerate(sequences):
+            logits = numpy_model(sequence, tiny_f32)[-1]
+            assert logits[int(ours[b])] > logits.max() - 1e-3
+            sequence.append(int(ours[b]))
+        tokens, lens = ours, new_lens
+    assert lens.tolist() == [303, 129, 6]
+
+
+def test_megakernel_plan_masks_phases_per_layer(tiny_bf16):
+    ids = jax.random.randint(jax.random.key(8), (2, 128), 0, TINY.vocab)
+    logits, caches, lens = jax.jit(prefill, static_argnums=3)(tiny_bf16, ids, jnp.array([128, 5], I32), 256)
+    tokens = jnp.argmax(logits, -1).astype(I32)
+    inputs = kernel_inputs(tiny_bf16, tokens, stack_caches(TINY, caches), lens)
+    lowered = gemma4_megakernel.lower(*inputs, MEGA_SMALL)
+    phases = [phase.range.var for phase in lowered.plan.phases]
+    assert phases == ["d", "d2", "d3", "d4", "j", "j2", "a", "a2", "f", "f2", "v"]  # (the 128 PLE units: inline)
+    assert [(r.range.var, r.first, r.last) for r in lowered.plan.repeats] == [("layer", 0, 10)]
+    count = jax.jit(lowered.entry.__globals__["gemma4_megakernel_steps"])(*inputs[6:15])[2][0]
+    # Per layer, in phase order: q 2 (or 1 empty) and k / v 2 (or 1 empty) per kind; attention per kind 1
+    # block per sequence (128 and 5 cached positions; 128-slot rings) or 1 empty; Wo 1 (sliding: 256 rows)
+    # or 2 (full: 512), or 1 empty; MLP 2 + 1 empty (narrow) or 1 empty + 4 (wide). Then 2 vocabulary blocks.
+    per_layer = {
+        "s": 2 + 2 + 1 + 1 + 2 + 1 + 1 + 1,
+        "f": 1 + 1 + 2 + 2 + 1 + 2 + 1 + 2,
+        "s shared": 2 + 1 + 1 + 1 + 2 + 1 + 1 + 1,
+        "f shared": 1 + 1 + 2 + 1 + 1 + 2 + 1 + 2,
+    }
+    mlp = {"n": 2 + 1, "w": 1 + 4}
+    expected = 2
+    for i in range(TINY.layers):
+        name = TINY.kind(i) + (" shared" if TINY.is_shared(i) else "")
+        expected += per_layer[name] + mlp[TINY.width(i)]
+    assert int(count) == expected
+
+
+def test_mega_loop_runs_the_steps(tiny_bf16):
+    prompts = jax.random.randint(jax.random.key(9), (2, 128), 0, TINY.vocab)
+    logits, caches, lens = jax.jit(prefill, static_argnums=3)(tiny_bf16, prompts, jnp.array([128, 60], I32), 256)
+    stacked = stack_caches(TINY, caches)
+    first = jnp.argmax(logits, axis=-1).astype(I32)
+    looped, _, looped_lens = jax.jit(mega_loop, static_argnums=4)(tiny_bf16, first, stacked, lens, 2)
+    token = first
+    for t in range(2):
+        token, stacked, lens = mega_step(tiny_bf16, token, stacked, lens)
+        assert looped[:, t].tolist() == token.tolist()
+    assert looped_lens.tolist() == lens.tolist() == [130, 62]
+
+
+def test_decode_loop_runs_the_steps():  # (the per-layer path)
     # The fori_loop over steps (one jit, caches donated) gives what the steps one by one give.
     params = init_params(TINY, seed=5)
     prompts = jax.random.randint(jax.random.key(5), (2, 128), 0, TINY.vocab)
@@ -397,6 +472,7 @@ def test_generator_reuses_its_compiled_functions(tiny_bf16):
     first, _ = generator(prompts)
     again, timings = generator(prompts)
     assert first.tolist() == again.tolist() and generator.max_len == 256 and timings.prefill_ms > 0
+    assert generator.mega and not Generator(tiny_bf16, 64, 128, 3).mega
 
 
 # --------------------------------------------------------------------------- weights
@@ -566,6 +642,15 @@ def test_decode_kernels_lower_for_v5e(batch):
         _lowers(gqa_decode, _b16(batch, 1, 8, dh), cache, cache, spec(batch, dtype=I32))
     _lowers(lm_head_argmax, _b16(batch, E2B.d_model), _b16(1, E2B.d_model), _b16(E2B.vocab, E2B.d_model))
     _lowers(lm_head, _b16(batch, E2B.d_model), _b16(1, E2B.d_model), _b16(E2B.vocab, E2B.d_model))
+
+
+@pytest.mark.parametrize("batch", [1, 8, 32])
+def test_megakernel_lowers_for_v5e(batch):
+    params = jax.eval_shape(lambda: init_params(E2B))
+    caches = jax.eval_shape(lambda: stack_caches(E2B, empty_caches(E2B, batch, 384)))
+    token = jax.ShapeDtypeStruct((batch,), I32)
+    specs = jax.eval_shape(kernel_inputs, params, token, caches, token)
+    _lowers(gemma4_megakernel, *specs)
 
 
 # --------------------------------------------------------------------------- on a TPU v5e

@@ -72,6 +72,7 @@ from decode import DecodeTiles, gqa_decode
 from gemma4_kernels import (
     AttentionTiles,
     HeadTiles,
+    MegaTiles,
     PostTiles,
     QkvTiles,
     lm_head,
@@ -86,6 +87,7 @@ B16, F32, I32 = jnp.bfloat16, jnp.float32, jnp.int32
 EPS = 1e-6
 LANES = 128
 PREFILL_CHUNK = 8192  # tokens per prefill chunk
+MEGA_MAX_BATCH = 32  # Generator decodes up to this many sequences with gemma4_megakernel.py's one-kernel step
 SLIDING, FULL = "sliding_attention", "full_attention"
 E2B_TYPES = tuple(FULL if layer % 5 == 4 else SLIDING for layer in range(35))
 
@@ -193,6 +195,7 @@ class Tiles:
     decode: DecodeTiles | None = None
     post: PostTiles | None = None
     head: HeadTiles | None = None
+    mega: MegaTiles | None = None
 
 
 jax.tree_util.register_static(Tiles)
@@ -723,24 +726,51 @@ class Timings(NamedTuple):
 @dataclass
 class Generator:
     """Greedy generation for prompts of one shape, compiled once (`compile`), then run any number of
-    times: prefill, then every decode step in one jitted loop, the caches donated."""
+    times: prefill, then every decode step in one jitted loop, the caches donated. Decode steps run as one
+    kernel (gemma4_megakernel.py) if `mega` (default: up to MEGA_MAX_BATCH sequences, one kv head), else as
+    three kernels per layer."""
 
     params: dict[str, Any]
     batch: int
     prompt_len: int
     new_tokens: int
     tiles: Tiles = field(default_factory=Tiles)
+    mega: bool | None = None
 
     def __post_init__(self) -> None:
+        import gemma4_megakernel as mk  # (it imports this module)
+
+        config: Config = self.params["config"]
+        if self.mega is None:
+            self.mega = self.batch <= MEGA_MAX_BATCH and config.kv_heads == 1
         self.max_len = -(-(self.prompt_len + self.new_tokens) // 128) * 128
-        self._prefill = jax.jit(functools.partial(prefill, max_len=self.max_len, tiles=self.tiles))
         steps = self.new_tokens - 1
-        self._decode = jax.jit(functools.partial(decode_loop, steps=steps, tiles=self.tiles), donate_argnums=2)
+        prefill_fn = functools.partial(prefill, max_len=self.max_len, tiles=self.tiles)
+        if self.mega:
+
+            def prefill_stacked(params, prompts, lengths):
+                logits, caches, lengths = prefill_fn(params, prompts, lengths)
+                return logits, mk.stack_caches(params["config"], caches), lengths
+
+            self._prefill = jax.jit(prefill_stacked)
+            decode = functools.partial(mk.mega_loop, steps=steps, mega_tiles=self.tiles.mega)
+        else:
+            self._prefill = jax.jit(prefill_fn)
+            decode = functools.partial(decode_loop, steps=steps, tiles=self.tiles)
+        self._decode = jax.jit(decode, donate_argnums=2)
         self._compiled: tuple[Any, Any] | None = None
 
     def compile(self, prompts: jax.Array, lengths: jax.Array) -> None:
-        """Trace (tuning every kernel on a TPU) and compile prefill and the decode loop."""
+        """Trace (tuning every kernel on a TPU) and compile prefill and the decode loop. The megakernel is
+        tuned first by an eager step on the prompts' real caches and lengths (under jit, a kernel with
+        runtime masks would tune on random index data)."""
+        import gemma4_megakernel as mk
+
         prefill_c = self._prefill.lower(self.params, prompts, lengths).compile()
+        if self.mega and self.tiles.mega is None and jax.default_backend() == "tpu":
+            logits, caches, lens = prefill_c(self.params, prompts, lengths)
+            first = jnp.argmax(logits, axis=-1).astype(I32)
+            mk.gemma4_megakernel.tuning(*mk.kernel_inputs(self.params, first, caches, lens))
         _, caches, lengths = jax.eval_shape(self._prefill, self.params, prompts, lengths)
         first = jax.ShapeDtypeStruct((self.batch,), I32)
         decode_c = self._decode.lower(self.params, first, caches, lengths).compile()
@@ -774,11 +804,13 @@ def generate(
     max_new_tokens: int,
     lengths: jax.Array | None = None,
     tiles: Tiles = Tiles(),
+    mega: bool | None = None,
 ) -> tuple[jax.Array, Timings]:
     """Greedy decoding: `max_new_tokens` tokens (B, max_new_tokens) after each prompt (B, S) (prompt b its
-    first lengths[b] tokens; all S by default), and the timings (compilation excluded)."""
+    first lengths[b] tokens; all S by default), and the timings (compilation excluded). `mega`: decode
+    with the one-kernel step (default: for small batches)."""
     b, s = prompts.shape
-    return Generator(params, b, s, max_new_tokens, tiles)(prompts, lengths)
+    return Generator(params, b, s, max_new_tokens, tiles, mega)(prompts, lengths)
 
 
 TINY = Config(
