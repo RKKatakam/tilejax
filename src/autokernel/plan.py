@@ -481,7 +481,7 @@ class _Planner:
             for j in range(rep.first, rep.last):
                 inner += [("code", nest.segments[j])] if j > rep.first else []
                 inner.append(("loop", reductions[j], nest.bodies[j]))
-            items += [("repeat", r, rep.loop.node, [*inner, ("code", rep.after)]), ("code", nest.segments[rep.last])]
+            items += [("repeat", r, [*inner, ("code", rep.after)]), ("code", nest.segments[rep.last])]
             i = rep.last
 
         phases: list[Phase] = []
@@ -511,31 +511,28 @@ class _Planner:
         loops = tuple(Repeat(r, a, b, tuple(after)) for (r, a, b), after in zip(repeats, afters, strict=True))
         return tuple(phases), tuple(tuple(s) for s in segments), loops
 
-    def _inline(self, items: list[tuple[Any, ...]]) -> list[tuple[Any, ...]]:
-        """`items` with the loops of one iteration (and no mask) as code: a reduction loop's binding its
-        variable first."""
+    def _inline(self, items: list[tuple[Any, ...]], keep_first: bool = False) -> list[tuple[Any, ...]]:
+        """`items` with the loops of one iteration (and no mask) as code, a reduction loop's binding its
+        variable first; with `keep_first`, the first reduction loop stays a loop (a phase of one step)."""
         out: list[tuple[Any, ...]] = []
         for item in items:
             if item[0] == "code":
                 out.append(item)
             elif item[0] == "loop":
                 r, body = item[1], item[2]
-                if r.count == 1 and r.mask is None:
+                if r.count == 1 and r.mask is None and not keep_first:
                     out.append(("code", (_bind(r, body[0]), *body)))
                 else:
                     out.append(item)
+                keep_first = False
             else:
-                r, node, inner = item[1], item[2], self._inline(item[3])
+                r, inner = item[1], self._inline(item[2])
                 if r.count == 1:  # (its variable, read across phases, is bound at every step: codegen.py)
                     out += inner
-                elif not any(sub[0] == "loop" for sub in inner):
-                    raise self.error(
-                        f"the repeat loop over `{r.var}` has no reduction loop of more than one iteration to take "
-                        "steps: give one a mask, or more iterations",
-                        node,
-                    )
-                else:
-                    out.append(("repeat", r, inner))
+                    continue
+                if not any(sub[0] == "loop" for sub in inner):  # every iteration takes a step at least
+                    inner = self._inline(item[2], keep_first=True)
+                out.append(("repeat", r, inner))
         return out
 
     def _operands(

@@ -186,6 +186,16 @@ def test_two_repeat_loops_and_static_tables():
     assert "def _before_phase1():" in lowered.source  # the second loop's code before its phase
 
 
+def test_a_repeat_loop_takes_a_step_per_iteration_at_least():
+    # Its one reduction loop has one iteration (a whole layer's weights per step): it stays a phase.
+    kernel = make_kernel(FFN_STACK.replace("range(0, F, 128)", "range(0, F, F)").replace("f + 128", "f + F"))
+    inputs = _ffn_inputs()
+    out = check(kernel, *inputs)
+    np.testing.assert_allclose(f64(out), _ffn_stack(*inputs), rtol=1e-4, atol=1e-3)
+    lowered = kernel.lower(*inputs)
+    assert [p.range.count for p in lowered.plan.phases] == [1] and lowered.steps == 2 * 3
+
+
 def test_a_repeat_loop_of_one_iteration_runs_inline():
     kernel = make_kernel(FFN_STACK)
     inputs = _ffn_inputs(layers=1)
@@ -198,20 +208,6 @@ def test_a_repeat_loop_of_one_iteration_runs_inline():
 @pytest.mark.parametrize(
     ("source", "message"),
     [
-        (
-            """
-            def f(x):
-                out = jnp.zeros((128, 128))
-                for i in range(0, 128, 128):
-                    h = x[i : i + 128, :]
-                    for l in range(2):
-                        for f in range(1):
-                            h = h + 1
-                    out = out.at[i : i + 128, :].set(h)
-                return out
-            """,
-            "the repeat loop over `l` has no reduction loop of more than one iteration",
-        ),
         (
             """
             def f(x):
