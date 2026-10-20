@@ -51,8 +51,8 @@ structure: a fully parallel kernel over (batch, block of chunks, head) tiles (`g
 writes each chunk's operands to HBM (bf16: [W; Gamma Q], U, the decayed attention and the decayed keys,
 transposed: 640 x 128 per chunk and head, and the chunk's decay), and a thin sequential kernel
 (`delta_scan`) runs the state chain over them, a tile per (batch, group of heads). It moves 2.5x the
-fused kernel's bytes. (Its scan tunes on the operands of an eager call; under `jax.jit`, tuning runs on
-random operands, on which the recurrence overflows: call it eagerly once per shape first.)
+fused kernel's bytes. (Under `jax.jit` the scan tunes on random operands, whose recurrence would grow
+without bound: it clamps its states to STATE_MAX, which real ones never reach.)
 
 `reference_recurrent` is the recurrence above in float64 NumPy; `baseline_chunked` the chunked algorithm
 in plain JAX (intra-chunk work batched over every chunk, a `lax.scan` over chunks for the state, outputs
@@ -78,6 +78,7 @@ SUB = 32  # KDA: rows per block of a chunk sharing a decay reference point
 KDA_GATE_MIN = -5.0  # KDA: per-token log decays are clamped to [KDA_GATE_MIN, 0]
 NORM_EPS = 1e-6  # q and k L2 normalization, as flash-linear-attention's
 PACKED = 5 * CHUNK  # the split form's rows per chunk and head: [W; Gamma Q], U, attention, keys^T
+STATE_MAX = 1e8  # the split form's scan clamps its states to this, far beyond what real inputs reach
 
 
 @autokernel.tunable
@@ -231,10 +232,11 @@ def gdn_operands(q, k, v, g, beta):
     g = [jnp.minimum(x, 0.0) for x in g]
     beta = [jnp.clip(x, 0.0, 1.0) for x in beta]
     g_col = [_column(x) for x in g]  # [r, s] = G_r
-    decay = [jnp.exp(jnp.minimum(gc - gr, causal)) for gc, gr in zip(g_col, g, strict=True)]
+    # exp(G_r - G_s) beta_s on and below the diagonal: the decays and betas of both K K^T and Q K^T
+    scale = [jnp.exp(jnp.minimum(gc - gr, causal)) * b for gc, gr, b in zip(g_col, g, beta, strict=True)]
     kq = [_dot_nt(jnp.concatenate([x, _bf16(y)]), x) for x, y in zip(kb, qn, strict=True)]  # [K; Q] K^T
-    a = [jnp.where(rows > cols, x[:CHUNK] * d * b, 0.0) for x, d, b in zip(kq, decay, beta, strict=True)]
-    qk = [_bf16(x[CHUNK:] * d * b) for x, d, b in zip(kq, decay, beta, strict=True)]
+    a = [jnp.where(rows > cols, x[:CHUNK] * d, 0.0) for x, d in zip(kq, scale, strict=True)]
+    qk = [_bf16(x[CHUNK:] * d) for x, d in zip(kq, scale, strict=True)]
     t = inverse_by_doubling(a)
     gamma = [jnp.exp(x) for x in g_col]  # exp(G_r), row r in every lane: it scales rows of (C, HEAD_DIM) tiles
     w_u = [_dot(x, jnp.concatenate([_bf16(y * gm), vv], axis=1)) for x, y, gm, vv in zip(t, kn, gamma, v, strict=True)]
@@ -494,6 +496,9 @@ def kda_chunks(q, k, v, g, rows, tiles=ChunkTiles()):
 def scan_step(packed, decays, state):
     """A step of `delta_scan`: packed (chunks, PACKED, heads * HEAD_DIM) operands and decays (chunks, 1,
     heads * HEAD_DIM); the chunks' outputs (chunks, C, heads * d_v) f32 and the states after them."""
+    # The delta rule's states stay near the size of its values (each token's update is a contraction plus
+    # beta k v^T); on random operands, which tuning runs on, they would grow ~100x per chunk and overflow.
+    state = jnp.clip(state, -STATE_MAX, STATE_MAX)
     ops = []
     for c in range(packed.shape[0]):
         for h in range(0, packed.shape[2], HEAD_DIM):

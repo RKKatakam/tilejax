@@ -145,11 +145,17 @@ def test_out_of_range_gates_are_clamped(per_channel):
     _assert_close(SPLIT[per_channel](q, k, v, g, beta, (ChunkTiles(), DeltaTiles())), want)
 
 
-def test_split_chunks_stay_finite_on_random_rows():
-    # Tuning runs the parallel kernel on normal random rows: "cumulative" log decays that rise and fall.
+def test_split_form_is_finite_on_random_operands():
+    # Under jax.jit, tuning runs each kernel on normal random inputs. For the parallel kernel those are
+    # "cumulative" log decays that rise and fall; for the scan, operands whose recurrence grows ~100x per
+    # chunk (until its states are clamped): 24 chunks overflow f32 without the clamp.
     q, k, v = (by_chunk(rand((1, 512, 2 * HEAD_DIM), seed, jnp.bfloat16)) for seed in range(3))
-    packed, decays = gdn_chunks(q, k, v, 3 * rand((1, 512 // CHUNK, 2, 1, 2 * HEAD_DIM), 3), ChunkTiles())
+    packed, decays = gdn_chunks(q, k, v, 3 * rand((1, 4, 2, 1, 2 * HEAD_DIM), 3), ChunkTiles())
     assert np.isfinite(f64(packed)).all() and np.isfinite(f64(decays)).all()
+    packed, decays = rand((1, 24, PACKED, 2 * HEAD_DIM), 4, jnp.bfloat16), rand((1, 24, 1, 2 * HEAD_DIM), 5)
+    out = delta_scan(packed, decays, DeltaTiles(heads=2, block=512))
+    assert np.isfinite(f64(out)).all()
+    delta_scan.verify(packed, decays, DeltaTiles(heads=2, block=512))
 
 
 def _gated_rmsnorm(o, z, weight, eps=1e-6):
