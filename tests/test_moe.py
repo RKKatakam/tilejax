@@ -8,19 +8,25 @@ import numpy as np
 import pytest
 from helpers import f64, lower_for_v5e, rand, run_checking_races, spec
 from moe import (
+    BLOCKS,
     CONFIGS,
     ExpertTiles,
     GmmTiles,
     MoeConfig,
+    RouterTiles,
     SharedTiles,
     baseline,
     baseline_params,
+    block_dispatch,
     capacity,
     choose_group,
     default_group,
     dispatch,
     expert_ffn,
+    expert_ffn_blocks,
     expert_inputs,
+    experts_specs,
+    gather,
     gmm_down,
     gmm_swiglu,
     group_candidates,
@@ -28,10 +34,13 @@ from moe import (
     megablox_tiling,
     moe_layer,
     moe_layer_ragged,
+    norm_router,
     ragged_rows,
     rmsnorm,
     route,
+    route_tokens,
     shared_experts,
+    split_router,
     tile_experts,
 )
 
@@ -167,13 +176,45 @@ def test_dispatch_puts_each_token_in_its_experts_rows(group):
             assert starts[e] <= t * group < ends[e]
 
 
+def _routing(tokens, k, shares, seed):
+    """Random routing, k distinct experts per token (as a router chooses), expert e with odds `shares[e]`."""
+    rng = np.random.default_rng(seed)
+    p = np.array(shares) / sum(shares)
+    return jnp.array([rng.choice(len(shares), k, replace=False, p=p) for _ in range(tokens)], jnp.int32)
+
+
+@pytest.mark.parametrize("group", [128, 256])
+def test_block_dispatch_tiles_each_experts_rows(group):
+    # 300 tokens x 3 of 7 experts: one without rows, the rest 0 to 3 tiles each, rows meeting mid-block.
+    ids = _routing(300, 3, [6, 1, 0, 2, 3, 1, 1], 0)
+    b = block_dispatch(ids, 7, group)
+    r = group // BLOCKS
+    src, pos = np.asarray(b.src), np.asarray(b.pos)
+    experts, blocks = np.asarray(b.tile_expert), np.asarray(b.tile_blocks).reshape(-1, BLOCKS)
+    counts = np.bincount(np.asarray(ids).reshape(-1), minlength=7)
+    assert counts[2] == 0 and counts.max() > group
+    assert experts.shape == (capacity(900, 7, group) // group,) and src.shape == (capacity(900, 7, r),)
+    assert (np.bincount(src[src < 300], minlength=300) == 3).all() and (src[src >= 300] == 300).all()
+    want = [e for e, n in enumerate(counts) for _ in range(-(-n // group))]
+    assert list(experts[: len(want)]) == want and (experts[len(want) :] == -1).all()
+    assert (blocks >= 0).all() and (blocks < src.size // r).all()
+    # Each slot's output row is in a tile of its expert, where the tile's blocks hold the slot's token.
+    assert len(set(pos.reshape(-1).tolist())) == 900
+    for t in range(300):
+        for s in range(3):
+            tile, row = divmod(int(pos[t, s]), group)
+            assert experts[tile] == ids[t, s] and src[blocks[tile, row // r] * r + row % r] == t
+
+
 def test_capacity_is_the_most_rows_a_routing_can_need():
     # 8 slots of 8 experts in groups of 16: every expert can get one row, so each needs a tile.
     assert capacity(8, 8, 16) == 128 and capacity(64, 128, 16) == 1024 and capacity(4096 * 8, 128, 256) == 65536
     assert ragged_rows(64) == 64 and ragged_rows(600) == 1024 and ragged_rows(24) == 32
     assert default_group(8) == 16 and default_group(64) == 64 and default_group(4096) == 256
-    assert group_candidates(8) == (16,) and group_candidates(64) == (16, 32, 64)
-    assert group_candidates(4096) == (128, 256, 512)
+    qwen, kimi, v2 = CONFIGS["qwen3-30b-a3b"], CONFIGS["kimi-k2-small"], CONFIGS["deepseek-v2-lite"]
+    assert group_candidates(8, qwen) == (16,) and group_candidates(64, qwen) == (16, 32, 64)
+    assert group_candidates(4096, qwen) == (256, 384, 512) and group_candidates(4096, kimi) == (128, 256)
+    assert group_candidates(4096, v2) == (384, 512, 768) and group_candidates(16384, qwen) == (512, 768, 1024)
 
 
 # --------------------------------------------------------------------------- the grouped kernels
@@ -211,6 +252,44 @@ def test_expert_ffn_against_numpy(dtype, group, block_f):
     per_expert = {e: -(-n // group) for e, n in enumerate(sizes) if n}
     assert len(tiles_run) == nf * sum(per_expert.values())
     assert {int(experts[t]) for t, _ in tiles_run} == set(per_expert)
+
+
+@pytest.mark.parametrize(("group", "block_f"), [(128, 256), (256, 128)])
+def test_expert_ffn_blocks_against_numpy(group, block_f):
+    # 300 tokens x 3 of 7 experts: one without rows, one over 3 tiles; tiles read past their expert's rows.
+    ids = _routing(300, 3, [6, 1, 0, 2, 3, 1, 1], 0)
+    d, f = 256, 256
+    normed = rand((300, d), 4, jnp.bfloat16)
+    w_gate, w_up = rand((7, d, f), 1, jnp.bfloat16) * 0.1, rand((7, d, f), 2, jnp.bfloat16) * 0.1
+    w_down = rand((7, f, d), 3, jnp.bfloat16) * 0.1
+    b = block_dispatch(ids, 7, group)
+    xs = gather(normed, b.src).reshape(-1, group // BLOCKS, d)
+    args = (xs, w_gate, w_up, w_down, b.tile_expert, b.tile_blocks, ExpertTiles(block_f=block_f))
+    out = f64(run_checking_races(expert_ffn_blocks, *args))
+    rows = out[np.asarray(b.pos)]  # (300, 3, d): each slot's row
+    want = np.stack([_swiglu(f64(normed), w_gate[e], w_up[e], w_down[e]) for e in range(7)])  # (7, 300, d)
+    want = want[np.asarray(ids), np.arange(300)[:, None]]
+    np.testing.assert_allclose(rows, want, rtol=3e-2, atol=3e-2 * np.abs(want).max())
+    assert (out[group * int(np.sum(np.asarray(b.tile_expert) >= 0)) :] == 0).all()  # the unused tiles
+    expert_ffn_blocks.verify(*args)
+    # Only the tiles with rows run, every block of hidden units.
+    steps = _steps(expert_ffn_blocks.lower(*args), b.tile_expert, b.tile_blocks)
+    counts = np.bincount(np.asarray(ids).reshape(-1), minlength=7)
+    assert len(steps) == (f // block_f) * sum(-(-n // group) for n in counts)
+
+
+def test_norm_router_against_numpy():
+    x = rand((256, 512), 0, jnp.bfloat16)
+    gamma = (1 + 0.1 * rand((1, 512), 1)).astype(jnp.bfloat16)
+    w_router = rand((512, 128), 2) / 23
+    args = (x, gamma, *split_router(w_router), RouterTiles(rows=128))
+    normed, logits = run_checking_races(norm_router, *args)
+    xf = f64(x)
+    want = xf / np.sqrt(np.mean(xf * xf, 1, keepdims=True) + 1e-6) * f64(gamma)
+    np.testing.assert_allclose(f64(normed), want, rtol=1e-2, atol=1e-2)
+    assert logits.dtype == jnp.float32  # the f32 router on the bf16 rows, to ~2^-17
+    np.testing.assert_allclose(f64(logits), f64(normed) @ f64(w_router), rtol=1e-4, atol=1e-4)
+    norm_router.verify(*args)
 
 
 @pytest.mark.parametrize(("dtype", "tm", "tn"), [(jnp.float32, 64, 128), (jnp.bfloat16, 128, 256)])
@@ -261,7 +340,10 @@ def test_shared_experts_against_numpy():
 # --------------------------------------------------------------------------- whole layers
 
 
-@pytest.mark.parametrize(("config", "tokens", "group"), [(SIGMOID, 128, 32), (SOFTMAX, 64, None), (SIGMOID, 8, None)])
+@pytest.mark.parametrize(
+    ("config", "tokens", "group"),
+    [(SIGMOID, 128, 32), (SOFTMAX, 64, None), (SIGMOID, 8, None), (SIGMOID, 128, None), (SOFTMAX, 512, 256)],
+)
 def test_moe_layer_against_numpy(config, tokens, group):
     params = init_params(config)
     x = rand((tokens, config.d_model), 7, jnp.bfloat16)
@@ -327,6 +409,35 @@ def test_expert_ffn_lowers_for_v5e(name, tokens, group, block_f):
 
 
 @pytest.mark.parametrize(
+    ("name", "tokens", "group", "block_f"),
+    [
+        ("qwen3-30b-a3b", 4096, 256, 1024),  # 768 hidden units: one block, the weights per tile
+        ("qwen3-30b-a3b", 16384, 1024, 256),
+        ("deepseek-v2-lite", 16384, 512, 2048),
+        ("kimi-k2-small", 4096, 128, 512),
+        ("deepseek-v3-small", 4096, 384, 128),
+    ],
+)
+def test_expert_ffn_blocks_lowers_for_v5e(name, tokens, group, block_f):
+    kernel, specs = experts_specs(CONFIGS[name], tokens, group)
+    assert kernel is expert_ffn_blocks
+    lowered = kernel.lower(*specs, ExpertTiles(block_f=block_f))
+    assert lowered.schedule.runtime and lowered.vmem_bytes < 96 * 2**20
+    assert "tpu_custom_call" in lower_for_v5e(lowered, *specs)
+
+
+@pytest.mark.parametrize(("tokens", "experts"), [(4096, 128), (16384, 64), (8, 384)])
+def test_norm_router_lowers_for_v5e(tokens, experts):
+    specs = [
+        spec(tokens, 2048, dtype=jnp.bfloat16),
+        spec(1, 2048, dtype=jnp.bfloat16),
+        spec(2048, experts, dtype=jnp.bfloat16),
+        spec(2048, experts, dtype=jnp.bfloat16),
+    ]
+    assert "tpu_custom_call" in lower_for_v5e(norm_router.lower(*specs), *specs)
+
+
+@pytest.mark.parametrize(
     ("name", "tokens", "tm", "tn"),
     [("qwen3-30b-a3b", 4096, 256, 1024), ("deepseek-v2-lite", 16384, 512, 2048), ("kimi-k2-small", 4096, 256, 512)],
 )
@@ -360,18 +471,23 @@ def test_shared_experts_lower_for_v5e():
 
 
 @pytest.mark.tpu
-@pytest.mark.parametrize("name", ["qwen3-30b-a3b", "deepseek-v3-small"])
+@pytest.mark.parametrize("name", ["qwen3-30b-a3b", "deepseek-v3-small", "kimi-k2-small"])
 @pytest.mark.parametrize("tokens", [32, 2048])
 def test_layers_match_ragged_dot_and_megablox_on_tpu(name, tokens):
     config = CONFIGS[name]
     params = init_params(config)
     x = jax.random.normal(jax.random.key(1), (tokens, config.d_model), jnp.bfloat16)
-    group = choose_group(x, params, config)  # tunes expert_ffn on this routing
+    group = choose_group(x, params, config)  # tunes the experts' kernel on this routing
     moe_layer_ragged(x, params, config)  # tunes the grouped matmuls on it, eagerly
     ours = jax.jit(moe_layer, static_argnums=(2, 3))(x, params, config, group)
     ragged = jax.jit(moe_layer_ragged, static_argnums=2)(x, params, config)
+    # `norm_router` and XLA round the logits differently: a token at a near tie may take another expert.
+    ids = np.sort(np.asarray(route_tokens(x, params, config)[1]), axis=1)
+    xla_ids = np.sort(np.asarray(route(rmsnorm(x, params["norm"]), params["router"], params["bias"], config)[0]), 1)
+    same = (ids == xla_ids).all(axis=1)
+    assert same.mean() >= 0.99
     bparams = baseline_params(params)
     for want in (baseline(config)(x, bparams), baseline(config, "megablox", megablox_tiling(128, 512))(x, bparams)):
         for out in (ours, ragged):
-            diff = jnp.abs(out.astype(jnp.float32) - want.astype(jnp.float32))
+            diff = jnp.abs(out.astype(jnp.float32) - want.astype(jnp.float32))[same]
             assert float(diff.max()) <= 3e-2 * float(jnp.abs(want.astype(jnp.float32)).max())
