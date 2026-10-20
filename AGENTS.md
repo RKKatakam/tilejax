@@ -184,6 +184,11 @@ kernel itself, or it holds the TPU for every later process (`colab restart-kerne
 - Prefer data (`Plan`, `Schedule`, `Pipeline` are frozen dataclasses) flowing forward to objects
   reaching back. A module only imports the ones to its left in the pipeline.
 - Generated names come from `codegen._Namer`, so they never collide with names in the user's code.
+- A kernel's result must not depend on its tunable: tuning checks every candidate against the reference
+  run at another tunable (the one with the fewest loop iterations, usually the largest blocks). Make a
+  tunable that would change the math unbuildable (`assert S % bk == 0` in the prologue): the decode
+  megakernel's caches flattened across sequences let a 2048-row block straddle two of them at S_max 7168,
+  so its reference was wrong and every correct candidate was rejected.
 - Keep public API small: `autokernel.__all__`. New options need a measured reason; see "What autokernel
   isn't".
 - When something is learned on hardware, add it to "Measured facts" above with the measurement.

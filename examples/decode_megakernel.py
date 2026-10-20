@@ -264,6 +264,7 @@ def decode_megakernel(
     H, Hkv = HD // HEAD_DIM, KVD // HEAD_DIM
     bd, bk, ba = min(tiles.block_d, D), min(tiles.block_kv, S), min(tiles.block_a, HD)
     bf, bv = min(tiles.block_f, F), min(tiles.block_v, V)
+    assert S % bk == 0  # a block of the flattened caches holds one sequence's positions, never two
     scale = HEAD_DIM**-0.5
     dtype = x.dtype
     logits = jnp.zeros((B, V), dtype)
