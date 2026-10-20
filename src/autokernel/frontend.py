@@ -33,6 +33,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
+from . import scopes
 from .errors import AutoKernelError
 
 __all__ = [
@@ -191,17 +192,6 @@ class _MatmulAssign(ast.NodeTransformer):
         return ast.fix_missing_locations(ast.copy_location(ast.Assign([s.target], value), s))
 
 
-def _local_names(fdef: ast.FunctionDef) -> set[str]:
-    """The function's local variables: its parameters and every name it assigns (not in a comprehension)."""
-    comprehension_vars = {id(t) for c in ast.walk(fdef) if isinstance(c, ast.comprehension) for t in ast.walk(c.target)}
-    stored = {
-        n.id
-        for n in ast.walk(fdef)
-        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store) and id(n) not in comprehension_vars
-    }
-    return stored | {a.arg for a in fdef.args.args}
-
-
 def _inline(value: ast.expr, allocs: dict[str, ast.expr]) -> ast.expr:
     """An output allocation reading outputs allocated before it (`allocs`), with their allocations in their place:
     the value they have there, in Python."""
@@ -294,7 +284,7 @@ class _Parser:
         output an allocation reads stands for its own allocation, and the rest of the prologue can't read one.
         """
         prologue, allocs = [], {}
-        local = _local_names(self.fdef)
+        local = scopes.local_names(self.fdef)
         assigned = set(self.params)
         read_by: dict[str, ast.stmt] = {}  # a name an allocation reads -> that allocation
         for s in stmts:

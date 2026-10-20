@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import functools
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -145,6 +146,7 @@ class _UnitCost:
     peak_bytes: int  # most VMEM the unit's temporaries hold at once
     # Vector arithmetic on integers the VPU can't compute on: (statement or None, primitive, dtype).
     unsupported: tuple[ast.AST | None, str, np.dtype, bool] | None = None  # (where, op, dtype, on vectors?)
+    unlowerable: tuple[ast.AST | None, str] | None = None  # (where, primitive) Pallas TPU has no lowering for
 
     @property
     def mxu_flops(self) -> float:
@@ -175,6 +177,19 @@ def estimate(
     body_costs = [_unit_cost(spec, u, vpu, cache) for u in bodies]
     tile_costs = [_unit_cost(spec, u, vpu, cache) for u in segments] + [_unit_cost(spec, None, vpu, cache)]
     for c in [*body_costs, *tile_costs]:
+        if c.unlowerable:
+            node, name = c.unlowerable
+            what = f"`{ast.unparse(node)}`" if node is not None else "the tile code"
+            raise spec.nest.error(
+                node,
+                f"{what} uses `{name}`, which Pallas can't lower to a TPU kernel (Mosaic rejects it when compiling "
+                "for the chip; the interpreter doesn't): compute it another way"
+                + (
+                    " (`jax.checkpoint` does nothing inside a kernel: call the function directly)"
+                    if "remat" in name or "checkpoint" in name
+                    else ""
+                ),
+            )
         if c.unsupported:
             node, name, dtype, vector = c.unsupported
             what = f"`{ast.unparse(node)}`" if node is not None else "the tile code"
@@ -359,12 +374,18 @@ def _unit_cost(
     dots = {}
     for dtype, f in counts.dots:
         dots[dtype] = dots.get(dtype, 0.0) + f
-    unsupported = None
+    nodes = [*stmts, *(st.node for st in nest.stores if unit is None)]
+
+    def at(line: int | None) -> ast.AST | None:
+        return next((n for n in nodes if line is not None and n.lineno <= line <= (n.end_lineno or n.lineno)), None)
+
+    unsupported = unlowerable = None
     if counts.narrow:
         name, dtype, line, vector = counts.narrow[0]
-        nodes = [*stmts, *(st.node for st in nest.stores if unit is None)]
-        node = next((n for n in nodes if line is not None and n.lineno <= line <= (n.end_lineno or n.lineno)), None)
-        unsupported = (node, name, np.dtype(dtype), vector)
+        unsupported = (at(line), name, np.dtype(dtype), vector)
+    if counts.unlowerable:
+        name, line = counts.unlowerable[0]
+        unlowerable = (at(line), name)
     return _UnitCost(
         tuple(sorted(dots.items())),
         counts.valu,
@@ -373,10 +394,28 @@ def _unit_cost(
         counts.transcendentals,
         _peak_live_bytes(jaxpr),
         unsupported,
+        unlowerable,
     )
 
 
 # --------------------------------------------------------------------------- counting vector work
+
+
+def _user_line(eqn: Any) -> int | None:
+    """The line of the traced unit an equation comes from (None if it can't be told)."""
+    frames = list(source_info_util.user_frames(eqn.source_info.traceback))
+    lines = [f.start_line for f in frames if f.file_name.startswith("<autokernel cost:")]
+    return lines[0] if lines else None
+
+
+@functools.cache
+def _tc_lowering_rules() -> frozenset:
+    """The primitives Pallas can lower in a TPU TensorCore kernel: what Mosaic will be asked to compile."""
+    from jax._src.pallas.mosaic import lowering
+
+    rules = next(v for k, v in lowering.lowering_rules.items() if getattr(k, "value", k) == "tc")
+    return frozenset(rules)
+
 
 _TRANSCENDENTAL = frozenset(
     {"exp", "exp2", "log", "log1p", "expm1", "tanh", "logistic", "sin", "cos", "tan", "rsqrt", "sqrt", "cbrt",
@@ -418,6 +457,7 @@ class _Counts:
         self.dots: list[tuple[str, float]] = []
         self.valu = self.eup = self.elementwise = self.transcendentals = 0.0
         self.narrow: list[tuple[str, Any, int | None, bool]] = []  # ops on integers the chip can't compute on
+        self.unlowerable: list[tuple[str, int | None]] = []  # primitives Pallas TPU can't lower, and their lines
 
     def check_ints(self, eqn: Any) -> None:
         """Record `eqn` if it's vector arithmetic on integers narrower than the VPU computes on."""
@@ -433,10 +473,15 @@ class _Counts:
             dtype = np.dtype(aval.dtype)
             narrow = dtype.itemsize * 8 not in self.int_bits if vector else dtype.itemsize < 4
             if np.issubdtype(dtype, np.integer) and narrow:
-                frames = list(source_info_util.user_frames(eqn.source_info.traceback))
-                lines = [f.start_line for f in frames if f.file_name.startswith("<autokernel cost:")]
-                self.narrow.append((eqn.primitive.name, dtype, lines[0] if lines else None, vector))
+                self.narrow.append((eqn.primitive.name, dtype, _user_line(eqn), vector))
                 return
+
+    def check_lowerable(self, eqn: Any) -> bool:
+        """Record `eqn` if Pallas has no TPU lowering rule for its primitive; whether it has one."""
+        if eqn.primitive in _tc_lowering_rules():
+            return True
+        self.unlowerable.append((eqn.primitive.name, _user_line(eqn)))
+        return False
 
     def vregs(self, aval: Any) -> float:
         shape = getattr(aval, "shape", ())
@@ -453,6 +498,8 @@ class _Counts:
     def add(self, jaxpr: Any, times: float = 1.0) -> None:
         for eqn in jaxpr.eqns:
             name = eqn.primitive.name
+            if not self.check_lowerable(eqn):
+                continue
             if subs := _sub_jaxprs(eqn):
                 reps = float(eqn.params.get("length", 1)) if name == "scan" else 1.0
                 for sub in subs:
@@ -505,10 +552,8 @@ def _sub_jaxprs(eqn: Any) -> list[Any]:
     found = []
     for value in eqn.params.values():
         for v in value if isinstance(value, (tuple, list)) else (value,):
-            if isinstance(v, jax.extend.core.ClosedJaxpr):
+            if isinstance(v, jax.extend.core.ClosedJaxpr):  # in JAX 0.11 a Jaxpr too, whose `.jaxpr` is itself
                 found.append(v.jaxpr)
-            elif isinstance(v, jax.extend.core.Jaxpr):
-                found.append(v)
     return found
 
 

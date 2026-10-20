@@ -22,6 +22,8 @@ tpu = ["jax[tpu]>=0.11.2,<0.12"]
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
+    "pytest-xdist>=3.8.0",
     "ruff>=0.14",
 ]
 
@@ -61,3 +63,18 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "examples/*" = ["E402"]
 "benchmarks/*" = ["E402"]
+
+[tool.coverage.run]
+source = ["autokernel"]
+branch = false
+# The sharding tests run pytest in a child process (JAX fixes its device count when it starts): measure it too.
+patch = ["subprocess"]
+parallel = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise AssertionError\\(.*analysis bug",
+]

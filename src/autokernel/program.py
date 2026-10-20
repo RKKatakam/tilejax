@@ -54,7 +54,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from . import analysis, autodiff, frontend, fusion, hardware
+from . import analysis, autodiff, frontend, fusion, hardware, scopes
 from . import tune as tune_lib
 from .api import TpuKernel, check_outputs
 from .errors import AutoKernelError
@@ -254,41 +254,13 @@ def _tiles(store: ast.Assign, loop_vars: set[str]) -> bool:
     return True
 
 
-_COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)
-_FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
-
-
-def _stores(nodes: list[ast.AST]) -> set[str]:
-    """The names `nodes` bind in their own scope: assignment, loop and `with` targets, `del`, imports,
-    `except ... as`, `match` captures, nested function and class names and walrus targets (in comprehensions
-    too), but not the names comprehensions, lambdas and nested functions bind for themselves."""
-    names: set[str] = set()
-    stack: list[ast.AST] = list(nodes)
-    while stack:
-        node = stack.pop()
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            names.add(node.name)
-            continue
-        if isinstance(node, ast.Lambda):
-            continue
-        if isinstance(node, _COMPREHENSIONS):  # its targets are its own; a walrus binds in the enclosing scope
-            names.update(n.target.id for n in ast.walk(node) if isinstance(n, ast.NamedExpr))
-            continue
-        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
-            names.add(node.id)
-        elif isinstance(node, (ast.Import, ast.ImportFrom)):
-            names.update(a.asname or a.name.split(".")[0] for a in node.names)
-        elif isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and node.name:
-            names.add(node.name)
-        elif isinstance(node, ast.MatchMapping) and node.rest:
-            names.add(node.rest)
-        stack.extend(ast.iter_child_nodes(node))
-    return names
+_COMPREHENSIONS = scopes.COMPREHENSIONS
+_FUNCTIONS = scopes.FUNCTIONS
 
 
 def _bound(node: ast.AST) -> set[str]:
-    """The names `node` binds in its scope (see `_stores`)."""
-    return _stores([node])
+    """The names `node` binds in its scope (`global` and `nonlocal` ones too): see `scopes.binds`."""
+    return scopes.binds([node], declared=True)
 
 
 def _loaded(node: ast.AST) -> set[str]:
@@ -357,15 +329,6 @@ def _blocks(s: ast.stmt) -> list[list[ast.stmt]]:
     return []
 
 
-def _local_names(fdef: ast.FunctionDef) -> set[str]:
-    """Names local to `fdef`: its parameters and everything its body binds (not nested scopes)."""
-    a = fdef.args
-    names = {p.arg for p in a.posonlyargs + a.args + a.kwonlyargs}
-    names |= {p.arg for p in (a.vararg, a.kwarg) if p is not None}
-    declared = {n for s in _walk_scope(fdef.body) if isinstance(s, (ast.Global, ast.Nonlocal)) for n in s.names}
-    return (names | _stores(fdef.body)) - declared
-
-
 class _Finder:
     """Finds the tile loop nests of a function.
 
@@ -377,12 +340,9 @@ class _Finder:
         self, fdef: ast.FunctionDef, fn_name: str, first_line: int, strict: bool, body: list[ast.stmt] | None = None
     ):
         self.fn_name, self.first_line, self.strict = fn_name, first_line, strict
-        self.locals = _local_names(fdef)
+        self.locals = scopes.local_names(fdef)
         self.regions: list[_Region] = []
         self.block(fdef.body if body is None else body)
-
-    def line(self, node: ast.AST) -> int:
-        return self.first_line + node.lineno - 1
 
     def block(self, stmts: list[ast.stmt]) -> None:
         for n, s in enumerate(stmts):
@@ -499,7 +459,7 @@ def _scope_loads(node: ast.AST, bound: frozenset[str] = frozenset()) -> Iterator
             inner = bound | {p.arg for p in ast.walk(a) if isinstance(p, ast.arg)}
             yield from _scope_loads(node.body, inner)
         else:
-            inner = bound | _local_names(node)
+            inner = bound | scopes.local_names(node)
             for s in node.body:
                 yield from _scope_loads(s, inner)
         return
@@ -663,7 +623,7 @@ def _program_ast(fdef: ast.FunctionDef, fn_name: str, first_line: int) -> _Progr
                 del r.block[_index(r.block, alloc)]
     reference = ast.fix_missing_locations(copy.deepcopy(fdef))
     groups = []
-    local = _local_names(fdef)
+    local = scopes.local_names(fdef)
     for block in {id(r.block): r.block for r in regions}.values():
         groups += _group_runs(block, calls, regions, local)
     unrolled = _roll_loops(fdef, first_line)
@@ -1035,7 +995,7 @@ def _roll_loops(fdef: ast.FunctionDef, first_line: int = 1) -> list[str]:
         if _escapes(loop.body):
             return "control leaves its body early (`break`, `continue`, `return`, `del`, ...)"
         var = loop.target.id
-        assigned = _stores(loop.body)
+        assigned = scopes.binds(loop.body, declared=True)
         loads = outside_loads(loop)
         if var in assigned or var in loads:
             return f"its body assigns `{var}`, or `{var}` is read after it"
@@ -1098,7 +1058,11 @@ def _roll_loops(fdef: ast.FunctionDef, first_line: int = 1) -> list[str]:
                 process(s.body, bound | _bound(s.target))
                 process(s.orelse, bound)
             elif isinstance(s, (ast.With, ast.AsyncWith)):
-                process(s.body, bound | _stores([i.optional_vars for i in s.items if i.optional_vars is not None]))
+                process(
+                    s.body,
+                    bound
+                    | scopes.binds([i.optional_vars for i in s.items if i.optional_vars is not None], declared=True),
+                )
             elif isinstance(s, (ast.Try, ast.TryStar)):
                 for sub in (s.body, s.orelse, s.finalbody):
                     process(sub, bound)
@@ -1796,8 +1760,9 @@ class ProgramNest:
         def reference(*xs: Any) -> Any:
             return kernel.reference(*arrays(*xs))
 
-        def unfused(*xs: Any) -> Any:  # the kernel on the views' arrays: what runs batched or sharded
-            return kernel(*arrays(*xs))
+        def unfused(*xs: Any) -> Any:  # what runs batched or sharded: a kernel taking the views' arrays
+            # (not `kernel`: it reads the views as windows of their bases, so it takes the bases)
+            return self({**values, **dict(zip(call.params, arrays(*xs), strict=True))})
 
         return autodiff.differentiable(fn, reference, None, fallback=unfused)(*args)
 
@@ -1943,12 +1908,6 @@ class ProgramGroup:
                 results[(seg.start + j, var)] = out
         outs = tuple(_materialise(actual(plan.binding[v])) for v in self.outputs)
         return outs if len(outs) > 1 else outs[0]
-
-    def reference(self, values: dict[str, Any], view_fns: tuple = ()) -> Any:
-        """Run the statements one after another: nests as Python loops (each with its kernel's `reference`),
-        views as the JAX code they are."""
-        env, fns = self._env(values, view_fns)
-        return self._sequential(env, fns, reference=True)
 
     def _sequential(self, env: dict[str, Any], fns: dict[int, Callable], reference: bool) -> Any:
         """Run the statements one after another, each nest as its own kernel (or its reference)."""

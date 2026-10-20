@@ -140,6 +140,8 @@ def unfusable(lowered: Lowered) -> str | None:
     """Why this kernel can't be a part of a fused kernel, or None if it can."""
     if lowered.plan is None:
         return "it isn't a generated kernel"
+    if lowered.plan.spec.ragged:
+        return "its last tiles run past the end of an array (its wrapper pads and crops them)"
     return None
 
 

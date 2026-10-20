@@ -17,7 +17,7 @@ import copy
 import inspect
 import itertools
 import math
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Collection, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -28,7 +28,7 @@ from jax._src.lax.lax import _convert_element_type  # the only way to set a weak
 from jax.experimental import checkify
 from jax.extend.core import Literal
 
-from . import hardware, mxu
+from . import hardware, mxu, tiles
 from .errors import AutoKernelError
 from .frontend import Loop, LoopNest, Reduction, assigned_name, free_loads, reads, scope_bound
 from .views import ViewError, ViewMap, Window
@@ -77,8 +77,9 @@ class LoopBounds:
 
     var: str
     start: int
-    stop: int
+    stop: int  # a multiple of step past start: for a ragged loop, the end of its last (partial) tile
     step: int
+    end: int | None = None  # a ragged loop's own stop (`stop - start` isn't a multiple of `step`), else None
 
     @property
     def count(self) -> int:
@@ -88,6 +89,10 @@ class LoopBounds:
     def blocks(self) -> range:
         """Absolute block indices the loop visits (start and stop are multiples of step)."""
         return range(self.start // self.step, self.stop // self.step)
+
+    @property
+    def ragged(self) -> bool:
+        return self.end is not None
 
 
 @dataclass(frozen=True)
@@ -152,6 +157,12 @@ class OutputSpec:
     alloc: ast.expr
     fill: Scalar | None  # the allocation's value when every element is the same known constant
     partial: bool = False  # the tiles don't cover it: the rest keeps the allocation's values (an input)
+    padded: tuple[int, ...] = ()  # its last tiles run past its end: the shape the kernel writes (then crops)
+
+    @property
+    def kernel_out(self) -> jax.ShapeDtypeStruct:
+        """The array the kernel writes: the output itself, or padded to whole tiles (see `padded`)."""
+        return jax.ShapeDtypeStruct(self.padded, self.out.dtype) if self.padded else self.out
 
 
 @dataclass(frozen=True)
@@ -226,6 +237,8 @@ class Specialization:
     # Inputs that are 0-d numbers: runtime scalars (read from SMEM), usable as values; integers also as indices.
     scalars: list[str] = field(default_factory=list)
     views: dict[str, ViewMap] = field(default_factory=dict)  # inputs that are views of a base array
+    # Inputs whose last tiles run past their end (ragged loops): the zero-padded shape the kernel reads.
+    pads: dict[str, tuple[int, ...]] = field(default_factory=dict)
     # Filled in by the passes below.
     tiles: list[tuple[int, ...]] = field(default_factory=list)  # parallel block indices of every tile, in loop order
     constant_tiles: list[tuple[int, ...]] = field(default_factory=list)  # tiles a static tile mask skips
@@ -295,7 +308,17 @@ class Specialization:
         return [p for p in self.nest.params if p not in self.scalars]
 
     def input_shape(self, param: str) -> tuple[int, ...]:
+        """The shape of the array the kernel reads: the input's, or zero-padded to whole tiles (`pads`)."""
+        return self.pads.get(param) or self.given_shape(param)
+
+    def given_shape(self, param: str) -> tuple[int, ...]:
+        """The input's own shape."""
         return tuple(self.specs[self.nest.params.index(param)].shape)
+
+    @property
+    def ragged(self) -> bool:
+        """Do some tiles run past the end of an input or output (zero-padded reads, dropped writes)?"""
+        return bool(self.pads) or any(o.padded for o in self.outputs)
 
     def input_dtype(self, param: str) -> np.dtype:
         return np.dtype(self.specs[self.nest.params.index(param)].dtype)
@@ -308,7 +331,9 @@ class Specialization:
     def operand(self, node: ast.Subscript, phase: int | None) -> Operand:
         """The operand a tile slice of an input refers to (`node` may be a copy of the collected read)."""
         op = self._reads.get((node.value.id, ast.dump(node.slice), phase))
-        if op is None:  # not one of the collected reads (`_reads` stays as collected: it keys the trace cache)
+        # Not one of the collected reads (`_reads` stays as collected: it keys the trace cache). Defensive: every
+        # caller passes a collected read or a copy of one.
+        if op is None:  # pragma: no cover
             block = self.resolve_input(node, phase)
             op = next((o for o in self.operands if (o.param, o.block.key) == (node.value.id, block.key)), None)
             if op is None:
@@ -349,9 +374,13 @@ class UserCode:
         ast.fix_missing_locations(wrapped)
         return compile(wrapped, self.filename, mode)
 
-    def run_prologue(self, env: dict[str, Any]) -> None:
-        """Run the prologue in `env`, one statement at a time so a failure names its line."""
+    def run_prologue(self, env: dict[str, Any], tuned: Collection[str] = ()) -> None:
+        """Run the prologue in `env`, one statement at a time so a failure names its line. Block sizes declared
+        with `autokernel.tile` that are among `tuned` keep their values in `env` (the declaration is skipped)."""
+        skip = {id(s) for name, s in tiles.declarations(self.nest.prologue, env).items() if name in tuned}
         for s in self.nest.prologue:
+            if id(s) in skip:
+                continue
             try:
                 exec(self.compile([s], "exec"), env)
             except Exception as e:
@@ -393,6 +422,8 @@ class Environment:
     # Inputs that are views of another array (`views.ViewMap`): the kernel is given that base array and
     # copies the windows of it that the tiles of the view are.
     views: dict[str, ViewMap] = field(default_factory=dict)
+    # Block sizes declared with `autokernel.tile` whose values `names` fixes (tuned ones, for a per-shard kernel).
+    tuned: frozenset[str] = frozenset()
 
 
 def environment(fn: Callable | Environment) -> Environment:
@@ -447,7 +478,7 @@ def specialize(
     env = dict(source.names)
     env.update(overrides or {})
     env.update(zip(nest.params, specs, strict=True))
-    code.run_prologue(env)
+    code.run_prologue(env, set(overrides or {}) | source.tuned)
     consts = {k: v for k, v in env.items() if k not in nest.params}
 
     loops = {lp.var: _bounds(lp, code, env, nest) for lp in nest.loops}
@@ -472,6 +503,7 @@ def specialize(
     spec.tiles, spec.constant_tiles, spec.tile_mask_runtime = _tile_mask(spec)
     spec.phase_masks, spec.phase_runtime = _phase_masks(spec)
     _check_masked_reads(spec)
+    spec.pads = _input_pads(spec)
     spec.outputs = _outputs(spec)
     spec.single_step = _single_step(spec)
     spec.operands = _collect_operands(spec)
@@ -496,13 +528,11 @@ def _single_step(spec: Specialization) -> bool:
 def _accumulators(spec: Specialization) -> list[Accumulator]:
     """The reductions' zero-initialised accumulators (see `Accumulator`), where every step of the reduction runs."""
     found = []
-    if not spec.single_step:  # see `Accumulator`
+    if not spec.single_step:  # see `Accumulator`; so no mask can skip a phase's (one) step
         return found
     segments = [u for u in spec.units if u.kind == "segment"]
     bodies = [u for u in spec.units if u.kind == "body"]
     for p in range(len(spec.phases)):
-        if spec.phase_masks[p] is not None or spec.phase_runtime[p]:
-            continue  # a skipped first step (or an empty phase) would leave the zeros unwritten
         seg, body = segments[p].statements, bodies[p].statements
         for n, init in enumerate(seg):
             var = assigned_name(init)
@@ -542,7 +572,7 @@ def _is_zeros(spec: Specialization, value: ast.expr) -> bool:
         return False
     try:
         fill = _constant_fill(spec, spec.code.compile(value, "eval"))
-    except Exception:
+    except Exception:  # pragma: no cover - defensive: `_constant_fill` returns None for what it can't follow
         return False
     return fill is not None and not isinstance(fill, bool) and fill == 0
 
@@ -587,15 +617,18 @@ def _narrow_int(dtype: Any) -> bool:
 def _bounds(lp: Loop, code: UserCode, env: dict[str, Any], nest: LoopNest) -> LoopBounds:
     what = f"`range` argument of loop `{lp.var}`"
     start, stop, step = (code.eval_int(e, what, env) for e in (lp.start, lp.stop, lp.step))
-    if step <= 0 or start % step or (stop - start) % step or stop <= start:
+    if step <= 0 or start % step or stop <= start:
         raise nest.error(
             lp.node,
             f"loop `{lp.var}`: range({start}, {stop}, {step}) must be non-empty, positive-step and aligned "
-            "(start and stop-start divisible by step)",
+            "(start divisible by step)",
         )
-    if start < _INT32_MIN or stop - step > _INT32_MAX:
+    # A ragged loop (`stop - start` not a multiple of `step`): its last tile is a whole tile running past
+    # `stop`, reading zeros past the end of an input and dropping what it writes past the end of an output.
+    whole = start + -(-(stop - start) // step) * step
+    if start < _INT32_MIN or whole - step > _INT32_MAX:
         raise nest.error(lp.node, f"loop `{lp.var}`: range({start}, {stop}, {step}) doesn't fit the kernel's int32")
-    return LoopBounds(lp.var, start, stop, step)
+    return LoopBounds(lp.var, start, whole, step, None if whole == stop else stop)
 
 
 _INT32_MIN, _INT32_MAX = int(np.iinfo(np.int32).min), int(np.iinfo(np.int32).max)
@@ -767,6 +800,34 @@ def _loop_dim(
     return lb
 
 
+def _padded_shape(spec: Specialization, index: ast.expr, full: tuple[int, ...]) -> tuple[int, ...]:
+    """`full` grown to cover the tiles of `index` whose last one starts inside a dim but runs past its end
+    (a ragged loop's last tile, or a loop whose tiles overrun the dim): those read zeros there and drop what
+    they write there. Unchanged when every tile fits; tiles that don't fit otherwise are `_loop_dim`'s error."""
+    dims = list(index.elts) if isinstance(index, ast.Tuple) else [index]
+    shape = list(full)
+    for d, sl in enumerate(dims[: len(full)]):
+        if not (isinstance(sl, ast.Slice) and isinstance(sl.lower, ast.Name) and sl.lower.id in spec.loops):
+            continue
+        lb = spec.loops[sl.lower.id]
+        if lb.start >= 0 and lb.stop > full[d] > lb.stop - lb.step:
+            shape[d] = max(shape[d], lb.stop)
+    return tuple(shape)
+
+
+def _input_pads(spec: Specialization) -> dict[str, tuple[int, ...]]:
+    """The inputs some tiles read past the end of, and the zero-padded shapes the kernel reads instead."""
+    nest = spec.nest
+    trees = [*(s for u in spec.units for s in u.statements), *(st.value for st in nest.stores)]
+    pads: dict[str, tuple[int, ...]] = {}
+    for node in _input_reads(nest, trees, spec.scalars):
+        given = spec.given_shape(node.value.id)
+        grown = _padded_shape(spec, node.slice, pads.get(node.value.id, given))
+        if grown != given:
+            pads[node.value.id] = grown
+    return pads
+
+
 def _tile_size(upper: ast.expr | None, var: str) -> ast.expr | None:
     """T in an upper bound written `var + T` or `T + var`."""
     if isinstance(upper, ast.BinOp) and isinstance(upper.op, ast.Add):
@@ -818,6 +879,8 @@ def _view_window(spec: Specialization, param: str, block: Block) -> Window | Non
     if vmap is None:
         return None
     nest = spec.nest
+    if param in spec.pads:
+        raise ViewError(param, f"{nest.fn_name}: tiles of `{param}`, a view, run past its end")
     # A mask or an allocation reading the view's values runs outside the kernel, on the view itself.
     guards = [nest.guard, *(r.guard for r in nest.reductions)]
     if any(g is not None and param in reads(g) and reads_inputs(nest, g) for g in guards):
@@ -884,7 +947,8 @@ def _outputs(spec: Specialization) -> list[OutputSpec]:
         if not isinstance(out, jax.ShapeDtypeStruct):
             raise nest.error(output.alloc, "an output allocation must produce a single array")
         store = stores[output.var]
-        block = _resolve_block(spec, f"{output.var}.at", store.index, tuple(out.shape), par_vars)
+        padded = _padded_shape(spec, store.index, tuple(out.shape))
+        block = _resolve_block(spec, f"{output.var}.at", store.index, padded, par_vars)
         if block.dynamic:
             raise nest.error(store.node, f"`{output.var}`'s tiles can't be placed by a runtime index")
         tiled_by = [v for v in block.loops if v]
@@ -904,7 +968,7 @@ def _outputs(spec: Specialization) -> list[OutputSpec]:
                 f"parallel loop `{var}` tiles two dims of `{output.var}`, so the tiles only cover its block "
                 "diagonal; every output element must be produced by the kernel",
             )
-        for d, (var, n, t) in enumerate(zip(block.loops, out.shape, block.shape, strict=True)):
+        for d, (var, n, t) in enumerate(zip(block.loops, padded, block.shape, strict=True)):
             covered = (spec.loops[var].start, spec.loops[var].stop) == (0, n) if var else t == n
             if not covered and output.keeps:
                 partial = True
@@ -916,7 +980,8 @@ def _outputs(spec: Specialization) -> list[OutputSpec]:
                 )
         ref = spec.names.fresh(f"{output.var}_ref")
         fill = _constant_fill(spec, alloc)
-        outputs.append(OutputSpec(output.var, ref, out, block, output.alloc, fill, partial))
+        grown = padded if padded != tuple(out.shape) else ()
+        outputs.append(OutputSpec(output.var, ref, out, block, output.alloc, fill, partial, grown))
     return outputs
 
 
@@ -929,7 +994,7 @@ def _constant_fill(spec: Specialization, alloc: Any) -> Scalar | None:
     """
     try:
         closed = jax.make_jaxpr(lambda *xs: eval(alloc, spec.namespace(xs)))(*spec.specs)
-    except Exception:
+    except Exception:  # pragma: no cover - defensive: callers have traced (or guard) the same code already
         return None
     jaxpr = closed.jaxpr
     uniform = {
@@ -1330,7 +1395,7 @@ def _state(
         }:
             break
         types = joined
-    else:
+    else:  # pragma: no cover - defensive: the joined types only widen, in a lattice far shorter than 16
         raise nest.error(nest.parallel[0].node, f"the types of {sorted(needs)} don't settle between steps")
     state: dict[str, StateVar] = {}
     casts: dict[int, np.dtype] = {}
@@ -1448,10 +1513,8 @@ def _sub_jaxprs(eqn: Any) -> list[Any]:
     found = []
     for value in eqn.params.values():
         for v in value if isinstance(value, (tuple, list)) else (value,):
-            if isinstance(v, jax.extend.core.ClosedJaxpr):
+            if isinstance(v, jax.extend.core.ClosedJaxpr):  # since jax 0.11 also a Jaxpr (its own `.jaxpr`)
                 found.append(v.jaxpr)
-            elif isinstance(v, jax.extend.core.Jaxpr):
-                found.append(v)
     return found
 
 
@@ -1563,7 +1626,7 @@ def _check_narrow_scalars(spec: Specialization) -> None:
 
         try:
             closed = jax.make_jaxpr(run)(*(aval for aval, _ in env.values()))
-        except Exception as e:
+        except Exception as e:  # pragma: no cover - defensive: `_trace_tile` traced the same code in these types
             raise nest.error(node, f"couldn't trace the tile body ({type(e).__name__}: {e})") from None
         given = {v: n for v, (_, n) in zip(closed.jaxpr.invars, env.values(), strict=True) if n is not None}
         problem, outs = _follow_narrow(closed.jaxpr, given)

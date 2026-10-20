@@ -235,3 +235,110 @@ def test_vmap_with_a_sharded_runtime_mask():
     for g, keep in zip(grads, keeps, strict=True):
         kept = np.repeat(np.repeat(np.asarray(keep), 128, 0), 128, 1).astype(np.float32)
         close(g, kept * 2.0 * (N // 128))
+
+
+# --------------------------------------------------------------------------- what can't be split, and why
+
+
+@pytest.mark.parametrize("explicit", [True, False])
+def test_an_input_split_over_an_axis_of_size_one(explicit):
+    kernel = autokernel.tpu(matmul)
+    m = mesh((DEVICES, 1), ("d", "one"), explicit=explicit)
+    x, y = rand((M, K)), rand((K, N), 1)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # nothing gathered
+        warnings.filterwarnings("ignore", message=".*interpreter")
+        out = kernel(shard(x, m, "one", None), y)
+    close(out, plain_matmul(x, y))
+    # An Explicit mesh's axes are in the input's type, so the kernel runs under a shard_map (of one shard);
+    # with Auto axes it isn't sharded at all.
+    assert bool(kernel._shard_plans) == explicit
+
+
+def symmetric(x):
+    out = jnp.zeros((M, M))
+    for i in range(0, M, 128):
+        for j in range(0, M, 128):
+            out = out.at[i : i + 128, j : j + 128].set(x[i : i + 128, j : j + 128] + x[j : j + 128, i : i + 128].T)
+    return out
+
+
+def test_an_input_read_along_a_loop_in_two_dims_is_gathered():
+    kernel = autokernel.tpu(symmetric)
+    x = rand((M, M))
+    with pytest.warns(UserWarning, match="input `x` is read both along loop `i` and otherwise"):
+        out = kernel(shard(x, mesh(), "d", None))
+    close(out, x + x.T)
+
+
+ROWS = 200  # not a whole number of 64-row tiles
+
+
+def ragged_rows(x):
+    out = jnp.zeros((ROWS, N))
+    for i in range(0, ROWS, 64):
+        out = out.at[i : i + 64, :].set(x[i : i + 64, :] * 2.0)
+    return out
+
+
+def test_an_output_with_a_ragged_last_tile_is_not_split():
+    x = rand((M, N))  # the tiles read 256 rows; the output keeps the first 200
+    with pytest.warns(UserWarning, match="`out`'s last tiles run past its end"):
+        out = autokernel.tpu(ragged_rows)(shard(x, mesh(), "d", None))
+    close(out, x[:ROWS] * 2.0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # the same gathering warns once
+        warnings.filterwarnings("ignore", message=".*interpreter")
+        out = autokernel.tpu(ragged_rows)(shard(x, mesh(), "d", None))
+    close(out, x[:ROWS] * 2.0)
+
+
+def update_columns(x, y):
+    out = y
+    for i in range(0, M, TM):
+        out = out.at[i : i + TM, 0:128].set(x[i : i + TM, 0:128] * 2.0)
+    return out
+
+
+def test_an_output_keeping_an_input_s_values_is_not_split():
+    x, y = rand((M, N)), rand((M, N), 1)
+    with pytest.warns(UserWarning, match="`out` keeps values of its allocation that a shard can't compute alone"):
+        out = autokernel.tpu(update_columns)(shard(x, mesh(), "d", None), y)
+    close(out, y.at[:, :128].set(x[:, :128] * 2.0))
+
+
+def scaled_by_rows(x):
+    rows = jnp.shape(x)[0]  # a shard's kernel would see its own rows
+    out = jnp.zeros((M, N))
+    for i in range(0, M, TM):
+        out = out.at[i : i + TM, :].set(x[i : i + TM, :] * rows)
+    return out
+
+
+def test_an_input_used_whole_is_gathered():
+    kernel = autokernel.TpuKernel(scaled_by_rows)  # one nest, run as a kernel
+    x = rand((M, N))
+    with pytest.warns(UserWarning, match="its per-shard kernel fails: input `x` is split, but the code uses it whole"):
+        out = kernel(shard(x, mesh(), "d", None))
+    close(out, x * M)
+    assert all(not p.loops for p in kernel._shard_plans.values())  # nothing split
+
+
+def global_shapes(x):
+    rows = len(x)
+    scale = x.size / (rows * x.shape[1])  # the global sizes in each shard's kernel too: 1.0
+    out = jnp.zeros((rows, N))
+    for i in range(0, rows, TM):
+        out = out.at[i : i + TM, :].set(x[i : i + TM, :] * scale)
+    return out
+
+
+def test_shapes_read_by_the_code_stay_global_per_shard():
+    kernel = autokernel.TpuKernel(global_shapes)
+    x = rand((M, N))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # the rows split
+        warnings.filterwarnings("ignore", message=".*interpreter")
+        out = kernel(shard(x, mesh(), "d", None))
+    close(out, x)
+    assert out.sharding.spec == P("d", None) and kernel._local

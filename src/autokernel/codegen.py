@@ -158,7 +158,7 @@ def check_layout(spec: Specialization, lanes: int) -> list[str]:
         )
     for out in spec.outputs:
         shape = out.block.kernel_shape
-        full = out.block.kept(tuple(out.out.shape))
+        full = out.block.kept(tuple(out.kernel_out.shape))
         what = f"output `{out.var}[{out.block.text}]` tile {shape}"
         problems += hardware.check_block(what, shape, full, out.out.dtype, lanes)
     return problems
@@ -196,6 +196,11 @@ def _scalar_src(value: Any) -> str:
     if isinstance(value, float) and not math.isfinite(value):
         return f"float('{value}')"
     return repr(value)
+
+
+def _pad_widths(shape: Sequence[int], padded: Sequence[int]) -> str:
+    """`jnp.pad`'s widths growing `shape` to `padded` at the end of each dim."""
+    return repr(tuple((0, p - n) for n, p in zip(shape, padded, strict=True)))
 
 
 def _indent(lines: Sequence[str], depth: int = 1) -> list[str]:
@@ -1178,11 +1183,17 @@ class Emitter:
             smem.append(self.fscalars_ref)
 
         for var, init in self.aliased.items():
-            alloc = next(o.alloc for o in spec.outputs if o.var == var)
-            self.used_names |= reads(alloc)
-            alloc = _Rename({**self.renamed, **param}).visit(copy.deepcopy(alloc))
-            lines.append(f"{init} = {ast.unparse(alloc)}  # skipped tiles keep these values")
+            out = next(o for o in spec.outputs if o.var == var)
+            self.used_names |= reads(out.alloc)
+            alloc = ast.unparse(_Rename({**self.renamed, **param}).visit(copy.deepcopy(out.alloc)))
+            if out.padded:
+                alloc = f"jnp.pad({alloc}, {_pad_widths(out.out.shape, out.padded)})"
+            lines.append(f"{init} = {alloc}  # skipped tiles keep these values")
             inits.append(init)
+        for p in spec.arrays:  # inputs whose last tiles run past their end: zeros there
+            if p in spec.pads:
+                widths = _pad_widths(spec.given_shape(p), spec.pads[p])
+                lines.append(f"{param[p]} = jnp.pad({param[p]}, {widths})  # its last tiles run past its end")
         return lines, smem, inits
 
     def _wrapper(self, kernel: str) -> list[str]:
@@ -1190,12 +1201,12 @@ class Emitter:
         smem, anyspace = "pl.BlockSpec(memory_space=pltpu.SMEM)", "pl.BlockSpec(memory_space=pl.ANY)"
         prep, smem_args, inits = self._wrapper_inputs()
         in_specs = [smem] * len(smem_args) + [anyspace] * (len(self.hbm) + len(inits))
-        outs = [f"jax.ShapeDtypeStruct({tuple(o.out.shape)}, {_dtype_src(o.out.dtype)})" for o in spec.outputs]
+        outs = [f"jax.ShapeDtypeStruct({tuple(o.kernel_out.shape)}, {_dtype_src(o.out.dtype)})" for o in spec.outputs]
         out_shape = f"({', '.join(outs)},)" if nest.returns_tuple else outs[0]
         out_specs = f"({', '.join([anyspace] * len(outs))},)" if nest.returns_tuple else anyspace
 
         param = self._params()
-        lines = [f"def {nest.fn_name}_pallas({', '.join(param.values())}, *, interpret=False):"]
+        lines = [f"def {nest.fn_name}_pallas({', '.join([*param.values(), '*', 'interpret=False'])}):"]
         lines.append(f"    # No grid: one loop over {self._describe()}{self._buffering()}.")
         lines += _indent(prep)
         args = [*smem_args, *[param[p] for p in self.hbm], *inits]
@@ -1203,8 +1214,10 @@ class Emitter:
         params = [f"vmem_limit_bytes={self.vmem_limit}"] + (
             ['dimension_semantics=("parallel",)'] if self.cores > 1 else []
         )
+        cropped = any(o.padded for o in spec.outputs)
+        result = self._n("out") if cropped else None
         lines += [
-            "    return pl.pallas_call(",
+            f"    {result} = pl.pallas_call(" if cropped else "    return pl.pallas_call(",
             f"        {kernel},",
             f"        out_shape={out_shape},",
             *([f"        grid=({self.cores},),"] if self.cores > 1 else []),
@@ -1220,6 +1233,13 @@ class Emitter:
             f"        name={nest.fn_name!r},",
             f"    )({', '.join(args)})",
         ]
+        if cropped:  # what the last tiles wrote past the outputs' ends is dropped
+            crops = [f"{result}[{k}]" if nest.returns_tuple else result for k in range(len(spec.outputs))]
+            crops = [
+                f"{c}[{', '.join(f':{n}' for n in o.out.shape)}]" if o.padded else c
+                for c, o in zip(crops, spec.outputs, strict=True)
+            ]
+            lines.append(f"    return ({', '.join(crops)},)" if nest.returns_tuple else f"    return {crops[0]}")
         return lines
 
     def prepare(self, name: str) -> list[str]:
@@ -1233,9 +1253,6 @@ class Emitter:
         weak = [*_WEAK.format(name=self.weak).splitlines(), "", ""] if helpers and self.weak is not None else []
         body = [*weak, *helpers, *prep, f"return [{', '.join(smem)}], [{', '.join(inits)}]"]
         return self._contained(name, ", ".join(self._params().values()), body)
-
-    def scratch(self) -> list[str]:
-        return self._scratch()
 
     def arg_groups(self) -> dict[str, list[str]]:
         return self._arg_groups()

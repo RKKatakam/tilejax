@@ -16,7 +16,7 @@ import pytest
 from helpers import rand
 
 import autokernel
-from autokernel import AutoKernelError, api, frontend
+from autokernel import AutoKernelError, api, frontend, scopes
 
 M, N, T = 16, 128, 8
 LR = 0.5
@@ -219,7 +219,7 @@ def test_free_loads_of_nested_functions_and_classes():
             """
         )
     ).body
-    loads = {n.id for n in api._free_loads(body, api._binds(body, False))}
+    loads = {n.id for n in scopes.global_loads(body, scopes.binds(body))}
     assert loads == {"D", "K", "R", "G", "W", "E", "Base", "Z", "V", "U"}
 
 

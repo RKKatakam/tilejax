@@ -94,7 +94,7 @@ def test_invalid_candidates_are_dropped_with_a_reason():
     rejected = [c for c in kern.tuning(bf16(S, S), bf16(S, S)) if c.error is not None]
     assert len(rejected) == 3 and all(c.error for c in rejected)
     assert any("multiple of 128" in c.error for c in rejected)  # TN=32 breaks the lane rule
-    assert any("aligned" in c.error for c in rejected)  # TM=96 doesn't divide 2048
+    assert any("would be ragged" in c.error for c in rejected)  # TM=96 doesn't divide 2048
 
 
 def test_no_valid_candidate_is_an_error():

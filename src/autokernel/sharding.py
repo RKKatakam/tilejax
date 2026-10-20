@@ -32,6 +32,7 @@ from jax.sharding import NamedSharding, PartitionSpec
 
 from . import frontend
 from .analysis import Specialization
+from .errors import AutoKernelError
 
 __all__ = ["ShardPlan", "find_mesh", "gather_all", "local_nest", "local_specs", "plan", "run"]
 
@@ -70,7 +71,13 @@ def _sharding(x: Any) -> NamedSharding | None:
         return None
     if any(math.prod(s.mesh.shape[a] for a in _axes(p)) > 1 for p in s.spec if p is not None):
         return s
-    return None
+    # Split only over axes of size 1: nothing to split, but an Explicit mesh's axes are in the value's type,
+    # which a pallas_call outside a shard_map rejects.
+    return s if _is_explicit(s.mesh) else None
+
+
+def _is_explicit(mesh: Any) -> bool:
+    return any(t == jax.sharding.AxisType.Explicit for t in getattr(mesh, "axis_types", ()))
 
 
 def _axes(entry: Any) -> tuple[str, ...]:
@@ -160,12 +167,15 @@ def _splittable(spec: Specialization) -> tuple[dict[str, dict[str, int]], dict[s
                 why[var] = f"input `{p}` is read both along loop `{var}` and otherwise"
                 break
             d = found[0][0]
-            if spec.input_shape(p)[d] != lb.stop:
+            if spec.given_shape(p)[d] != lb.stop:
                 why[var] = f"loop `{var}` covers only part of `{p}`'s dim {d}"
                 break
             dims[p] = d
         else:
             for out in spec.outputs:
+                if out.padded:
+                    why[var] = f"`{out.var}`'s last tiles run past its end"
+                    break
                 if getattr(out, "partial", False) or (masked and out.fill is None):
                     why[var] = f"`{out.var}` keeps values of its allocation that a shard can't compute alone"
                     break
@@ -184,7 +194,7 @@ def plan(spec: Specialization, mesh: Any, arg_specs: Sequence[PartitionSpec | No
     """How to run the kernel specialised as `spec` on arguments sharded as `arg_specs` over `mesh`."""
     nest = spec.nest
     splittable, why, indexers = _splittable(spec)
-    explicit = any(t == jax.sharding.AxisType.Explicit for t in getattr(mesh, "axis_types", ()))
+    explicit = _is_explicit(mesh)
     assigned: dict[str, tuple[str, ...]] = {}
     gathered: list[tuple[str, int, str]] = []
     used_axes: set[str] = set()
@@ -289,7 +299,7 @@ def local_nest(spec: Specialization, shard_plan: ShardPlan) -> tuple[frontend.Lo
     nest = spec.nest
     shards = {v: n for v, _, n in shard_plan.loops}
     fdef = copy.deepcopy(nest.fdef)
-    arrays = {p: tuple(spec.input_shape(p)) for p in nest.params if p not in spec.scalars}
+    arrays = {p: tuple(spec.given_shape(p)) for p in nest.params if p not in spec.scalars}
     _GlobalShapes(arrays).visit(fdef)
     extra: dict[str, Any] = {FULL: jnp.full}
     outputs = {o.var: o for o in spec.outputs}
@@ -308,10 +318,25 @@ def local_nest(spec: Specialization, shard_plan: ShardPlan) -> tuple[frontend.Lo
         extra[fill] = out.fill if out.fill is not None else 0  # without a tile mask, every element is stored
         dtype = ast.Constant(np.dtype(out.out.dtype).name)
         s.value = ast.Call(ast.Name(FULL, ast.Load()), [ast.Constant(shape), ast.Name(fill, ast.Load()), dtype], [])
+    split = {p for p, ps in zip(nest.params, shard_plan.in_specs, strict=True) if not _is_trivial(ps)}
+    for p in sorted(_whole_uses(fdef) & split):
+        # `jnp.shape(x)`, say: the shard's value would differ from the global one the kernel computes with.
+        raise AutoKernelError(f"input `{p}` is split, but the code uses it whole")
     name = f"{nest.fn_name}_shard"
     fdef.name = name
     ast.fix_missing_locations(fdef)
     return frontend.parse_function(fdef, name, nest.first_line), extra
+
+
+def _whole_uses(fdef: ast.FunctionDef) -> set[str]:
+    """Names the code reads other than through a subscript (a tile) or for their dtype or rank."""
+    parts = {
+        id(n.value)
+        for n in ast.walk(fdef)
+        if isinstance(n, ast.Subscript) or (isinstance(n, ast.Attribute) and n.attr in ("dtype", "ndim"))
+    }
+    loads = [n for n in ast.walk(fdef) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)]
+    return {n.id for n in loads if id(n) not in parts}
 
 
 class _GlobalShapes(ast.NodeTransformer):

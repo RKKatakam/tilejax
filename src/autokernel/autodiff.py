@@ -83,9 +83,8 @@ def _jvp_of_reference(base: Callable[..., Any], reference: Callable[..., Any]) -
 
     def call_jvp(primals: tuple[Any, ...], tangents: tuple[Any, ...]) -> tuple[Any, Any]:
         out = call(*primals)  # the kernel computes the primal output (differentiable again: higher orders)
+        # Some tangent is nonzero: JAX doesn't call the rule when they all are symbolic zeros.
         live = [not isinstance(t, SymbolicZero) for t in tangents]
-        if not any(live):
-            return out, jax.tree.map(_zeros_like_primal, out)
 
         def along_live(*xs: Any) -> Any:  # the reference as a function of the inputs with nonzero tangents
             it = iter(xs)

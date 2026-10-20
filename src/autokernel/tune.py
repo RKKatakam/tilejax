@@ -19,6 +19,7 @@ The search is split in two so that thousands of combinations stay cheap:
 from __future__ import annotations
 
 import ast
+import functools
 import itertools
 import time
 from collections.abc import Callable, Sequence
@@ -28,7 +29,7 @@ from typing import Any
 import jax
 import numpy as np
 
-from . import hardware
+from . import hardware, tiles
 from .analysis import Environment, UserCode, environment
 from .cost import Estimate
 from .errors import AutoKernelError
@@ -71,6 +72,7 @@ class Candidate:
     error: str | None = None  # why it can't run (invalid tiling, too much VMEM, ...)
     measured_s: float | None = None
     estimate: Estimate | None = None  # the cost model's estimate, for every valid candidate
+    cached: bool = False  # the pick of an earlier search, read from the tuning cache (see `cache`)
 
     @property
     def predicted_s(self) -> float:
@@ -161,6 +163,9 @@ class Space:
             {i for i, v in enumerate(values) if v in extents.get(name, ())} if mono else set()
             for name, values, mono in zip(self.names, self.values, self.monotone, strict=True)
         ]
+        # Loops ragged as written: a candidate making another loop ragged would change what it computes (its
+        # last tile reading zeros past an array's end), not just how fast.
+        self.ragged = _ragged_loops(nest, fn, specs)
         self.cache: dict = {}  # unit costs, shared by every combination
         self.seen: dict[Point, Candidate] = {}
         self.too_big: list[Point] = []  # combinations that don't fit in VMEM (smallest known)
@@ -200,7 +205,16 @@ class Space:
         else:
             try:
                 p = plan(self.nest, self.fn, self.specs, self.options, overrides, cost_cache=self.cache)
-                c = Candidate(overrides, p.buffers, None, estimate=p.estimate)
+                made = [lb for lb in p.spec.loops.values() if lb.ragged and lb.var not in self.ragged]
+                if made:
+                    lb = made[0]
+                    reason = (
+                        f"loop `{lb.var}` would be ragged (range({lb.start}, {lb.end}, {lb.step})): its last tile "
+                        "would read zeros past the end of an array, which can change the result"
+                    )
+                    c = Candidate(overrides, p.buffers, None, reason)
+                else:
+                    c = Candidate(overrides, p.buffers, None, estimate=p.estimate)
             except AutoKernelError as e:
                 c = Candidate(overrides, self.options.buffers, None, " ".join(str(e).split()))
                 if isinstance(e, VmemError):
@@ -279,7 +293,7 @@ class Space:
 
     def _nearest_current(self) -> Point:
         """The constants' own values (the nearest candidate, for block sizes the candidates don't include)."""
-        env = environment(self.fn).names
+        env = _prologue_env(self.nest, self.fn, self.specs)
         point = []
         for name, values, mono in zip(self.names, self.values, self.monotone, strict=True):
             current = env.get(name)
@@ -290,6 +304,18 @@ class Space:
             else:
                 point.append(len(values) // 2)
         return tuple(point)
+
+
+def _prologue_env(nest: LoopNest, fn: Callable | Environment, specs: Sequence[jax.ShapeDtypeStruct]) -> dict[str, Any]:
+    """The names the loops see: the constants, and what the prologue computes from the input shapes (block
+    sizes declared with `autokernel.tile` among them); just the constants if the prologue fails."""
+    source = environment(fn)
+    env = {**source.names, **dict(zip(nest.params, specs, strict=True))}
+    try:
+        UserCode(nest, source.filename).run_prologue(env)
+    except Exception:  # planning reports it
+        return dict(source.names)
+    return env
 
 
 def _loop_steps(nest: LoopNest) -> set[str]:
@@ -316,6 +342,24 @@ def _loop_extents(
         return extents
     except Exception:  # planning reports it
         return {}
+
+
+def _ragged_loops(nest: LoopNest, fn: Callable | Environment, specs: Sequence[jax.ShapeDtypeStruct]) -> set[str]:
+    """The loops whose range isn't a whole number of steps with the constants as written (empty when the bounds
+    can't be worked out)."""
+    try:
+        source = environment(fn)
+        env = {**source.names, **dict(zip(nest.params, specs, strict=True))}
+        code = UserCode(nest, source.filename)
+        code.run_prologue(env)
+        ragged = set()
+        for lp in nest.loops:
+            start, stop, step = (code.eval_int(e, "`range` argument", env) for e in (lp.start, lp.stop, lp.step))
+            if step > 0 and (stop - start) % step:
+                ragged.add(lp.var)
+        return ragged
+    except Exception:  # planning reports it
+        return set()
 
 
 def _same(a: Any, b: Any) -> bool:
@@ -381,7 +425,7 @@ def grid(
 ) -> list[tuple[str, tuple[Any, ...]]]:
     """The names being tuned and the values to try for each: `options.tune` with "auto" resolved."""
     used = {n.id for n in ast.walk(nest.fdef) if isinstance(n, ast.Name)}
-    computed = _prologue_names(nest)
+    computed = _prologue_names(nest) - set(tiles.declarations(nest.prologue, environment(fn).names))
     explicit = {name: values for name, values in options.tune if values != AUTO}
     for name, values in explicit.items():
         if not isinstance(values, tuple):
@@ -391,7 +435,7 @@ def grid(
         if name in computed:
             raise AutoKernelError(
                 f"{nest.fn_name}: tune[{name!r}]: `{name}` is computed in the function's prologue, so overriding it "
-                "has no effect"
+                f"has no effect; declare it as a block size to tune it: `{name} = autokernel.tile(extent, block)`"
             )
         if name not in used:
             raise AutoKernelError(f"{nest.fn_name}: tune[{name!r}]: `{name}` isn't used by the function")
@@ -428,15 +472,17 @@ def block_sizes(
     """Candidate values for every block size in the nest, and why other loop steps can't be tuned.
 
     A block size is a name used as the step of a loop (`range(0, M, TM)`) bound to an int constant in the
-    function's module globals or closure. Steps computed in the prologue (from input shapes) and steps of
-    1 (loops that index a dim) aren't block sizes. The candidates are powers of two and three times powers
-    of two between a minimum set by the tiles the loops cut (`lanes` on a tile's last axis, the dtype's
-    sublane count on its second-to-last, else `AUTO_MIN`) and `AUTO_MAX`, plus the current value and the
-    whole loop (up to `AUTO_WHOLE_MAX`); each must divide every loop it steps.
+    function's module globals or closure, or declared in the prologue with `autokernel.tile`. Other steps
+    computed in the prologue (from input shapes) and steps of 1 (loops that index a dim) aren't block sizes.
+    The candidates are powers of two and three times powers of two between a minimum set by the tiles the
+    loops cut (`lanes` on a tile's last axis, the dtype's sublane count on its second-to-last, else
+    `AUTO_MIN`) and `AUTO_MAX`, plus the current value and the whole loop (up to `AUTO_WHOLE_MAX`); each must
+    divide every loop it steps.
     """
     source = environment(fn)
     env = source.names
-    computed = _prologue_names(nest)
+    declared = set(tiles.declarations(nest.prologue, env))
+    computed = _prologue_names(nest) - declared
     shapes_env = {**env, **dict(zip(nest.params, specs, strict=True))}
     code = UserCode(nest, source.filename)
     code.run_prologue(shapes_env)
@@ -450,10 +496,13 @@ def block_sizes(
     sizes: dict[str, tuple[int, ...]] = {}
     why_not: dict[str, str] = {}
     for name, loops in loops_of.items():
-        value = env.get(name)
+        value = shapes_env.get(name) if name in declared else env.get(name)
         if name in computed:
-            why_not[name] = "is computed in the function's prologue (from the input shapes)"
-        elif name not in env:
+            why_not[name] = (
+                "is computed in the function's prologue (from the input shapes); declare it as a block size to "
+                f"tune it: `{name} = autokernel.tile(extent, block)`"
+            )
+        elif name not in env and name not in declared:
             why_not[name] = "isn't a module global or closure variable"
         elif not isinstance(value, (int, np.integer)) or isinstance(value, bool):
             why_not[name] = f"is {value!r}, not an int"
@@ -527,14 +576,27 @@ def _tile_minimums(
 # --------------------------------------------------------------------------- measuring
 
 
-def measure(candidates: list[Candidate], args: Sequence[Any], top: int) -> Lowered | None:
+def measure(
+    candidates: list[Candidate],
+    args: Sequence[Any],
+    top: int,
+    check: Callable[[Lowered], str | None] | None = None,
+) -> Lowered | None:
     """Time the `top` best-predicted block sizes on the attached TPU, then the other buffer depth of the
-    winner; the fastest, or None if none ran."""
+    winner; the fastest, or None if none ran.
+
+    `check(lowered)` runs a candidate and says why its output is wrong (None if it is right): a candidate
+    whose output disagrees with the reference is dropped before it is timed, as one that fails to run is,
+    so a miscompiled block size can't win by being fast."""
     valid = [c for c in candidates if c.lowered is not None]
     shapes = list(dict.fromkeys(_shape(c) for c in valid))  # ranked order
 
     def time_candidate(c: Candidate) -> None:
         try:
+            wrong = check(c.lowered) if check is not None else None
+            if wrong is not None:
+                c.error = f"wrong result: {wrong}"
+                return
             c.measured_s = time_kernel(c.lowered, args)
         except Exception as e:  # e.g. Mosaic rejects it: drop the candidate
             c.error = f"failed to run: {type(e).__name__}"
@@ -562,7 +624,7 @@ def time_kernel(
 ) -> float:
     """Median seconds per call on the attached TPU, after a compiling warm-up (`interpret`: in the Pallas TPU
     interpreter instead, which says nothing about TPU time but runs anywhere)."""
-    fn = jax.jit(lambda *xs: lowered.entry(*xs, interpret=interpret))
+    fn = jax.jit(functools.partial(lowered.entry, interpret=interpret))
     jax.block_until_ready(fn(*args))
     samples = []
     for _ in range(repeats):

@@ -17,3 +17,7 @@ dumps/
 
 # OS
 .DS_Store
+
+# Coverage data
+.coverage
+.coverage.*

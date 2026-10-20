@@ -199,7 +199,16 @@ def f(x, y, mask):  # positional array parameters
 ```
 
 - Loops are `range(stop)`, `range(start, stop)` or `range(start, stop, step)` with values known at trace
-  time (constants, closures, `x.shape`).
+  time (constants, closures, `x.shape`), starting on a tile (`start` a multiple of `step`).
+- **Ragged loops**: `stop - start` needn't be a multiple of `step` (`range(0, 200, 64)`). The last tile is
+  a whole tile running past the end: it reads zeros past the end of an input and what it writes past the
+  end of an output is dropped (the generated wrapper zero-pads those inputs with `jnp.pad` and crops the
+  outputs, so the kernel itself only ever sees whole tiles). Sums and matmuls need nothing more; a
+  reduction the zeros would change (a max, a softmax) masks them with the loop variable, e.g.
+  `jnp.where(k + jnp.arange(TK) < K, t, -jnp.inf)`. `reference` and `verify` read and write tiles by the
+  same rule (zeros past an array's end, writes past it dropped), so they check the kernel against plain
+  Python. Tiles must start inside the array. A ragged nest in a program runs as its own kernel (unfused),
+  and sharded inputs it tiles raggedly are gathered.
 - Every parallel loop tiles exactly one dim of every output, so no two tiles write the same block and
   the tiles cover the whole array.
 - Inputs are read through tiles: each dimension is `v:v + T` (T equal to loop `v`'s step), a constant
@@ -433,8 +442,8 @@ def matmul(x, y): ...
 ```
 
 `"auto"` tunes *block sizes*: names a loop steps by (`range(0, M, TM)`) that are int constants in the
-module or a closure. Steps computed in the prologue from input shapes, and steps of 1 (loops that index a
-dim), aren't tuned. The candidates are powers of two and three times powers of two from the smallest tile the
+module or a closure, or that the prologue declares with `autokernel.tile`. Other steps computed in the
+prologue from input shapes, and steps of 1 (loops that index a dim), aren't tuned. The candidates are powers of two and three times powers of two from the smallest tile the
 TPU layout allows for the dims the loop slices (128 on a tile's last axis, 8, 16 or 32 rows by dtype on its
 second-to-last) up to 4096, plus the constant's own value and one block for the whole loop (up to 8192: a
 single reduction step), keeping those that divide the loop. Combinations that can't fit in VMEM are pruned
@@ -466,6 +475,41 @@ the winner; the model's predictions for good block sizes are often within a few 
 and only timing tells those apart. `kernel.tuning(*args)` lists every candidate with its predicted and
 measured time, or why it was rejected (`lowered` is set only for the generated ones). [examples/tuned_matmul.py](examples/tuned_matmul.py)
 shows it. `autotune="measure"` without `tune` times the kernel as written with 2 and 3 buffers.
+
+Each measured candidate is first run and compared with the Python loops (as `verify` does, with the
+constants as written): one whose output disagrees is dropped (`error="wrong result: ..."`) before it is
+timed, so a miscompiled block size can't win by being fast. A tuned block size that would make a loop
+ragged (its last tile reading zeros past the end of an array) is rejected too, since it could change the
+result rather than just the speed.
+
+### Block sizes computed from shapes: `autokernel.tile`
+
+A block size computed in the prologue would be computed again whatever the tuner sets. Declare it instead:
+
+```python
+@autokernel.tpu(tune="auto")
+def matmul(x, y):
+    M, K = x.shape
+    N = y.shape[1]
+    TM = autokernel.tile(M, 512)  # 512 rows per tile, or all of M if smaller, unless tuned
+    TN = autokernel.tile(N, 512)
+    TK = autokernel.tile(K, 512)
+    ...
+```
+
+`autokernel.tile(extent, block)` is `min(block, extent)`; the tuner treats the name it is assigned to as a
+block size like a module constant (`"auto"`, or explicit values `tune={"TM": (256, 512)}`), and the
+kernel, `reference` and `verify` all use the tuned value.
+
+### The tuning cache
+
+A search's pick (the tuned values and buffer depth, and its measured time) is saved on disk, so later
+processes skip the search and, for `autotune="measure"`, the timing. It is keyed by the nest's code, the
+values of the constants it reads, the input shapes and dtypes, the chip, the options, and the JAX and
+autokernel versions; changing any of them searches again. A model pick is reused by model searches only;
+a measured search measures again and replaces it. After a cache hit `kernel.tuning(*args)` lists just the
+cached pick (`Candidate.cached`). Entries live in `$AUTOKERNEL_CACHE_DIR/tuning` (default
+`~/.cache/autokernel/tuning`), one small JSON file each; `AUTOKERNEL_CACHE=0` turns the cache off.
 
 ## Options
 
@@ -509,6 +553,9 @@ or `jax.ShapeDtypeStruct`s.
   to Mosaic's (sublane, 128) tiles) and must fit the chip. The kernel's VMEM limit is the chip's scoped VMEM,
   not the estimate: Mosaic takes its own scratch (spilled intermediates) from what the limit leaves, and
   limits sized from the estimate made attention-heavy kernels up to 2.7% slower on a v5e.
+- Tile code may only use operations Pallas can lower for a TPU: anything without a Pallas TPU lowering rule
+  (`jax.checkpoint` in a tile body, say) is rejected at plan time naming the line, instead of running in the
+  interpreter and failing in Mosaic on the chip.
 - Integer vector arithmetic only on 16- and 32-bit values: 8-bit elementwise math, comparisons and
   reductions (`x_i8 * 2`, `jnp.maximum(x_i8, 0)`) are rejected with an `AutoKernelError` naming the line,
   since Mosaic can't compile them on a v5e though the interpreter runs them; widen with
@@ -536,6 +583,7 @@ uv sync --extra tpu          # on a TPU VM
 
 ```bash
 uv run pytest                           # all tests: on CPU via the TPU interpreter, or natively on a TPU
+uv run pytest -n auto --cov=autokernel  # in parallel, with line coverage (the sharding subprocess included)
 uv run ruff check . && uv run ruff format --check .
 uv run python examples/splash_attention.py
 uv run python examples/transformer_block.py
@@ -548,7 +596,10 @@ uv run python benchmarks/decode.py      # decode-like MLP layers that stream the
 Besides running kernels in the interpreter (with its race detector), the tests cross-lower every kind of
 kernel to Mosaic for a v5e, and the two-TensorCore form (fused kernels with their barriers too) for a
 v5p, which catches lowering errors the interpreter can't see. `tests/test_sharding.py` runs
-`tests/sharding_cases.py` in a subprocess with four CPU devices. Timing still needs real hardware.
+`tests/sharding_cases.py` in a subprocess with four CPU devices. `tests/test_fuzz.py` compiles random
+matmul nests (dtypes, block sizes, ragged sizes, transposed and batched operands, epilogues, masks) and
+checks the kernel and the reference each against a float64 `np.einsum`, so a mistake both share can't hide.
+Tests never touch your tuning cache (`tests/conftest.py` turns it off). Timing still needs real hardware.
 
 ## Layout
 
@@ -572,7 +623,10 @@ src/autokernel/
   autodiff.py   derivatives: a custom_jvp from the Python loops, or a user `backward`; the vmap hook
   batching.py   jax.vmap: the loop nest with an extra batch loop, as one kernel
   sharding.py   sharded inputs: which loops split across devices; the per-shard kernel under shard_map
-  reference.py  the Python loops as a traceable reference (runtime masks as jnp.where)
+  reference.py  the Python loops as a traceable reference (runtime masks as jnp.where, ragged tiles)
+  tiles.py      autokernel.tile: block sizes declared in the prologue, tunable
+  cache.py      the on-disk tuning cache
+  scopes.py     Python's scoping rules: the names code binds and reads, for every pass that asks
   errors.py     AutoKernelError
 examples/       runnable examples
 benchmarks/     timing scripts for a TPU

@@ -102,10 +102,10 @@ class ViewMap:
         if jaxpr.outvars[0] is not current:
             return None
         out = jaxpr.outvars[0].aval
-        if np.dtype(out.dtype) != np.dtype(spec.dtype):
+        if np.dtype(out.dtype) != np.dtype(spec.dtype):  # pragma: no cover - every step it follows keeps the dtype
             return None
         vmap = builder.result(np.dtype(spec.dtype))
-        if vmap.shape != tuple(out.shape):  # the builder disagrees with JAX: don't guess
+        if vmap.shape != tuple(out.shape):  # pragma: no cover - the builder disagrees with JAX: don't guess
             return None
         return vmap
 
@@ -173,9 +173,9 @@ class ViewMap:
                 ranged = [(dd, kk) for dd, kk in self.dims[v] if (dd, kk) in owner]
                 if k is None or covered != ranged or covered != [(d, i) for i in range(k, len(f)) if sizes[i] > 1]:
                     raise ViewError(param, f"{where}: the tile's elements aren't in the base's order along dim {d}")
-                if length != (1 if block.squeezed[v] else block.shape[v]):
+                if length != (1 if block.squeezed[v] else block.shape[v]):  # pragma: no cover - caught above
                     raise ViewError(param, f"{where}: view dim {v} doesn't map onto one dim of the base")
-            elif length != 1:
+            elif length != 1:  # pragma: no cover - a factor ranged over always has an owning view dim
                 raise ViewError(param, f"{where}: base dim {d} would need a window of {length}")
             out.append(BaseDim(tuple(terms), const, length, v is None))
             kept_by.append(v)
@@ -382,7 +382,7 @@ class _Builder:
             return True
         if name == "squeeze":
             drop = set(p["dimensions"])
-            if any(self.dims[k] for k in drop):
+            if any(self.dims[k] for k in drop):  # pragma: no cover - JAX squeezes size-1 dims, which have no factors
                 return False
             self.dims = [d for k, d in enumerate(self.dims) if k not in drop]
             return True
@@ -428,7 +428,7 @@ class _Builder:
             dim: list[int] = []
             need = t
             while need > 1:
-                if not queue:
+                if not queue:  # pragma: no cover - JAX checked the sizes' product
                     return False
                 f = queue[0]
                 s = self.size[f]
@@ -446,7 +446,7 @@ class _Builder:
                     queue[0] = b
                     need = 1
             out.append(dim)
-        if queue:
+        if queue:  # pragma: no cover - JAX checked the sizes' product
             return False
         self.dims = out
         return True
