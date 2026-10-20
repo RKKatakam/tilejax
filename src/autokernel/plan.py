@@ -16,7 +16,13 @@ iteration's are fetched while this one's run.
 
 Inputs read element by element (`lengths[b]`) are index arrays, kept whole in SMEM: their elements are
 values in tile code, conditions in reduction masks (which the kernel then evaluates when it runs: runtime
-masks), and integer indices of tile reads (`w[expert[e], :, :]`: runtime windows).
+masks), and integer indices of tile reads (`w[expert[e], :, :]`: runtime windows) and of stores into an
+output updated in place.
+
+An output allocated as an input (`new = pool`) is that input updated in place: the kernel writes the tiles
+it stores into the input's buffer, and everything else keeps the input's values. Only such an output may be
+stored at windows index arrays choose (`new = new.at[slot[b], :, :].set(...)`, a scatter): what no tile
+stores is the input's.
 """
 
 from __future__ import annotations
@@ -171,10 +177,11 @@ class Output:
     name: str
     shape: tuple[int, ...]
     dtype: np.dtype
-    fill: Any  # the allocation's value (0 for jnp.zeros)
+    fill: Any  # the allocation's value (0 for jnp.zeros); None for an input updated in place
     tile: Tile
     value: jax.ShapeDtypeStruct  # the type of the value the tile code stores
     phase: int | None = None  # the phase whose steps each store a tile of it (None: a tile per output tile)
+    aliases: int | None = None  # the input it updates in place (its buffer is the output's), if any
 
 
 @dataclass(frozen=True)
@@ -298,6 +305,7 @@ class _Planner:
     def plan(self) -> Plan:
         outputs = self._prologue()
         self.indices = {index.name: index for index in self._index_arrays()}
+        aliased = self._aliases()
         parallel = tuple(self._range(loop) for loop in self.nest.parallel)
         reductions = tuple(self._range(loop) for loop in self.nest.reductions)
         repeat_loops = tuple(self._range(rep.loop) for rep in self.nest.repeats)
@@ -333,7 +341,7 @@ class _Planner:
             reads=reads_,
             read_phases=self.read_phases,
             outputs=tuple(
-                Output(name, *outputs[name], output_tiles[name], types.stores[name], stored_by[name])
+                Output(name, *outputs[name], output_tiles[name], types.stores[name], stored_by[name], aliased[name])
                 for name in self.nest.outputs
             ),
             carried=carried,
@@ -363,7 +371,13 @@ class _Planner:
         return outputs
 
     def _allocation(self, name: str, call: ast.expr) -> tuple[tuple[int, ...], np.dtype, Any]:
-        usage = f"allocate output `{name}` with jnp.zeros(shape, dtype) or jnp.full(shape, value, dtype)"
+        usage = (
+            f"allocate output `{name}` with jnp.zeros(shape, dtype) or jnp.full(shape, value, dtype), or as an "
+            f"input updated in place (`{name} = x`)"
+        )
+        if isinstance(call, ast.Name) and call.id in self.nest.params:  # an input updated in place
+            spec = self.inputs[self.nest.params.index(call.id)]
+            return tuple(spec.shape), np.dtype(spec.dtype), None
         if not isinstance(call, ast.Call):
             raise self.error(usage, call)
         func = self.eval(call.func)
@@ -379,6 +393,25 @@ class _Planner:
         if not np.isscalar(fill):
             raise self.error(f"output `{name}` is filled with a scalar constant, not {type(fill).__name__}", call)
         return aval.shape, aval.dtype, fill
+
+    def _aliases(self) -> dict[str, int | None]:
+        """For each output, the input it updates in place (`new = pool`), if any: an input array (not an index
+        array, which is in SMEM) that no other output updates."""
+        aliased: dict[str, int | None] = {}
+        for name in self.nest.outputs:
+            value = self.nest.allocations[name].value
+            is_input = isinstance(value, ast.Name) and value.id in self.nest.params
+            aliased[name] = self.nest.params.index(value.id) if is_input else None  # type: ignore[attr-defined]
+            if not is_input:
+                continue
+            if value.id in self.indices:  # type: ignore[attr-defined]
+                raise self.error(
+                    f"output `{name}` updates `{value.id}` in place, but `{value.id}` is an index array (in SMEM)",  # type: ignore[attr-defined]
+                    value,
+                )
+            if list(aliased.values()).count(aliased[name]) > 1:
+                raise self.error(f"two outputs update `{value.id}` in place: one may", value)  # type: ignore[attr-defined]
+        return aliased
 
     # ------------------------------------------------------------------ loops
 
@@ -704,7 +737,14 @@ class _Planner:
     ) -> Tile:
         store = self.nest.stores[name]
         tile = self._tile(name, shape, dtype, store.index, store.node)
-        uses = [w.loop for w in tile.windows if w.loop]
+        uses = [w.loop for w in tile.windows if w.loop] + [v for w in tile.windows for v in sorted(w.index_loops)]
+        scatter = next((w.index for w in tile.windows if w.index is not None), None)
+        if scatter is not None and fill is not None:
+            raise self.error(
+                f"{tile.text}: an index array places this tile, so no tile might store the rest of `{name}`: "
+                f"allocate it as an input updated in place (`{name} = x`), whose values the rest keeps",
+                scatter,
+            )
         r = self.nest.stored_in[name]
         placing = [*parallel, *([self.ranges[self.nest.reductions[r].var]] if r is not None else [])]
         for r in placing:
@@ -716,6 +756,8 @@ class _Planner:
                 )
         for window, dim in zip(tile.windows, shape, strict=True):
             r = self.ranges.get(window.loop) if window.loop else None
+            if window.index is not None:
+                continue  # a window the kernel chooses when it runs: it needn't cover the dim
             if r is None:
                 if window.offset != 0 or window.size != dim:
                     raise self.error(f"{tile.text}: dims no loop places are stored whole, with `:`", store.node)

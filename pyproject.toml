@@ -50,7 +50,7 @@ filterwarnings = [
 [tool.ruff]
 line-length = 120
 target-version = "py312"
-extend-exclude = [".venv", "*.md"]  # Markdown code blocks keep their aligned comments
+extend-exclude = [".venv", "*.md", "benchmarks/vs_vllm_kda/vllm_torchtpu"]  # (Markdown: aligned comments; vendored code)
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]

@@ -61,8 +61,11 @@ class Pipeline:
 def vmem_bytes(plan: Plan, schedule: Schedule, pipeline: Pipeline) -> int:
     """VMEM the kernel's own buffers take: input slots, output slots and fills, carried values."""
     total = sum(pipeline.slots(op.kind) * v5e.padded_bytes(op.tile.shape, op.tile.dtype) for op in plan.operands)
-    per_output = pipeline.output_buffers + (1 if schedule.fills else 0)
-    total += sum(per_output * v5e.padded_bytes(out.tile.shape, out.dtype) for out in plan.outputs)
+    total += sum(
+        (pipeline.output_buffers + (1 if schedule.fills and out.fill is not None else 0))
+        * v5e.padded_bytes(out.tile.shape, out.dtype)
+        for out in plan.outputs
+    )
     total += sum(v5e.padded_bytes(c.shape, c.dtype) for c in plan.carried.values())
     return total
 

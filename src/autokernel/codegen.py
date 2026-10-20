@@ -11,7 +11,9 @@ The kernel is a single `pl.loop` over its steps (schedule.py). Each step
    the code after it at the last step, whose stores fill output slots and start their copies to HBM.
 
 Values carried between steps live in VMEM scratch. Tiles a mask skips are written with the output's fill
-value by DMAs from a constant VMEM tile, a few at every tile, so they overlap the compute. An empty step (a
+value by DMAs from a constant VMEM tile, a few at every tile, so they overlap the compute (an output that
+is an input updated in place keeps the input's values there: its buffer is the input's,
+`input_output_aliases`). An empty step (a
 reduction loop whose mask skips all of a tile's blocks) fetches nothing and runs no body.
 
 Index arrays (inputs read element by element) are SMEM inputs. When masks read them, the entry function
@@ -191,10 +193,11 @@ class _Generator:
         self.bufs |= {out.name: n(f"{out.name}_bufs") for out in plan.outputs}
         self.sems |= {out.name: n(f"{out.name}_sems") for out in plan.outputs}
         self.refs = {c: n(f"{c}_ref") for c in plan.carried}
-        fills = plan.outputs if schedule.fills else ()
-        self.fill_bufs = {out.name: n(f"{out.name}_fill") for out in fills}
-        self.fill_sems = {out.name: n(f"{out.name}_fill_sem") for out in fills}
-        self.fill_copies = {out.name: n(f"{out.name}_fill_copy") for out in fills}
+        # The outputs whose tiles a mask skips are filled (an input updated in place keeps its values there).
+        self.filled = [out for out in plan.outputs if out.fill is not None] if schedule.fills else []
+        self.fill_bufs = {out.name: n(f"{out.name}_fill") for out in self.filled}
+        self.fill_sems = {out.name: n(f"{out.name}_fill_sem") for out in self.filled}
+        self.fill_copies = {out.name: n(f"{out.name}_fill_copy") for out in self.filled}
         self.copy_fns = {name: n(f"{name}_copy") for name in [op.name for op in plan.operands] + list(nest.outputs)}
         self.views = {op.name: n(f"{op.name}_ref") for op in plan.operands}
         # Per-tile windows consecutive tiles may share: copied only when they move; SMEM holds each one's slot.
@@ -362,6 +365,9 @@ class _Generator:
                 with w.block("scratch_shapes=["):
                     w(*self._scratch_shapes())
                 w("],")
+                aliases = self._aliases()
+                if aliases:
+                    w(f"input_output_aliases={aliases},  # outputs updated in place")
                 w(f"compiler_params=pltpu.CompilerParams(vmem_limit_bytes={v5e.VMEM_LIMIT}),")
                 w("interpret=interpret,")
                 w(f"name={self.nest.name!r},")
@@ -369,6 +375,15 @@ class _Generator:
             inputs += [param[a] for a in self.arrays]
             w(f")({', '.join(inputs)})")
         return w.text()
+
+    def _aliases(self) -> dict[int, int]:
+        """The pallas_call's input_output_aliases: each output updated in place by its input's position."""
+        before = len(self.tables) + len(self.runtime) + len(self.indices)  # (the SMEM inputs come first)
+        return {
+            before + self.arrays.index(self.nest.params[out.aliases]): k
+            for k, out in enumerate(self.plan.outputs)
+            if out.aliases is not None
+        }
 
     def _scratch_shapes(self) -> list[str]:
         lines = []
@@ -428,7 +443,7 @@ class _Generator:
                 self._moves_fn(w, op)
             for out in plan.outputs:
                 self._output_copy_fn(w, out)
-            if self.schedule.fills:
+            if self.filled:
                 self._fill_copy_fns(w)
             self._setup(w)
             self._loop(w)
@@ -633,7 +648,7 @@ class _Generator:
                 w(f"{self.blk[r.var]} = {self.table_params[FILL_TABLE % r.var]}[{f}]")
                 names.append(self.blk[r.var])
             w(f"return ({_tuple(names)})")
-        for out in self.plan.outputs:
+        for out in self.filled:
             with w.block(f"def {self.fill_copies[out.name]}({self.n_at}):"):
                 self._unpack(w, self.n_at)
                 block_of = {r.var: self.blk[r.var] for r in self.plan.parallel}
@@ -648,9 +663,9 @@ class _Generator:
         if sch.runtime:
             count = f"{self.table_params[STEP_COUNT]}[0]"
             w(f"{self.n_steps} = {count}" if sch.repeats == 1 else f"{self.n_steps} = {sch.repeats} * {count}")
-        if sch.fills:
+        if self.filled:
             w("# The fill value of the tiles the masks skip.")
-            for out in plan.outputs:
+            for out in self.filled:
                 buf = self.fill_bufs[out.name]
                 w(f"{buf}[...] = jnp.full({buf}.shape, {_literal(out.fill)}, {buf}.dtype)")
         once = [op for op in plan.operands if op.kind is Kind.ONCE]
@@ -863,7 +878,7 @@ class _Generator:
                     for out in per_tile_outs:
                         w(f"{self.copy_fns[out.name]}({zero}, {_int_expr(tile, '%', out_slots)}).wait()")
 
-            if sch.fills:
+            if self.filled:
                 with self._when(w, tile_first, "_fill_skipped_tiles"):
                     self._start_fills(w)
 
@@ -964,9 +979,9 @@ class _Generator:
         with w.block(f"def {self.local('_fills')}({c}):"):
             zero = (0,) * len(self.plan.parallel)
             with self._when(w, f"{c} >= {FILLS_IN_FLIGHT}", "_wait_for_a_fill"):
-                w(*[f"{self.fill_copies[out.name]}({zero}).wait()" for out in self.plan.outputs])
+                w(*[f"{self.fill_copies[out.name]}({zero}).wait()" for out in self.filled])
             w(f"{self.n_at} = {self.n_fill_blocks}({c})")
-            w(*[f"{self.fill_copies[out.name]}({self.n_at}).start()" for out in self.plan.outputs])
+            w(*[f"{self.fill_copies[out.name]}({self.n_at}).start()" for out in self.filled])
 
     def _drain(self, w: _Writer) -> None:
         sch, pipe = self.schedule, self.pipeline
@@ -980,8 +995,8 @@ class _Generator:
             kb = "" if out.phase is None else "0, "
             for n in range(max(0, stores - ob), stores):
                 w(f"{self.copy_fns[out.name]}({zero}, {kb}{n % ob}).wait()")
-        for _ in range(min(sch.fills, FILLS_IN_FLIGHT)):
-            w(*[f"{self.fill_copies[out.name]}({zero}).wait()" for out in self.plan.outputs])
+        for _ in range(min(sch.fills, FILLS_IN_FLIGHT) if self.filled else 0):
+            w(*[f"{self.fill_copies[out.name]}({zero}).wait()" for out in self.filled])
 
 
 def _may_stay(op: Operand, plan: Plan) -> bool:

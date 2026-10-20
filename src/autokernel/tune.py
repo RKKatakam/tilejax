@@ -3,7 +3,8 @@
 A schedule (`Config`) is the kernel's tunable (its block sizes, or whatever its fields mean) and its
 buffering (`Pipeline`). Tuning runs on the TPU, on the inputs of the call that asked for it (random inputs of
 their shapes if they are being traced, under `jax.jit`): a kernel whose masks read index arrays runs the
-steps those inputs need.
+steps those inputs need. (Random index arrays that place stores into an output updated in place hold
+distinct values: two tiles storing one window would race.)
 
 1. **Test.** Every candidate's output is compared with the loop nest run as plain JAX; a schedule that
    computes something else (or doesn't build, or doesn't compile) is out.
@@ -143,7 +144,8 @@ def _stats(plan: Plan, schedule: Schedule) -> _Stats:
 
     moved = sum(copies(op) * _bytes(op.tile.shape, op.tile.dtype) for op in plan.operands)
     for out in plan.outputs:
-        stores = schedule.tiles + schedule.fills if out.phase is None else schedule.phase_steps[out.phase]
+        fills = schedule.fills if out.fill is not None else 0  # (an input updated in place isn't filled)
+        stores = schedule.tiles + fills if out.phase is None else schedule.phase_steps[out.phase]
         moved += stores * _bytes(out.tile.shape, out.dtype)
     return _Stats(schedule.steps, moved)
 
@@ -208,13 +210,19 @@ def _smaller(kernel: Kernel, signature: Signature, config: Config) -> list[Confi
     return found + [c for _, c in sorted(near, key=lambda n: n[0])]
 
 
-def random_inputs(signature: Signature, bounds: dict[int, int] | None = None, seed: int = 0) -> list[jax.Array]:
+def random_inputs(
+    signature: Signature, bounds: dict[int, int] | None = None, seed: int = 0, distinct: frozenset[int] = frozenset()
+) -> list[jax.Array]:
     """Inputs of these shapes and dtypes to tune on: normal floats, small integers, random booleans; the
-    inputs `bounds` names (index arrays) from 0 to their bound."""
+    inputs `bounds` names (index arrays) from 0 to their bound, distinct values for those in `distinct` (as
+    far as the bound allows)."""
     keys = jax.random.split(jax.random.key(seed), len(signature))
     inputs = []
     for i, (key, (shape, dtype)) in enumerate(zip(keys, signature, strict=True)):
-        if bounds and i in bounds:
+        if bounds and i in distinct and math.prod(shape) <= bounds[i] + 1:
+            values = jax.random.permutation(key, bounds[i] + 1)[: math.prod(shape)]
+            inputs.append(values.reshape(shape).astype(dtype))
+        elif bounds and i in bounds:
             inputs.append(jax.random.randint(key, shape, 0, bounds[i] + 1).astype(dtype))
         elif jnp.issubdtype(dtype, jnp.floating):
             inputs.append(jax.random.normal(key, shape, jnp.float32).astype(dtype))
@@ -225,12 +233,22 @@ def random_inputs(signature: Signature, bounds: dict[int, int] | None = None, se
     return inputs
 
 
-def _index_bounds(kernel: Kernel, signature: Signature, start: Config) -> dict[int, int]:
+def _index_bounds(kernel: Kernel, signature: Signature, start: Config) -> tuple[dict[int, int], frozenset[int]]:
     """For each index array, the bound of the values to tune on: the furthest any loop goes (sequence
-    lengths up to a cache's size, expert offsets up to the rows, ...)."""
+    lengths up to a cache's size, expert offsets up to the rows, ...), or for one that places stores, the
+    last element of the dim it indexes; and those that place stores (their values must be distinct)."""
     plan, _ = kernel.build(signature, start.tunable)
     furthest = max(r.start + r.count * r.step for r in plan.loops)
-    return {index.param: furthest for index in plan.indices}
+    bounds = {index.param: furthest for index in plan.indices}
+    params = {index.name: index.param for index in plan.indices}
+    distinct = set()
+    for out in plan.outputs:
+        for window, dim in zip(out.tile.windows, out.shape, strict=True):
+            if window.index is not None:
+                param = params[window.index.value.id]  # type: ignore[attr-defined]
+                bounds[param] = min(bounds[param], dim - 1)
+                distinct.add(param)
+    return bounds, frozenset(distinct)
 
 
 def _reference_config(kernel: Kernel, signature: Signature, start: Config) -> Any:
@@ -296,7 +314,8 @@ def tune(kernel: Kernel, signature: Signature, arrays: Sequence[Any] | None = No
         if _concrete(arrays):
             inputs = list(arrays)  # type: ignore[arg-type]
         else:
-            inputs = random_inputs(signature, _index_bounds(kernel, signature, start))
+            bounds, distinct = _index_bounds(kernel, signature, start)
+            inputs = random_inputs(signature, bounds, distinct=distinct)
         args = [_reference_config(kernel, signature, start)] if start.tunable is not None else []
         want = kernel.reference(*inputs, *args)
         return search(
