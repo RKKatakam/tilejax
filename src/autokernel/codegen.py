@@ -5,7 +5,7 @@ The kernel is a single `pl.loop` over its steps (schedule.py). Each step
 1. decodes its tile and reduction block (arithmetic, or SMEM tables when masks skip work);
 2. starts fetching the inputs of the step `input_buffers - 1` ahead, into a ring of VMEM slots;
 3. waits for its own inputs; at a tile's first step it first starts fetching the next tile's per-tile
-   inputs, then waits for this tile's;
+   inputs, then waits for this tile's (a per-tile window the next tile shares isn't fetched again);
 4. at a tile's last step, waits until the output slot it is about to write is free;
 5. runs the tile code: the code before the reduction loop at the tile's first step, the reduction body,
    the code after it at the last step, whose stores fill output slots and start their copies to HBM.
@@ -197,6 +197,12 @@ class _Generator:
         self.fill_copies = {out.name: n(f"{out.name}_fill_copy") for out in fills}
         self.copy_fns = {name: n(f"{name}_copy") for name in [op.name for op in plan.operands] + list(nest.outputs)}
         self.views = {op.name: n(f"{op.name}_ref") for op in plan.operands}
+        # Per-tile windows consecutive tiles may share: copied only when they move; SMEM holds each one's slot.
+        self.shared = [op for op in plan.operands if op.kind is Kind.TILE and _may_stay(op, plan)]
+        self.tile_slots = n("tile_slots")
+        self.moved_fns = {op.name: n(f"{op.name}_moves") for op in self.shared}
+        self.prev_blk = {r.var: n(f"{r.var}_prev") for r in plan.parallel}
+        self.n_prev = n("prev")
         self.blk = {r.var: n(f"{r.var}_blk") for r in plan.loops}
         # The kernel's own locals and helper functions.
         self.n_step, self.n_blocks, self.n_fill_blocks = n("step"), n("blocks"), n("fill_blocks")
@@ -389,6 +395,9 @@ class _Generator:
                     f"pltpu.VMEM({out.tile.shape}, jnp.{out.dtype.name}),  # {self.fill_bufs[out.name]}",
                     "pltpu.SemaphoreType.DMA(()),",
                 ]
+        if self.shared:
+            names = ", ".join(op.name for op in self.shared)
+            lines.append(f"pltpu.SMEM(({len(self.shared)},), jnp.int32),  # {self.tile_slots}: the slots of {names}")
         return lines
 
     # ------------------------------------------------------------------ the kernel
@@ -409,11 +418,14 @@ class _Generator:
         params += list(self.refs.values())
         for out in self.fill_bufs:
             params += [self.fill_bufs[out], self.fill_sems[out]]
+        params += [self.tile_slots] if self.shared else []
         with w.block(f"def {self.kernel_name}({', '.join(params)}):"):
             self._step_fn(w)
             self._blocks_fn(w)
             for op in plan.operands:
                 self._operand_copy_fn(w, op)
+            for op in self.shared:
+                self._moves_fn(w, op)
             for out in plan.outputs:
                 self._output_copy_fn(w, out.name, out.tile)
             if self.schedule.fills:
@@ -573,6 +585,27 @@ class _Generator:
             dst = (buf, sem) if op.kind is Kind.ONCE else (f"{buf}.at[{slot}]", f"{sem}.at[{slot}]")
             w(f"return pltpu.make_async_copy({src}, {dst[0]}, {dst[1]})")
 
+    def _moves_fn(self, w: _Writer, op: Operand) -> None:
+        """`<op>_moves(at, prev)`: does the per-tile window move from tile `prev` to tile `at`?"""
+        at, prev = self.n_at, self.n_prev
+        with w.block(f"def {self.moved_fns[op.name]}({at}, {prev}):"):
+            w(f"# {op.tile.text}")
+            self._unpack(w, at)
+            w(f"{_tuple([self.prev_blk[r.var] for r in self.plan.parallel])} = {prev}")
+            now = self._window_starts(op.tile, {r.var: self.blk[r.var] for r in self.plan.parallel})
+            before = self._window_starts(op.tile, dict(self.prev_blk))
+            w(f"return {' | '.join(f'({a} != {b})' for a, b in zip(now, before, strict=True))}")
+
+    def _window_starts(self, tile: Tile, block_of: dict[str, str]) -> list[str]:
+        """Where `tile`'s window starts in each dim a loop (or index array) moves, given the loops' blocks."""
+        starts = []
+        for window, dim in zip(tile.windows, self._array_shape(tile.array), strict=True):
+            if window.index is not None:
+                starts.append(self._runtime_index(window.index, block_of, dim))
+            elif window.loop is not None and self._range(window.loop).count > 1:
+                starts.append(_scaled(block_of[window.loop], self._range(window.loop)))
+        return starts
+
     def _output_copy_fn(self, w: _Writer, name: str, tile: Tile) -> None:
         at, slot = self.n_at, self.n_slot
         with w.block(f"def {self.copy_fns[name]}({at}, {slot}):"):
@@ -622,6 +655,8 @@ class _Generator:
             w("# The first tile's per-tile inputs.")
             at0 = sch.blocks_at(0)
             w(*[f"{self.copy_fns[op.name]}({at0}, 0).start()" for op in per_tile])
+            # (A shared window's slot flips when it moves: tile 0's moves into slot 0.)
+            w(*[f"{self.tile_slots}[{k}] = 1" for k in range(len(self.shared))])
         streamed = [op for op in plan.operands if op.kind is Kind.STREAM]
         ahead = min(self.pipeline.input_buffers - 1, sch.steps)
         if not (streamed and ahead):
@@ -746,19 +781,15 @@ class _Generator:
             with self._region(w, WAIT) if per_tile or streamed else nullcontext():  # (no region to leave empty)
                 if per_tile:
                     with self._when(w, tile_first, "_tile_inputs"):
-                        with self._when(w, f"{tile} + 1 < {sch.tiles}", "_next_tile_inputs"):
-                            next_slot = _int_expr(f"{tile} + 1", "%", TILE_SLOTS)
-                            for op in per_tile:
-                                w(f"{self.copy_fns[op.name]}({self.n_blocks}({tile} + 1), {next_slot}).start()")
-                        for op in per_tile:
-                            w(f"{self.copy_fns[op.name]}({at}, {slots[Kind.TILE]}).wait()")
+                        self._tile_inputs(w, per_tile, slots[Kind.TILE])
                 for phase, ops in self._by_phase(streamed).items():
                     with self._when(w, self._runs(ph, phase, empty), f"_wait_phase{phase}"):
                         for op in ops:
                             w(f"{self.copy_fns[op.name]}({at}, {self._rb(self.n_rb)}{kb}, {slots[Kind.STREAM]}).wait()")
             for op in plan.operands:
                 buf = self.bufs[op.name]
-                view = buf if op.kind is Kind.ONCE else f"{buf}.at[{slots[op.kind]}]"
+                slot = f"{self.tile_slots}[{self.shared.index(op)}]" if op in self.shared else slots.get(op.kind)
+                view = buf if op.kind is Kind.ONCE else f"{buf}.at[{slot}]"
                 w(f"{self.views[op.name]} = {view}")
             self._loop_vars(w)
 
@@ -776,6 +807,32 @@ class _Generator:
 
             with self._region(w, COMPUTE):
                 self._tile_code(w, tile_first)
+
+    def _tile_inputs(self, w: _Writer, per_tile: list[Operand], slot: str) -> None:
+        """At a tile's first step: start the next tile's per-tile inputs, and wait for this tile's. A window the
+        previous tile had is in its slot already; one the next tile shares isn't fetched again."""
+        tile, at, blocks, slots = self.n_tile, self.n_at, self.n_blocks, self.tile_slots
+        moves = {}
+        for k, op in enumerate(self.shared):
+            moves[op.name] = self.local(f"{op.name}_moved")
+            prev = f"{blocks}(jnp.maximum({tile} - 1, 0))"
+            w(f"{moves[op.name]} = ({tile} == 0) | {self.moved_fns[op.name]}({at}, {prev})")
+            w(f"{slots}[{k}] = jnp.where({moves[op.name]}, 1 - {slots}[{k}], {slots}[{k}])")
+        with self._when(w, f"{tile} + 1 < {self.schedule.tiles}", "_next_tile_inputs"):
+            next_slot = _int_expr(f"{tile} + 1", "%", TILE_SLOTS)
+            for op in per_tile:
+                if op in self.shared:
+                    k = self.shared.index(op)
+                    with self._when(w, f"{self.moved_fns[op.name]}({blocks}({tile} + 1), {at})", f"_next_{op.name}"):
+                        w(f"{self.copy_fns[op.name]}({blocks}({tile} + 1), 1 - {slots}[{k}]).start()")
+                else:
+                    w(f"{self.copy_fns[op.name]}({blocks}({tile} + 1), {next_slot}).start()")
+        for op in per_tile:
+            if op in self.shared:
+                with self._when(w, moves[op.name], f"_wait_{op.name}"):
+                    w(f"{self.copy_fns[op.name]}({at}, {slots}[{self.shared.index(op)}]).wait()")
+            else:
+                w(f"{self.copy_fns[op.name]}({at}, {slot}).wait()")
 
     def _tile_code(self, w: _Writer, tile_first: str | None) -> None:
         """The segments and the phase bodies: the code before the phases at a tile's first step; each
@@ -859,6 +916,13 @@ class _Generator:
                 w(f"{self.copy_fns[out.name]}({zero}, {tile % pipe.output_buffers}).wait()")
         for _ in range(min(sch.fills, FILLS_IN_FLIGHT)):
             w(*[f"{self.fill_copies[out.name]}({zero}).wait()" for out in self.plan.outputs])
+
+
+def _may_stay(op: Operand, plan: Plan) -> bool:
+    """May a per-tile window be the same for consecutive tiles? If an index array places it, or a parallel
+    loop of more than one block doesn't move it."""
+    moved_by_all = all(r.var in op.tile.loops for r in plan.parallel if r.count > 1)
+    return any(w.index is not None for w in op.tile.windows) or not moved_by_all
 
 
 def _value_reads(plan: Plan) -> set[str]:

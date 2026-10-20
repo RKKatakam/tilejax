@@ -745,3 +745,31 @@ def test_updating_part_of_a_carried_value_stores_just_that_part():
     src = kernel.source(x)
     assert "acc_ref[k] = jnp.broadcast_to(x_ref[...] * 2, acc_ref.at[k].shape).astype(acc_ref.dtype)" in src
     assert "acc_ref[k, 8:16, :] = jnp.broadcast_to(acc_ref[k, 8:16, :] + 1," in src
+
+
+def test_a_per_tile_window_consecutive_tiles_share_is_fetched_once():
+    # `u[b]` is the same for every `i` of a batch, and `v[ids[i // 128]]` as long as the ids repeat.
+    kernel = make_kernel(
+        """
+        def f(x, w, u, v, ids):
+            B, M, D = x.shape
+            out = jnp.zeros((B, M, D))
+            for b in range(B):
+                for i in range(0, M, 128):
+                    t = jnp.zeros((128, D)) + u[b, 0:8, :].sum(0) + v[ids[i // 128], 0:8, :].sum()
+                    for k in range(0, D, 128):
+                        t += x[b, i : i + 128, k : k + 128] @ w[k : k + 128, :]
+                    out = out.at[b, i : i + 128, :].set(t)
+            return out
+        """
+    )
+    x, w, u, v = rand((2, 512, 256)), rand((256, 256), 1), rand((2, 8, 256), 2), rand((3, 8, 256), 3)
+    ids = jnp.array([2, 2, 0, 2], jnp.int32)
+    out = check(kernel, x, w, u, v, ids)
+    want = np.stack([f64(x[b]) @ f64(w) + f64(u[b]).sum(0) for b in range(2)])
+    want += np.repeat(np.array([f64(v[n]).sum() for n in np.asarray(ids)]), 128)[None, :, None]
+    np.testing.assert_allclose(f64(out), want, rtol=1e-4, atol=1e-3)
+    src = kernel.source(x, w, u, v, ids)
+    assert "def u_moves(at, prev):" in src and "return (b_blk != b_prev)" in src
+    assert "jnp.clip(ids_smem[i_blk * 128 // 128], 0, 2) != jnp.clip(ids_smem[i_prev * 128 // 128], 0, 2)" in src
+    assert "def x_moves" not in src and "def w_moves" not in src  # streamed
