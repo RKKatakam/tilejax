@@ -160,6 +160,44 @@ features they needed came from them:
   computes them, carrying only the recurrent state.
 - *Per-tile windows fetched once*: MoE tiles of one expert read its weights once.
 
+## A real model against vLLM: Gemma 4 E2B
+
+[gemma4.py](examples/gemma4.py) is Gemma 4 E2B's text decoder with its real weights:
+
+- **Model:** 35 layers, sliding-window and full attention with one KV head (head dim 256 / 512), KV
+  caches shared by the last 20 layers, double-wide MLPs, per-layer embeddings, soft-capped tied LM head.
+- **Generation:** greedy, prefill then every decode step in one jitted loop.
+- **Kernels:** built from [gemma4_kernels.py](examples/gemma4_kernels.py). A batch of one decodes with
+  [gemma4_megakernel.py](examples/gemma4_megakernel.py), which runs all 35 layers and the LM head as
+  one kernel.
+- **Correctness:** its greedy tokens agree with a plain-JAX reference at every position checked.
+
+The baseline is vLLM 0.31 (`vllm-tpu`, its JAX backend) on the same v5e and the same workload:
+
+- 128-token random prompts, all submitted at once;
+- 256 greedy tokens each, EOS ignored;
+- output tokens/s, wall time with prefill included.
+
+Reproduce with `benchmarks/vllm_gemma4.py` and `benchmarks/gemma4.py`.
+
+| Batch | vLLM tok/s | autokernel tok/s | | decode ms/step |
+| --- | --- | --- | --- | --- |
+| 1 | 147.9 | **158.2** | 1.07× | 6.31 |
+| 8 | 1,133.5 | **1,202.2** | 1.06× | 6.58 |
+| 32 | 3,816.1 | **4,113.1** | 1.08× | 7.43 |
+| 64 | 6,158.7 | **6,853.0** | 1.11× | 8.63 |
+| 128 | 9,088.2 | **10,294.4** | 1.13× | 11.00 |
+| 256 | 11,713.1 | **13,603.8** | 1.16× | 15.93 |
+
+**Small batches.** A decode step reads 4.5 GB of weights, about 5.5 ms at 819 GB/s. Batch 1 runs at
+6.3 ms, and its profile is copy-bound.
+
+**The one-kernel step.** It wins only at batch 1: 6.31 ms against 6.36 ms for the per-layer kernels. Its
+attention takes a step per sequence, so from batch 8 up the per-layer kernels are faster: 6.58 against
+6.70 ms at B8, 7.44 against 8.09 at B32.
+
+**Tuning** changed these by under 1% at every batch, so the table is at the default tiles.
+
 ## Writing kernels
 
 ```python
@@ -411,7 +449,7 @@ examples/       matmul, causal matmul, causal attention (+ JAX splash), RMSNorm 
                 a whole attention block, a whole transformer; Qwen3 (GQA, QK-norm, RoPE, sliding window,
                 gated attention, SwiGLU), MLA, MoE, KV-cache decoding (paged too), linear attention
                 (Gated DeltaNet, KDA), whole Qwen3 / Qwen3-MoE / DeepSeek-V3 / Kimi-K2 / Qwen3-Next /
-                Kimi-Linear-like models, a decode step in one kernel
+                Kimi-Linear-like models, a decode step in one kernel; Gemma 4 E2B with its real weights
 benchmarks/     timing and profiling scripts for a TPU v5e
 tests/
 ```

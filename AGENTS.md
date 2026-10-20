@@ -30,6 +30,8 @@ kernel for a **TPU v5e**, and tunes its schedule on the hardware. The scope is d
   - MoE: routers, dropless grouped SwiGLU experts over runtime masks and windows, shared experts (`moe.py`);
   - linear attention: chunked Gated DeltaNet and KDA (`linear_attention.py`, `linear_attention_layer.py`),
     hybrid Qwen3-Next / Kimi Linear models (`hybrid_layers.py`, `hybrid_models.py`);
+  - a real model: Gemma 4 E2B's text decoder with its weights, greedy generation against vLLM (`gemma4.py`,
+    `gemma4_kernels.py`, `gemma4_megakernel.py`);
   - decoding: GQA (contiguous, paged) and MLA attention over KV caches with per-sequence lengths
     (`decode.py`, `kv_cache.py`, `decode_model.py`), a whole decode step as one kernel with cross-layer
     prefetch (`decode_megakernel.py`), a stack of layers in one kernel (`layer_stack.py`).
@@ -138,6 +140,11 @@ Each of these was found on hardware; don't undo them without measuring again.
   call is on the "XLA Ops" line, named `<kernel>.N` (sometimes `<kernel>.N.<output>_hbm`).
 - Mosaic on a v5e has no 8-bit integer vector arithmetic and no mixed-dtype matmul (hence
   `mxu._mxu_operands` promotes); the interpreter accepts both, so cross-lowering tests matter.
+- Gemma 4 E2B (text, real weights), 128-token prompts + 256 greedy tokens: 1.06-1.16x vLLM 0.31's output
+  tokens/s at batch 1-256 (B1 158 vs 148, B256 13604 vs 11713). The one-kernel decode step (all layers, cross-layer
+  prefetch) is copy-bound at B1 (6.31 ms vs a 5.5 ms weight-read floor) and only beats three kernels per layer
+  there (6.36 ms): its attention takes a step per sequence (B32: 3429 steps, 7.49 ms vs 6.18 at B1), so the
+  per-layer kernels win from B8 (6.58 vs 6.70 ms) up. Tuning moved every batch by under 1%.
 - Mosaic and XLA can differ by one bf16 ulp on fused elementwise math, and XLA may skip an
   f32 -> bf16 -> f32 round trip in the reference (excess precision) that the kernel performs: exact
   kernel-vs-reference checks only hold in the interpreter (mark such tests `cpu`). Plain `f32 @ f32` in

@@ -96,7 +96,10 @@ B16, F32, I32 = jnp.bfloat16, jnp.float32, jnp.int32
 EPS = 1e-6
 LANES = 128
 PREFILL_CHUNK = 8192  # tokens per prefill chunk
-MEGA_MAX_BATCH = 32  # Generator decodes up to this many sequences with gemma4_megakernel.py's one-kernel step
+# Generator decodes up to this many sequences with gemma4_megakernel.py's one-kernel step. Its attention takes a
+# step per sequence; on a v5e (ms per decode step, one kernel / per-layer kernels): B1 6.31 / 6.36, B8 6.70 / 6.58,
+# B16 7.15 / 6.88, B32 8.09 / 7.44.
+MEGA_MAX_BATCH = 1
 SLIDING, FULL = "sliding_attention", "full_attention"
 E2B_TYPES = tuple(FULL if layer % 5 == 4 else SLIDING for layer in range(35))
 
