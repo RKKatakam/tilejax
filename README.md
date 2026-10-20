@@ -177,6 +177,27 @@ followed by RMSNorm and the feed-forward layer in XLA, tuned, on a v5e (bf16, ms
 | 4 | 16 | 2048 | 64 | 4096 | 6.784 | 1.837 | **1.714** | 3.96× | 1.07× |
 | 1 | 32 | 2048 | 128 | 16384 | 6.118 | 3.539 | **3.264** | 1.87× | 1.08× |
 
+**A whole transformer** ([examples/transformer.py](examples/transformer.py)): a decoder-only model,
+tokens to logits (embedding, L pre-norm layers of causal multi-head attention and a GELU feed-forward
+layer, final norm, vocab projection), as autokernel kernels composed in plain JAX on (batch, seq, d_model)
+activations, a head being a block of columns (no transposes). Per layer: the attention RMSNorm fused with
+the QKV projection; then attention, output projection, residual, RMSNorm, feed-forward layer and residual
+in one kernel of three phases. With big feed-forward weights the attention's query blocks are too few rows
+to reuse them, so the feed-forward layer can run as a kernel of its own instead: each layer runs the form
+its kernels' tuned device times say is faster. The QKV projection stays a kernel of its own: attention for
+a query block needs every earlier token's keys and values. Against the same model in plain JAX with
+splash attention, tuned, on a v5e (bf16, ms; `benchmarks/transformer.py`):
+
+| layers | d_model | heads | FFN | batch | seq | splash default | splash best | autokernel | vs default | vs best | layer |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 4 | 1024 | 8 | 4096 | 4 | 2048 | 24.200 | 11.380 | **9.225** | 2.62× | 1.23× | fused |
+| 4 | 2048 | 16 | 8192 | 2 | 2048 | 24.048 | 14.902 | **13.902** | 1.73× | 1.07× | split |
+| 2 | 2048 | 16 | 8192 | 1 | 4096 | 16.792 | 9.617 | **8.930** | 1.88× | 1.08× | fused |
+| 2 | 4096 | 32 | 16384 | 1 | 2048 | 16.553 | 13.092 | **12.721** | 1.30× | 1.03× | split |
+
+(Logits agree with the baseline to 0.03–0.05, one or two bf16 steps. Timings vary by 1–2% from run to
+run, tuning included.)
+
 **RMSNorm fused with a projection** ([examples/rmsnorm_matmul.py](examples/rmsnorm_matmul.py)): the row
 scale commutes with the matmul, `rmsnorm(x) @ w = (1 / rms(x)) * ((x * gamma) @ w)`, so one reduction
 over the model dimension accumulates `(x * gamma) @ w` on the MXU and each row's sum of squares, and the
@@ -300,7 +321,8 @@ src/autokernel/
   tilecode.py   names tile code reads and assigns; output stores
   v5e.py        the chip: memories and layout rules
   errors.py     KernelError
-examples/       matmul, causal matmul, causal attention (+ JAX splash), RMSNorm fused with a projection
+examples/       matmul, causal matmul, causal attention (+ JAX splash), RMSNorm fused with a projection,
+                a whole attention block, a whole transformer
 benchmarks/     timing and profiling scripts for a TPU v5e
 tests/
 ```

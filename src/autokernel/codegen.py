@@ -671,9 +671,15 @@ class _TileCode:
     def emit(self, stmts: tuple[ast.stmt, ...], segment: str, outside: set[str]) -> list[str]:
         """Source lines for `stmts`. The code after a phase runs in a function of its own, inside the phase's:
         an assignment there to a name in `outside` (the phase body's, and at the end, carried values') gives
-        it a fresh name from then on. Before the end, assignments to carried values store them."""
+        it a fresh name from then on. Before the end, a carried value is read from its VMEM buffer until the
+        code assigns it, is a local after that, and its last assignment stores it."""
         self.segment, self.outside = segment, outside
         self.renamed: dict[str, str] = {}
+        self.last: dict[str, int] = {}  # carried name -> id of its last assignment in `stmts`
+        if segment != "end":
+            for stmt in flatten(stmts):
+                for name in assigned([stmt]) & set(self.plan.carried):
+                    self.last[name] = id(stmt)
         lines = []
         for stmt in stmts:
             for new in self._statement(stmt):
@@ -697,6 +703,7 @@ class _TileCode:
             new.body = [s for inner in stmt.body for s in self._statement(inner)]
             return [new]
         types_ = plan.assigned_types.get(id(stmt), {})
+        original = stmt
         if isinstance(stmt, ast.AugAssign):  # `a op= b` is `a = a op b` (arrays are immutable)
             name = stmt.target.id  # type: ignore[union-attr]
             value = ast.BinOp(ast.Name(name, ast.Load()), stmt.op, stmt.value)
@@ -704,12 +711,24 @@ class _TileCode:
         assert isinstance(stmt, ast.Assign)
         value = self._expr(stmt.value)
         target = stmt.targets[0]
-        if self.segment != "end" and isinstance(target, ast.Name) and target.id in plan.carried:
+        if isinstance(target, ast.Name) and self.last.get(target.id) == id(original):  # the value to keep
             c = plan.carried[target.id]
             ref = gen.refs[c.name]
+            self.renamed.pop(c.name, None)  # read from the buffer from here on
             value = self._cast(value, types_[c.name], c.shape, c.dtype, f"{ref}.dtype")
             return [_parse_stmt(f"{ref}[...] = VALUE", VALUE=value)]
-        return [ast.Assign([self._rename_targets(copy.deepcopy(target))], value)]
+        names = [n.id for n in ast.walk(target) if isinstance(n, ast.Name)]
+        carried = [n for n in names if n in self.last]
+        for name in carried:  # values on their way: locals (`a, b = ...` unpacks into them)
+            self.renamed[name] = name
+        new = [ast.Assign([self._rename_targets(copy.deepcopy(target))], value)]
+        for name in carried:
+            if self.last[name] == id(original):  # the value to keep: store it
+                c, ref = plan.carried[name], gen.refs[name]
+                kept = self._cast(ast.Name(name, ast.Load()), types_[name], c.shape, c.dtype, f"{ref}.dtype")
+                new.append(_parse_stmt(f"{ref}[...] = VALUE", VALUE=kept))
+                self.renamed.pop(name)
+        return new
 
     def _rename_targets(self, target: ast.expr) -> ast.expr:
         """A name in `outside` gets a fresh name from its first assignment here on."""
@@ -723,12 +742,22 @@ class _TileCode:
     def _expr(self, expr: ast.expr) -> ast.expr:
         gen, plan, renamed = self.gen, self.plan, self.renamed
 
+        scalars = {r.var for r in plan.loops} | set(plan.constants)
+
         class Rewrite(ast.NodeTransformer):
             def visit_Subscript(self, node: ast.Subscript) -> ast.expr:
                 operand = plan.reads.get(read_key(node))
-                if operand is None:
-                    return self.generic_visit(node)  # type: ignore[return-value]
-                return _parse_expr(f"{gen.views[operand.name]}[...]")
+                if operand is not None:
+                    return _parse_expr(f"{gen.views[operand.name]}[...]")
+                base = node.value
+                if (
+                    isinstance(base, ast.Name)
+                    and base.id in plan.carried
+                    and base.id not in renamed
+                    and reads(node.slice) <= scalars
+                ):  # index the carried value's VMEM buffer itself: load only the part read
+                    return ast.Subscript(ast.Name(gen.refs[base.id], ast.Load()), self.visit(node.slice), ast.Load())
+                return self.generic_visit(node)  # type: ignore[return-value]
 
             def visit_Name(self, node: ast.Name) -> ast.expr:
                 if node.id in renamed:

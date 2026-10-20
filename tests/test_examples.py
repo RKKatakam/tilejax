@@ -234,3 +234,99 @@ def test_attention_block_lowers_at_scale(heads, head_dim, ffn):
     specs = (spec(2, heads, 2048, head_dim, dtype=b16),) * 3
     specs += (spec(1, d, dtype=b16), spec(d, ffn, dtype=b16), spec(ffn, d, dtype=b16))
     assert "tpu_custom_call" in lower_for_v5e(attention_block.lower(*specs), *specs)
+
+
+def _gelu(x):
+    return 0.5 * x * (1 + np.tanh(np.sqrt(2 / np.pi) * (x + 0.044715 * x**3)))
+
+
+def _rms(x, gamma, eps=1e-6):
+    return x / np.sqrt(np.mean(x * x, axis=-1, keepdims=True) + eps) * f64(gamma)
+
+
+def _transformer_layer(x, qkv, wo, gamma, w_up, w_down):
+    """A layer after its QKV projection, in float64 NumPy: attention, output projection, residual, RMSNorm,
+    feed-forward layer, residual."""
+    b, s, _ = x.shape
+    h, dh = wo.shape[0], wo.shape[1]
+    q, k, v = (f64(t).reshape(b, s, h, dh).transpose(0, 2, 1, 3) for t in np.split(f64(qkv), 3, axis=-1))
+    heads = _attention(q, k, v)  # (B, H, S, Dh); q is pre-scaled
+    resid = f64(x) + np.einsum("bhsd,hde->bse", heads, f64(wo))
+    return resid + _gelu(_rms(resid, gamma) @ f64(w_up)) @ f64(w_down)
+
+
+def _transformer(tokens, params):
+    x = f64(params["embed"])[np.asarray(tokens)]
+    for layer in params["layers"]:
+        qkv = _rms(x, layer["attn_norm"]) @ f64(layer["w_qkv"])
+        x = _transformer_layer(x, qkv, layer["wo"], layer["ffn_norm"], layer["w_up"], layer["w_down"])
+    return _rms(x, params["final_norm"]) @ f64(params["w_vocab"])
+
+
+def test_transformer_matches_numpy():
+    from transformer import Config, init_params, transformer
+
+    config = Config(layers=2, d_model=256, heads=2, ffn=512, vocab=512)
+    params = init_params(config)
+    tokens = jax.random.randint(jax.random.key(1), (2, 256), 0, config.vocab)
+    logits = jax.jit(transformer)(tokens, params)
+    want = _transformer(tokens, params)
+    assert logits.shape == (2, 256, 512)
+    np.testing.assert_allclose(f64(logits), want, atol=5e-2 * np.abs(want).max())
+
+
+@pytest.mark.parametrize(("heads", "head_dim"), [(2, 128), (4, 64)])
+def test_transformer_layer_in_three_phases(heads, head_dim):
+    from transformer import LayerTiles, transformer_layer
+
+    d, s = heads * head_dim, 256
+    keys = jax.random.split(jax.random.key(0), 6)
+    x = jax.random.normal(keys[0], (1, s, d), jnp.bfloat16)
+    qkv = jax.random.normal(keys[1], (1, s, 3 * d), jnp.bfloat16)
+    qkv = qkv.at[:, :, :d].multiply(head_dim**-0.5)
+    wo = (jax.random.normal(keys[2], (heads, head_dim, d)) / d**0.5).astype(jnp.bfloat16)
+    gamma = jnp.ones((1, d), jnp.bfloat16)
+    w_up = (jax.random.normal(keys[3], (d, 1024)) / d**0.5).astype(jnp.bfloat16)
+    w_down = (jax.random.normal(keys[4], (1024, d)) / 32).astype(jnp.bfloat16)
+    args = (x, qkv, wo, gamma, w_up, w_down, LayerTiles(block_q=128, block_kv=128, block_f=256))
+    out = run_checking_races(transformer_layer, *args)
+    want = _transformer_layer(*args[:6])
+    np.testing.assert_allclose(f64(out), want, atol=3e-2 * np.abs(want).max())
+    transformer_layer.verify(*args)
+    lowered = transformer_layer.lower(*args)
+    assert [phase.range.var for phase in lowered.plan.phases] == ["j", "hh", "f"]
+    assert "heads_ref[hh]" in lowered.source  # a head of the carried attention output, read from VMEM directly
+
+
+@pytest.mark.parametrize(
+    ("d", "heads", "ffn"), [(1024, 8, 4096), (2048, 16, 8192), (1024, 16, 4096), (4096, 32, 16384)]
+)
+def test_transformer_layer_lowers_at_scale(d, heads, ffn):
+    from transformer import transformer_layer
+
+    b16, dh = jnp.bfloat16, d // heads
+    specs = (spec(2, 2048, d, dtype=b16), spec(2, 2048, 3 * d, dtype=b16), spec(heads, dh, d, dtype=b16))
+    specs += (spec(1, d, dtype=b16), spec(d, ffn, dtype=b16), spec(ffn, d, dtype=b16))
+    assert "tpu_custom_call" in lower_for_v5e(transformer_layer.lower(*specs), *specs)
+
+
+def test_transformer_split_layer_matches_numpy():
+    from transformer import Config, FfnTiles, LayerTiles, attention_layer, ffn_layer, fuse_ffn, init_params, split_layer
+
+    config = Config(layers=1, d_model=256, heads=2, ffn=1024, vocab=256)
+    layer = init_params(config)["layers"][0]
+    keys = jax.random.split(jax.random.key(0), 2)
+    x = jax.random.normal(keys[0], (1, 256, 256), jnp.bfloat16)
+    qkv = jax.random.normal(keys[1], (1, 256, 768), jnp.bfloat16).at[:, :, :256].multiply(128**-0.5)
+    want = _transformer_layer(x, qkv, layer["wo"], layer["ffn_norm"], layer["w_up"], layer["w_down"])
+    out = split_layer(x, qkv, layer)
+    np.testing.assert_allclose(f64(out), want, atol=3e-2 * np.abs(want).max())
+    tiles = LayerTiles(block_q=128, block_kv=128)
+    run_checking_races(attention_layer, x, qkv, layer["wo"], tiles)
+    attention_layer.verify(x, qkv, layer["wo"], tiles)
+    rows = x.reshape(256, 256)
+    ffn_tiles = FfnTiles(rows=128, block_f=256)
+    run_checking_races(ffn_layer, rows, layer["ffn_norm"], layer["w_up"], layer["w_down"], ffn_tiles)
+    ffn_layer.verify(rows, layer["ffn_norm"], layer["w_up"], layer["w_down"], ffn_tiles)
+    if not ON_TPU:
+        assert fuse_ffn(x, qkv, layer)  # nothing measured off a TPU: fused

@@ -141,3 +141,15 @@ def test_attention_block_natively_matches_splash_then_norm_and_ffn():
     tuned = jax.jit(attention_block)(*inputs)  # tunes on this first call
     np.testing.assert_allclose(f64(tuned), f64(unfused), atol=3e-2 * scale)
     print(attention_block.tuning(*inputs[:3], *inputs[3:]))
+
+
+def test_transformer_natively_matches_splash_and_xla():
+    from transformer import Config, baseline, init_params, transformer
+
+    config = Config(layers=2, d_model=1024, heads=8, ffn=4096, vocab=8192)
+    params = init_params(config)
+    tokens = jax.random.randint(jax.random.key(1), (2, 1024), 0, config.vocab)
+    logits = jax.jit(transformer)(tokens, params)  # tunes every kernel
+    want = baseline(config, 1024)(tokens, params)
+    scale = float(jnp.max(jnp.abs(want.astype(jnp.float32))))
+    np.testing.assert_allclose(f64(logits), f64(want), atol=5e-2 * scale)

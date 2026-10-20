@@ -686,3 +686,33 @@ def test_phases_back_to_back():
     total = xf[:, :128] + xf[:, 128:]
     np.testing.assert_allclose(f64(out), np.maximum(np.maximum(total, xf[:, :128]), xf[:, 128:]), rtol=1e-6)
     assert "_after_phase0" not in kernel.source(x)
+
+
+def test_unpacking_into_carried_values():
+    def step(acc, total, tile):
+        return acc + tile, total + tile.sum(axis=1, keepdims=True)
+
+    kernel = make_kernel(
+        """
+        def f(x):
+            out = jnp.zeros((128, 128))
+            for i in range(0, 128, 128):
+                acc, total = jnp.zeros((128, 128)), jnp.zeros((128, 1))
+                for k in range(0, 384, 128):
+                    acc, total = step(acc, total, x[i : i + 128, k : k + 128])
+                    acc = acc * 0.5
+                out = out.at[i : i + 128, :].set(acc + total)
+            return out
+        """,
+        step=step,
+    )
+    x = rand((128, 384))
+    out = check(kernel, x)
+    acc, total = np.zeros((128, 128)), np.zeros((128, 1))
+    for k in range(3):
+        tile = f64(x[:, k * 128 : (k + 1) * 128])
+        acc, total = (acc + tile) * 0.5, total + tile.sum(axis=1, keepdims=True)
+    np.testing.assert_allclose(f64(out), acc + total, rtol=1e-5, atol=1e-5)
+    src = kernel.source(x)
+    assert "acc, total = step(acc_ref[...], total_ref[...], x_ref[...])" in src
+    assert "total_ref[...] = total" in src and "acc_ref[...] = acc * 0.5" in src

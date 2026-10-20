@@ -220,14 +220,33 @@ def test_carried_values():
         ("acc = jnp.zeros((128, 256))", "acc = acc + 1\n    acc = acc.astype(jnp.bfloat16)", "keeps one type"),
         ("acc = jnp.ones((128, 1))", "acc = jnp.sum(acc, 1, keepdims=True) + x[k : k + 128, :]", "keeps one type"),
         ("acc = jnp.zeros((128, 256))\nacc = acc.astype(jnp.int8)", "acc = acc + 1.0", "keeps one type"),
-        ("acc = None\nacc = jnp.zeros((128, 256))", "acc = acc + 1.0", "makes it not an array"),
-        ("acc = jnp.zeros((128, 256))\nn = acc", "acc, n = acc + 1, n", "one at a time, not by unpacking"),
+        ("acc = None\nacc = jnp.zeros((128, 256))", "acc = acc + 1.0", None),  # on its way: fine
+        ("acc = jnp.zeros((128, 256))\nn = acc", "acc, n = acc + 1, n", None),  # unpacking is fine
         ("acc = jnp.zeros((128, 256))", "acc = acc + undefined", "tile code fails for these input shapes"),
         ("acc = jnp.zeros((128, 256))", "acc = acc @ x[k : k + 128, :]", "tile code fails for these input shapes"),
     ],
 )
 def test_carried_value_errors(pre, body, message):
-    assert message in plan_error(_reduction(pre, body))
+    if message is None:
+        plan(_reduction(pre, body))
+    else:
+        assert message in plan_error(_reduction(pre, body))
+
+
+def test_what_a_region_leaves_must_keep_the_type():
+    source = nest_with(
+        """
+acc = jnp.zeros((128, 256))
+for k in range(0, 256, 128):
+    acc = acc + x[k : k + 128, :]
+acc = None
+b = jnp.zeros((128, 256))
+for k2 in range(0, 256, 128):
+    b = b + x[k2 : k2 + 128, :]
+out = out.at[i : i + 128, :].set(b)
+"""
+    )
+    assert "makes it not an array" in plan_error(source)
 
 
 def test_nothing_carries_over_between_tiles():
@@ -244,3 +263,15 @@ def test_named_scopes_must_be_named():
     for opener in ("jax.named_scope(NAME_NUMBER)", "jax.named_scope('a', 'b')", "jax.default_device(None)"):
         source = nest_with(f"with {opener}:\n    v = 1.0\nout = out.at[i : i + 128, :].set(v)")
         assert "only `with jax.named_scope(name):`" in plan_error(source, NAME_NUMBER=3)
+
+
+def test_matmuls_accumulate_in_32_bits():
+    def narrow(a, b):  # a helper is plain JAX: bf16 @ bf16 is bf16
+        return jax.jit(lambda u, v: u @ v)(a, b)
+
+    source = nest_with(
+        "t = x[i : i + 128, :].astype(jnp.bfloat16)\n"
+        "out = out.at[i : i + 128, :].set(narrow(t, jnp.ones((256, 256), jnp.bfloat16)))"
+    )
+    error = plan_error(source, narrow=narrow)
+    assert "accumulates in bfloat16, but the TPU's MXU accumulates in 32 bits" in error

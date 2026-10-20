@@ -21,7 +21,9 @@ kernel for a **TPU v5e**, and tunes its schedule on the hardware. The scope is d
   to do instead.
 - **The examples are the spec**: matmul, causal matmul, causal attention (checked against JAX's splash
   attention), RMSNorm fused with a projection (checked against plain JAX), and a whole attention block
-  (attention, RMSNorm, feed-forward) in one kernel (checked against splash + XLA, and NumPy). A feature earns its place by making one of them better or by a new example that needs it.
+  (attention, RMSNorm, feed-forward) in one kernel (checked against splash + XLA, and NumPy), and a whole
+  decoder-only transformer from those kernels (examples/transformer.py: per layer, a fused RMSNorm + QKV
+  projection, then attention + output projection + residual + RMSNorm + FFN + residual in one kernel). A feature earns its place by making one of them better or by a new example that needs it.
 
 ## The pipeline
 
@@ -101,6 +103,13 @@ Each of these was found on hardware; don't undo them without measuring again.
   blocks) + RMSNorm + FFN in XLA by 1.06-1.13x on six shapes (D 1024-4096, F 4096-16384, head dim 64 and
   128); tuning picked 256-512 query/key blocks and streamed FFN weights in 1024-wide blocks. Bigger blocks
   ran Mosaic out of VMEM (intermediates beyond the kernel's own buffers): the tuner rules those out.
+- Whole transformer (examples/transformer.py), tokens to logits: 1.03-1.23x faster than plain JAX + splash
+  at its best blocks on four model sizes. Fusing the FFN into the attention kernel wins at d_model 1024
+  (1.24 ms fused vs 0.54 + 0.74 split); at d_model 2048-4096 with batch*seq 4096 the attention's query
+  blocks are too few rows to reuse the FFN weights, and a separate FFN kernel (1024-row tiles) wins by
+  ~2%. The split form's extra launch + HBM round trip cost < 1%: compare tuned device times directly.
+- A matmul accumulating in under 32 bits (plain `bf16 @ bf16` in a helper) can't compile for the MXU:
+  plan.py rejects it from the traced jaxpr (`_check_matmuls`), naming the line.
 - 128³ matmul tiles are per-step-overhead bound (~0.2 us of fixed cost per step); 512³ bf16 tiles are
   DMA/MXU balanced. The tuner's proposals follow from these: overhead -> bigger tiles.
 - `jax.named_scope` in a kernel shows up in the profiler as events on the "XLA TraceMe" line, named

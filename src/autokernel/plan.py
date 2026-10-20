@@ -26,6 +26,8 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax._src import core as jax_core
+from jax._src import source_info_util
 
 from . import mxu, v5e
 from .errors import KernelError
@@ -465,10 +467,6 @@ class _Planner:
             carried |= first_reads(phase.body) & (made | assigned(phase.body))
             carried |= (first_reads(after) & made) - assigned(phase.body)
             made |= assigned(phase.body) | assigned(after)
-        for stmt in flatten([s for part in (*segments[:-1], *(p.body for p in phases)) for s in part]):
-            targets = stmt.targets[0] if isinstance(stmt, ast.Assign) else None
-            if isinstance(targets, ast.Tuple | ast.List) and assigned([stmt]) & carried:
-                raise self.error("assign values carried between steps one at a time, not by unpacking", stmt)
         return carried
 
     def _constants(self) -> dict[str, Any]:
@@ -531,7 +529,7 @@ class _TypeTrace:
         specs = [jax.ShapeDtypeStruct(op.tile.shape, op.tile.dtype) for op in self.operands]
         loop_vars = [jax.ShapeDtypeStruct((), jnp.int32, weak_type=True) for _ in self.planner.ranges]
         try:
-            jax.eval_shape(fn, *specs, *loop_vars)
+            traced = jax.make_jaxpr(fn)(*specs, *loop_vars)
         except Exception as e:
             frame = next(
                 (f for f in reversed(traceback.extract_tb(e.__traceback__)) if f.filename == self.nest.filename),
@@ -539,7 +537,21 @@ class _TypeTrace:
             )
             node = ast.Pass(lineno=frame.lineno) if frame else None
             raise self.nest.error(f"the tile code fails for these input shapes: {e!r}", node) from e
+        self._check_matmuls(traced.jaxpr)
         return _Types(self._carried_types(), self._assigned(), self.stores)
+
+    def _check_matmuls(self, jaxpr: Any) -> None:
+        """The MXU accumulates in 32 bits: a matmul whose result is narrower (plain JAX's `bf16 @ bf16`, in
+        a helper function, say) can't compile for the TPU."""
+        for eqn in jaxpr.eqns:
+            for inner in jax_core.jaxprs_in_params(eqn.params):
+                self._check_matmuls(inner)
+            if eqn.primitive.name == "dot_general" and np.dtype(eqn.outvars[0].aval.dtype).itemsize < 4:
+                raise self.nest.error(
+                    f"the matmul at {source_info_util.summarize(eqn.source_info)} accumulates in "
+                    f"{eqn.outvars[0].aval.dtype}, but the TPU's MXU accumulates in 32 bits: use `@` in kernel "
+                    "code, or `preferred_element_type=jnp.float32`"
+                )
 
     def _function(self) -> Callable:
         """The tile code as one function of its operands and loop variables, with type hooks."""
@@ -603,10 +615,11 @@ class _TypeTrace:
         """The one type each carried value keeps: what the first phase body that assigns it makes it (else
         the code that assigns it last).
 
-        The kernel keeps a carried value in a VMEM buffer of that type, so every value assigned to it must
-        have the type; the code around the phases may also start it with a number (`m = -1e30`), which the
-        kernel broadcasts to the carried type. After the last phase, assignments make new values (codegen
-        renames them), so they may have any type."""
+        The kernel keeps a carried value in a VMEM buffer of that type, so the value each region (the code
+        around the phases, a phase's body) leaves it with must have the type; values on their way (assigned
+        earlier in the region) are locals and may have any. The code around the phases may also start it with
+        a number (`m = -1e30`), which the kernel broadcasts to the carried type. After the last phase,
+        assignments make new values (codegen renames them), so they may have any type."""
         types = {}
         for name in sorted(self.carried):
             bodies = [label for label, _ in self.regions if label.startswith("body") and not label.endswith("+")]
@@ -620,8 +633,12 @@ class _TypeTrace:
                 raise self.nest.error(
                     f"`{name}` is carried between reduction steps, so it must be an array (kept in VMEM)", node
                 )
+            # What each region leaves behind (its last assignment) is stored: that must have the type.
+            left: dict[str, tuple[int, Any]] = {}
             for (label, stmt), values in self.notes.items():
-                value = values.get(name, kept)
+                if name in values:
+                    left[label] = (stmt, values[name])
+            for label, (stmt, value) in left.items():
                 code = label.startswith("seg")
                 if label == _LAST or _show(value) == _show(kept) or (code and _starts(value, kept)):
                     continue
