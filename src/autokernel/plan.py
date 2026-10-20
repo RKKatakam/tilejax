@@ -209,6 +209,7 @@ class Plan:
     assigned_types: Mapping[int, Mapping[str, jax.ShapeDtypeStruct]]  # id(stmt) -> the types it assigns
     constants: Mapping[str, Any]  # names the tile code reads from the module, closure and prologue
     scopes: tuple[str, ...]  # the names of the tile code's `jax.named_scope`s
+    tile_ops: int  # operations in a tile's code traced as plain JAX (each phase body twice): its size
     env: dict[str, Any]  # the function's module and closure values, with the prologue's names over them
 
     @property
@@ -333,6 +334,7 @@ class _Planner:
             assigned_types=types.assigned,
             constants=self._constants(),
             scopes=scopes,
+            tile_ops=types.ops,
             env=self.env,
         )
 
@@ -754,6 +756,7 @@ class _Planner:
 
 @dataclass(frozen=True)
 class _Types:
+    ops: int
     carried: dict[str, jax.ShapeDtypeStruct]
     assigned: dict[int, dict[str, jax.ShapeDtypeStruct]]
     stores: dict[str, jax.ShapeDtypeStruct]
@@ -854,7 +857,7 @@ class _TypeTrace:
             node = ast.Pass(lineno=frame.lineno) if frame else None
             raise self.nest.error(f"the tile code fails for these input shapes: {e!r}", node) from e
         self._check_matmuls(traced.jaxpr)
-        return _Types(self._carried_types(), self._assigned(), self.stores)
+        return _Types(_count_ops(traced.jaxpr), self._carried_types(), self._assigned(), self.stores)
 
     def _check_matmuls(self, jaxpr: Any) -> None:
         """The MXU accumulates in 32 bits: a matmul whose result is narrower (plain JAX's `bf16 @ bf16`, in
@@ -982,6 +985,11 @@ class _TypeTrace:
         for (_, stmt), values in self.notes.items():
             assigned_.setdefault(stmt, {}).update(values)  # a body statement: its type in the second step
         return assigned_
+
+
+def _count_ops(jaxpr: Any) -> int:
+    """Equations in a jaxpr, those of the jaxprs inside them (calls of jitted functions) included."""
+    return sum(1 + sum(_count_ops(inner) for inner in jax_core.jaxprs_in_params(eqn.params)) for eqn in jaxpr.eqns)
 
 
 def _bind(r: Range, at: ast.AST) -> ast.stmt:

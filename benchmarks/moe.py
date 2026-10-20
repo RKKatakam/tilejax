@@ -65,6 +65,16 @@ DENSE_TOKENS = 64  # every expert on every token only for decode batches
 MEGABLOX_TILINGS = [(tm, cap) for tm in (128, 256, 512) for cap in (512, 2048)]  # rows, k and n blocks up to cap
 
 
+def _time_or_inf(fn: Any, *args: Any, runs: int) -> float:
+    """`time_ms`, or infinity for a baseline configuration that doesn't compile (megablox tilings can run
+    Mosaic out of VMEM)."""
+    try:
+        return time_ms(fn, *args, runs=runs)
+    except jax.errors.JaxRuntimeError as e:
+        print(f"    (skipped a baseline configuration: {str(e).splitlines()[0][:100]})")
+        return float("inf")
+
+
 def megablox_tilings(config: MoeConfig, rows: int) -> list[tuple[str, Any]]:
     """Megablox tilings to try, each named by its (tm, tk, tn) for the gate-up and down matmuls, without
     repeats (small arrays clamp tilings to the same blocks)."""
@@ -129,7 +139,7 @@ def run(config: MoeConfig, name: str, tokens: int) -> dict[str, Any]:
     ragged_dot_experts = time_ms(experts, xs, bparams, disp.counts, config, "ragged_dot", None, runs=10)
     tilings = megablox_tilings(config, rows)
     megablox_experts, megablox_name = min(
-        (time_ms(experts, xs, bparams, disp.counts, config, "megablox", tiling, runs=10), label)
+        (_time_or_inf(experts, xs, bparams, disp.counts, config, "megablox", tiling, runs=10), label)
         for label, tiling in tilings
     )
 
@@ -151,7 +161,7 @@ def run(config: MoeConfig, name: str, tokens: int) -> dict[str, Any]:
     ours_ragged = time_ms(ours_ragged_fn, x, params, config, runs=10)
     ragged_dot_fn = baseline(config)
     ragged_dot = time_ms(ragged_dot_fn, x, bparams, runs=10)
-    megablox = min(time_ms(baseline(config, "megablox", t), x, bparams, runs=10) for _, t in tilings)
+    megablox = min(_time_or_inf(baseline(config, "megablox", t), x, bparams, runs=10) for _, t in tilings)
     dense = time_ms(baseline(config, "dense"), x, bparams, runs=10) if not prefill else float("nan")
     want = ragged_dot_fn(x, bparams)
     diffs = (max_diff(ours_fn(x, params, config, group), want), max_diff(ours_ragged_fn(x, params, config), want))

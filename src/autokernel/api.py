@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import itertools
 import linecache
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -29,6 +30,7 @@ __all__ = ["Kernel", "Lowered", "kernel"]
 Signature = tuple[tuple[tuple[int, ...], np.dtype], ...]
 
 _generated = itertools.count()  # numbers the generated sources' file names, which linecache keys by
+JIT_OPS = 20_000  # a reference unrolling into more operations than this runs op by op, not jitted
 
 
 @dataclass(frozen=True)
@@ -101,6 +103,7 @@ class Kernel:
             )
         self._builds: dict[tuple[Signature, Any], tuple[Plan, Schedule]] = {}
         self._references: dict[Signature, Callable[..., Any]] = {}
+        self._jitted: dict[Signature, Callable[..., Any]] = {}
         self._lowered: dict[tuple[Signature, Config, bool], Lowered] = {}
         self._tunings: dict[Signature, Tuning] = {}
 
@@ -131,8 +134,13 @@ class Kernel:
         self.build(signature, tunable if tunable is not None else self.default_tunable)  # reads the constants
         if self.nest.tunable:
             tunable = tunable if tunable is not None else self.lower(*arrays).config.tunable
-            return self._references[signature](*arrays, tunable)
-        return self._references[signature](*arrays)
+        plan, _ = self.build(signature, tunable)
+        reference = self._references[signature]
+        # The loops unroll: XLA would take minutes to compile a reference of hundreds of thousands of
+        # operations, which run op by op in seconds. (Masks reading index arrays need values: op by op too.)
+        if not self.nest.runtime_masks and plan.tile_ops * math.prod(r.count for r in plan.loops) <= JIT_OPS:
+            reference = self._jitted.setdefault(signature, jax.jit(reference))
+        return reference(*arrays, tunable) if self.nest.tunable else reference(*arrays)
 
     def verify(self, *args: Any, rtol: float | None = None, atol: float | None = None) -> float:
         """Run the kernel and its reference; raise AssertionError unless they agree (within tolerances for the

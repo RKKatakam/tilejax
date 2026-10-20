@@ -5,7 +5,8 @@ computes. The one change: `@` in the loop nest means what it means in the kernel
 accumulating in f32, not plain JAX's `bf16 @ bf16 -> bf16`.
 
 A loop nest whose masks read index arrays (`if j >= lengths[b]: continue`) branches on array values, which
-Python can only do on concrete arrays: its reference runs op by op, not under `jax.jit`.
+Python can only do on concrete arrays: its reference runs op by op, not under `jax.jit`. So does one whose
+loops unroll into more operations than XLA compiles quickly (api.py decides, from the plan).
 """
 
 from __future__ import annotations
@@ -15,8 +16,6 @@ import copy
 from collections.abc import Callable
 from typing import Any
 
-import jax
-
 from . import mxu
 from .parse import Nest
 
@@ -24,8 +23,8 @@ __all__ = ["make_reference"]
 
 
 def make_reference(nest: Nest, fn: Callable) -> Callable[..., Any]:
-    """`fn` as a JAX function with `@` on the MXU (jitted, unless its masks read index arrays), reading the
-    module's and closure's values as they are now (as the kernel built now does)."""
+    """`fn` as a JAX function with `@` on the MXU, reading the module's and closure's values as they are now
+    (as the kernel built now does)."""
     fdef = copy.deepcopy(nest.function)
     fdef.decorator_list = []
     fdef.args.defaults = []  # the reference is always given its tunable: its default needn't evaluate again
@@ -45,5 +44,4 @@ def make_reference(nest: Nest, fn: Callable) -> Callable[..., Any]:
     namespace = {**fn.__globals__, **mxu.FUNCTIONS}
     exec(compile(module, nest.filename, "exec"), namespace)
     cells = [cell.cell_contents for cell in fn.__closure__ or ()]
-    reference = namespace["__make__"](*cells)
-    return reference if nest.runtime_masks else jax.jit(reference)
+    return namespace["__make__"](*cells)
