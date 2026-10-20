@@ -55,7 +55,7 @@ def test_matmul_plan():
     assert p.carried["acc"].dtype == jnp.float32 and p.carried["acc"].shape == (128, 128)
     out = p.outputs[0]
     assert (out.shape, out.dtype, out.fill, out.value.dtype) == ((256, 256), np.float32, 0, jnp.float32)
-    assert p.eval(p.reduction.mask or p.nest.parallel[0].bounds[1]) == 256
+    assert [phase.range.var for phase in p.phases] == ["k"] and p.eval(p.nest.parallel[0].bounds[1]) == 256
 
 
 def test_operand_kinds_and_windows():

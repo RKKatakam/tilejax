@@ -21,7 +21,7 @@ from .pipeline import Pipeline, default_pipeline, vmem_bytes
 from .plan import Plan, make_plan
 from .reference import make_reference
 from .schedule import Schedule, make_schedule
-from .tunable import is_tunable
+from .tunable import is_tunable, neighbours
 from .tune import Config, Tuning, tune
 
 __all__ = ["Kernel", "Lowered", "kernel"]
@@ -168,8 +168,18 @@ class Kernel:
         return tuple(signature)
 
     def default_config(self, signature: Signature) -> Config:
-        """The tunable's defaults, with the default buffering for them."""
-        return Config(self.default_tunable, default_pipeline(*self.build(signature, self.default_tunable)))
+        """The schedule to start from: the tunable's defaults with their default buffering, or, if they don't
+        build for these inputs (their tiles don't fit in VMEM, say), the nearest tunable that does."""
+        tunable = self.default_tunable
+        try:
+            return Config(tunable, default_pipeline(*self.build(signature, tunable)))
+        except KernelError:
+            if tunable is None:
+                raise
+            found = _nearest(tunable, lambda t: Config(t, default_pipeline(*self.build(signature, t))))
+            if found is None:
+                raise
+            return found
 
     def build(self, signature: Signature, tunable: Any) -> tuple[Plan, Schedule]:
         """The plan and schedule for this signature and tunable."""
@@ -209,6 +219,25 @@ class Kernel:
                 f"{self.nest.name} takes {n} input arrays ({', '.join(self.nest.params)}){more}; got {len(args)}"
             )
         return args, None
+
+
+def _nearest(tunable: Any, make: Callable[[Any], Config]) -> Config | None:
+    """The first tunable, breadth-first over neighbours from `tunable`, that `make` turns into a Config
+    without a KernelError."""
+    seen, frontier = {tunable}, [tunable]
+    while frontier:
+        later = []
+        for t in frontier:
+            for n in neighbours(t):
+                if n in seen:
+                    continue
+                seen.add(n)
+                try:
+                    return make(n)
+                except KernelError:
+                    later.append(n)
+        frontier = later
+    return None
 
 
 def _load(source: str, filename: str, entry: str) -> Callable[..., Any]:

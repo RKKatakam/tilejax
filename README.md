@@ -56,10 +56,11 @@ ops instead.
 | Python | Generated kernel |
 | --- | --- |
 | outer loops whose tiles the outputs are stored at | the output tiles the step loop walks |
-| code before the inner loop | runs at a tile's first step |
-| the inner (reduction) loop | the tile's steps |
-| code after it, and the stores | runs at a tile's last step |
-| `x[i : i + T, k : k + T]` that moves every step | a ring of VMEM slots, fetched steps ahead |
+| code before the inner loops | runs at a tile's first step |
+| each inner (reduction) loop | a phase: the tile's steps for it, one phase after another |
+| code after a reduction loop (the stores, after the last) | runs at the phase's last step |
+| a reduction loop of one iteration | no step: its body runs inline |
+| `x[i : i + T, k : k + T]` that moves every step | a ring of VMEM slots, fetched steps ahead (across phases) |
 | `q[b, h, i : i + T, :]` that moves once per tile | two VMEM slots, the next tile's fetched early |
 | `bias[0:1, :]` that never moves | fetched once |
 | values carried between steps (`acc`) | VMEM scratch |
@@ -107,12 +108,12 @@ def f(x, y, tiles=Tiles()):                   # the input arrays; optionally las
         for j in range(0, N, TN):
             if j > i:                         # optional tile mask: skip this output tile
                 continue
-            acc = jnp.zeros((TM, TN))         # pre: runs once per tile
-            for k in range(0, K, TK):         # at most one reduction loop
+            acc = jnp.zeros((TM, TN))         # code before the reduction loops: once per tile
+            for k in range(0, K, TK):         # any number of reduction loops, one after another
                 if k > i:                     # optional step mask: skip this step
                     continue
                 acc += x[i : i + TM, k : k + TK] @ y[k : k + TK, j : j + TN]
-            out = out.at[i : i + TM, j : j + TN].set(acc)   # post: each output stored once per tile
+            out = out.at[i : i + TM, j : j + TN].set(acc)   # each output stored once per tile, at the end
     return out
 ```
 
@@ -133,9 +134,17 @@ def f(x, y, tiles=Tiles()):                   # the input arrays; optionally las
   automatically and kept in VMEM, so each keeps one type, the one the loop body gives it: start it with
   that type (`jnp.zeros((TM, TN), jnp.float32)` for `acc += a @ b`, which is f32), or with a number
   (`m = -1e30`). Nothing carries over from one tile to the next. Every tile that runs takes at least one
-  reduction step.
+  step of each reduction loop.
+- **Reduction loops** run one after another, each a phase of the tile's steps: a whole transformer block
+  (attention over key blocks, then a feed-forward layer over blocks of hidden units) is one kernel. Code
+  between them runs once, at the end of the phase before; values it hands to the next phase are carried in
+  VMEM like accumulators. A loop of one iteration (`range(0, F, F)`) takes no step: its body runs inline,
+  and windows only it moved are fetched once, so a tunable block size covering a whole dim turns streamed
+  weights into resident ones.
 - **Loop variables** can be used as values (`i + jax.lax.broadcasted_iota(...)`); they behave as Python
   ints (`bf16_tile * i` stays bf16), as int32 in the kernel.
+- **Defaults that don't fit** (block sizes too big for VMEM, or not dividing the arrays) are replaced by the
+  nearest tunable that builds, and schedules Mosaic can't compile are ruled out while tuning.
 - **Masks** are `if cond: continue` at the top of a loop. They are Python conditions on loop variables and
   constants, evaluated once per combination of the loop values they read when the kernel is built; the
   kernel walks SMEM tables of only the tiles and steps that run. Tables cover only the loops a mask reads:
@@ -146,8 +155,27 @@ def f(x, y, tiles=Tiles()):                   # the input arrays; optionally las
 
 Anything else is rejected with a `KernelError` naming the line, before anything runs.
 
-The [examples](examples/) are matmul, causal matmul, causal multi-head (splash) attention, and RMSNorm
-fused with the projection after it, tested against NumPy, JAX's own splash attention, and plain JAX.
+The [examples](examples/) are matmul, causal matmul, causal multi-head (splash) attention, RMSNorm fused
+with the projection after it, and a whole attention block (attention, RMSNorm, feed-forward layer) in one
+kernel, tested against NumPy, JAX's own splash attention, and plain JAX.
+
+**A whole attention block in one kernel** ([examples/attention_block.py](examples/attention_block.py)):
+causal multi-head attention, the post-attention RMSNorm and the feed-forward layer
+(`gelu(h @ w_up) @ w_down`). The parallel loops walk (batch, query block); the tile's first reduction loop
+is flash attention over the key blocks for every head at once (skipping future blocks); the code after it
+puts the heads side by side and normalizes them; the second reduction loop is the feed-forward layer over
+blocks of hidden units, streaming the weights (or keeping them in VMEM, if the tuner picks a block of all
+of them). Nothing between attention and the block's output goes to HBM. Against JAX's splash attention
+followed by RMSNorm and the feed-forward layer in XLA, tuned, on a v5e (bf16, ms; `benchmarks/attention_block.py`):
+
+| B | H | S | head dim | F | splash (default blocks) + norm + FFN | splash (its best blocks) + norm + FFN | autokernel | vs default | vs best |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 4 | 8 | 2048 | 128 | 4096 | 4.226 | 1.245 | **1.106** | 3.82× | 1.13× |
+| 8 | 8 | 1024 | 128 | 4096 | 2.603 | 1.099 | **1.022** | 2.55× | 1.08× |
+| 2 | 16 | 2048 | 128 | 8192 | 4.933 | 1.951 | **1.821** | 2.71× | 1.07× |
+| 1 | 16 | 4096 | 128 | 8192 | 7.330 | 2.199 | **2.066** | 3.55× | 1.06× |
+| 4 | 16 | 2048 | 64 | 4096 | 6.784 | 1.837 | **1.714** | 3.96× | 1.07× |
+| 1 | 32 | 2048 | 128 | 16384 | 6.118 | 3.539 | **3.264** | 1.87× | 1.08× |
 
 **RMSNorm fused with a projection** ([examples/rmsnorm_matmul.py](examples/rmsnorm_matmul.py)): the row
 scale commutes with the matmul, `rmsnorm(x) @ w = (1 / rms(x)) * ((x * gamma) @ w)`, so one reduction

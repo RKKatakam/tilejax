@@ -36,7 +36,7 @@ __all__ = [
     "tunable",
 ]
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 # Tuning reads trace regions, which libtpu records only if told before JAX starts its TPU backend.
 if not profiling._backend_started():

@@ -1,9 +1,14 @@
 """Resolve a parsed loop nest for concrete input shapes: what the kernel copies, keeps and computes.
 
 `make_plan` runs the prologue on the inputs' shapes, evaluates the loop ranges, turns every tile read and
-store into a window of an array, finds the values a tile carries from one reduction step to the next, and
-traces the tile code once with abstract values to learn every type. Nothing here depends on how the kernel
-is pipelined (pipeline.py) or the order its steps run in (schedule.py).
+store into a window of an array, finds the values a tile carries from one step to the next, and traces the
+tile code once with abstract values to learn every type. Nothing here depends on how the kernel is
+pipelined (pipeline.py) or the order its steps run in (schedule.py).
+
+A tile's reduction loops become its phases: the steps of the first, then of the second, ... A reduction
+loop of one iteration (and no mask) takes no step of its own: its body runs inline, in the code around it,
+with its variable bound to its one value. So a tunable block size that covers a whole dim turns a loop
+into straight-line code, and the windows it moved into ones fetched once.
 """
 
 from __future__ import annotations
@@ -27,7 +32,7 @@ from .errors import KernelError
 from .parse import Loop, Nest
 from .tilecode import assigned, first_reads, flatten, reads
 
-__all__ = ["Carried", "Kind", "Operand", "Output", "Plan", "Range", "Tile", "Window", "make_plan"]
+__all__ = ["Carried", "Kind", "Operand", "Output", "Phase", "Plan", "Range", "Tile", "Window", "make_plan"]
 
 
 @dataclass(frozen=True)
@@ -77,7 +82,7 @@ class Tile:
 class Kind(Enum):
     """When an input tile changes, and so how the kernel buffers it."""
 
-    STREAM = "stream"  # every step: a ring of slots, fetched ahead
+    STREAM = "stream"  # every step (of its phase): a ring of slots, fetched ahead
     TILE = "tile"  # every output tile: two slots, the next tile's fetched at a tile's first step
     ONCE = "once"  # never: fetched once, before the first step
 
@@ -90,6 +95,15 @@ class Operand:
     param: int  # which input
     tile: Tile
     kind: Kind
+    phase: int | None = None  # a streamed operand of a phase: the phase (None: it streams every step)
+
+
+@dataclass(frozen=True)
+class Phase:
+    """A reduction loop that takes steps: the tile's steps for it, and its body."""
+
+    range: Range
+    body: tuple[ast.stmt, ...]
 
 
 @dataclass(frozen=True)
@@ -121,7 +135,9 @@ class Plan:
     inputs: tuple[jax.ShapeDtypeStruct, ...]
     tunable: Any  # the tunable's values it was planned with (None: the kernel has none)
     parallel: tuple[Range, ...]  # outermost first
-    reduction: Range | None
+    reductions: tuple[Range, ...]  # every reduction loop, in order (the inlined ones too)
+    phases: tuple[Phase, ...]  # the reduction loops that take steps
+    segments: tuple[tuple[ast.stmt, ...], ...]  # the code before, between and after the phases: one more
     operands: tuple[Operand, ...]
     reads: Mapping[str, Operand]  # `read_key` of a tile read -> its operand
     outputs: tuple[Output, ...]
@@ -133,20 +149,16 @@ class Plan:
 
     @property
     def single_step(self) -> bool:
-        """Does every tile run in one step? Then nothing is carried between steps."""
-        return _single_step(self.reduction)
+        """Does every tile run in one step (no phases)? Then nothing is carried between steps."""
+        return not self.phases
 
     @property
     def loops(self) -> tuple[Range, ...]:
-        return self.parallel + ((self.reduction,) if self.reduction else ())
+        return self.parallel + self.reductions
 
     def eval(self, node: ast.expr, values: Mapping[str, Any] | None = None) -> Any:
         """Evaluate an expression of the function on the prologue's names (and `values`, e.g. loop values)."""
         return evaluate(self.nest, self.env, node, values)
-
-
-def _single_step(reduction: Range | None) -> bool:
-    return reduction is None or (reduction.count == 1 and reduction.mask is None)
 
 
 def evaluate(nest: Nest, env: dict[str, Any], node: ast.expr, values: Mapping[str, Any] | None = None) -> Any:
@@ -190,15 +202,15 @@ class _Planner:
     def plan(self) -> Plan:
         outputs = self._prologue()
         parallel = tuple(self._range(loop) for loop in self.nest.parallel)
-        reduction = self._range(self.nest.reduction) if self.nest.reduction else None
-        self.ranges = {r.var: r for r in (*parallel, *([reduction] if reduction else []))}
-        single_step = _single_step(reduction)
-        operands, reads_ = self._operands(reduction, single_step)
+        reductions = tuple(self._range(loop) for loop in self.nest.reductions)
+        self.ranges = {r.var: r for r in (*parallel, *reductions)}
+        phases, segments = self._phases(reductions)
+        operands, reads_ = self._operands(phases)
         output_tiles = {name: self._output_tile(name, *outputs[name], parallel) for name in self.nest.outputs}
         self._check_reads_before_assignment()
-        carried_names = set() if single_step else self._carried_names()
+        carried_names = self._carried_names(phases, segments)
         scopes = self._scopes()
-        types = _TypeTrace(self, operands, reads_, carried_names, single_step).run()
+        types = _TypeTrace(self, operands, reads_, carried_names, phases, segments).run()
         for name in self.nest.outputs:
             self._check_store(output_tiles[name], types.stores[name])
         carried = {name: Carried(name, aval.shape, aval.dtype) for name, aval in types.carried.items()}
@@ -207,7 +219,9 @@ class _Planner:
             inputs=self.inputs,
             tunable=self.env.get(self.nest.tunable) if self.nest.tunable else None,
             parallel=parallel,
-            reduction=reduction,
+            reductions=reductions,
+            phases=phases,
+            segments=segments,
             operands=operands,
             reads=reads_,
             outputs=tuple(
@@ -347,7 +361,22 @@ class _Planner:
             raise self.error(f"{text}: a {tile.shape} tile breaks the TPU layout: {'; '.join(problems)}", node)
         return tile
 
-    def _operands(self, reduction: Range | None, single_step: bool) -> tuple[tuple[Operand, ...], dict[str, Operand]]:
+    def _phases(self, reductions: tuple[Range, ...]) -> tuple[tuple[Phase, ...], tuple[tuple[ast.stmt, ...], ...]]:
+        """The reduction loops that take steps, and the code around them: a loop of one iteration (and no
+        mask) joins the code around it, its variable bound to its value first."""
+        nest = self.nest
+        phases: list[Phase] = []
+        segments: list[list[ast.stmt]] = [list(nest.segments[0])]
+        for r, body, after in zip(reductions, nest.bodies, nest.segments[1:], strict=True):
+            if r.count == 1 and r.mask is None:
+                bind = ast.Assign([ast.Name(r.var, ast.Store())], ast.Constant(r.start))
+                segments[-1] += [ast.fix_missing_locations(ast.copy_location(bind, body[0])), *body, *after]
+            else:
+                phases.append(Phase(r, body))
+                segments.append(list(after))
+        return tuple(phases), tuple(tuple(s) for s in segments)
+
+    def _operands(self, phases: tuple[Phase, ...]) -> tuple[tuple[Operand, ...], dict[str, Operand]]:
         operands: list[Operand] = []
         by_key: dict[str, Operand] = {}
         params = {name: i for i, name in enumerate(self.nest.params)}
@@ -360,15 +389,17 @@ class _Planner:
             spec = self.inputs[param]
             index = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
             tile = self._tile(node.value.id, spec.shape, spec.dtype, index, node)
-            if not tile.loops:
+            moving = {v for v in tile.loops if self.ranges[v].count > 1}  # loops of one block don't move it
+            phase = next((p for p, ph in enumerate(phases) if ph.range.var in moving), None)
+            if not moving:
                 kind = Kind.ONCE
-            elif (reduction and reduction.var in tile.loops) or single_step:
+            elif phase is not None or not phases:
                 kind = Kind.STREAM
             else:
                 kind = Kind.TILE
             taken = {*self.nest.params, *(op.name for op in operands)}
             name = tile.array if tile.array not in {op.tile.array for op in operands} else _fresh(tile.array, taken)
-            operand = Operand(name, param, tile, kind)
+            operand = Operand(name, param, tile, kind, phase)
             operands.append(operand)
             by_key[key] = operand
         return tuple(operands), by_key
@@ -415,7 +446,7 @@ class _Planner:
         """Python raises UnboundLocalError for a local read before it is assigned: in a tile, that is a
         value expected to carry over from the previous tile, which nothing does."""
         nest = self.nest
-        early = (first_reads(nest.pre + nest.body + nest.post) & assigned(nest.tile)) - set(nest.outputs)
+        early = (first_reads(nest.tile) & assigned(nest.tile)) - set(nest.outputs)
         for stmt in flatten(nest.tile):
             names = sorted(reads(stmt) & early)
             if names:
@@ -424,14 +455,17 @@ class _Planner:
                     stmt,
                 )
 
-    def _carried_names(self) -> set[str]:
-        """Values a tile carries between steps: read by the reduction body before it assigns them, or assigned
-        before the reduction and read after it."""
-        nest = self.nest
-        made = assigned(nest.pre) | assigned(nest.body)
-        carried = first_reads(nest.body) & made
-        carried |= (first_reads(nest.post) & assigned(nest.pre)) - assigned(nest.body)
-        for stmt in flatten(nest.pre + nest.body):
+    def _carried_names(self, phases: tuple[Phase, ...], segments: tuple[tuple[ast.stmt, ...], ...]) -> set[str]:
+        """Values a tile carries from one step to another (kept in VMEM): read by a phase's body before it
+        assigns them; or read by the code after a phase, but made before that phase. (The code after a phase
+        runs in the phase's last step, after its body: it sees the body's values.)"""
+        carried: set[str] = set()
+        made = assigned(segments[0])
+        for phase, after in zip(phases, segments[1:], strict=True):
+            carried |= first_reads(phase.body) & (made | assigned(phase.body))
+            carried |= (first_reads(after) & made) - assigned(phase.body)
+            made |= assigned(phase.body) | assigned(after)
+        for stmt in flatten([s for part in (*segments[:-1], *(p.body for p in phases)) for s in part]):
             targets = stmt.targets[0] if isinstance(stmt, ast.Assign) else None
             if isinstance(targets, ast.Tuple | ast.List) and assigned([stmt]) & carried:
                 raise self.error("assign values carried between steps one at a time, not by unpacking", stmt)
@@ -464,10 +498,13 @@ class _Types:
     stores: dict[str, jax.ShapeDtypeStruct]
 
 
+_LAST = "last"  # the segment after the last phase
+
+
 class _TypeTrace:
-    """Runs the tile code once with abstract values (`jax.eval_shape`): pre, the reduction body twice (a
-    value's type after the first step must be its type after every step), post. Records the type of every
-    value assigned and stored."""
+    """Runs the tile code once with abstract values (`jax.eval_shape`): the segments in order, each phase's
+    body twice between them (a value's type after its first step must be its type after every step).
+    Records the type of every value assigned and stored."""
 
     def __init__(
         self,
@@ -475,10 +512,16 @@ class _TypeTrace:
         operands: tuple[Operand, ...],
         reads_: Mapping[str, Operand],
         carried: set[str],
-        single_step: bool,
+        phases: tuple[Phase, ...],
+        segments: tuple[tuple[ast.stmt, ...], ...],
     ) -> None:
         self.planner, self.nest = planner, planner.nest
-        self.operands, self.reads, self.carried, self.single_step = operands, reads_, carried, single_step
+        self.operands, self.reads, self.carried = operands, reads_, carried
+        # The regions in the order they run, labelled (a phase's body runs twice: "body0", "body0+").
+        self.regions: list[tuple[str, tuple[ast.stmt, ...]]] = [("seg0" if phases else _LAST, segments[0])]
+        for p, phase in enumerate(phases):
+            after = _LAST if p == len(phases) - 1 else f"seg{p + 1}"
+            self.regions += [(f"body{p}", phase.body), (f"body{p}+", phase.body), (after, segments[p + 1])]
         self.notes: dict[tuple[str, int], dict[str, Any]] = {}  # (segment, id(stmt)) -> name -> type
         self.stores: dict[str, jax.ShapeDtypeStruct] = {}
         self.stmts: dict[int, ast.stmt] = {}
@@ -500,13 +543,9 @@ class _TypeTrace:
 
     def _function(self) -> Callable:
         """The tile code as one function of its operands and loop variables, with type hooks."""
-        segments = [("pre", self.nest.pre), ("body", self.nest.body)]
-        if not self.single_step:
-            segments.append(("body2", self.nest.body))
-        segments.append(("post", self.nest.post))
         body: list[ast.stmt] = []
-        for segment, stmts in segments:
-            body += [s for stmt in stmts for s in self._instrument(stmt, segment)]
+        for label, stmts in self.regions:
+            body += [s for stmt in stmts for s in self._instrument(stmt, label)]
         args = [f"__operand{i}" for i in range(len(self.operands))] + list(self.planner.ranges)
         fdef = ast.FunctionDef(
             name="__tile__",
@@ -561,24 +600,31 @@ class _TypeTrace:
         self.stores[output] = _type(value)
 
     def _carried_types(self) -> dict[str, jax.ShapeDtypeStruct]:
-        """The one type each carried value keeps: what the reduction body makes it.
+        """The one type each carried value keeps: what the first phase body that assigns it makes it (else
+        the code that assigns it last).
 
         The kernel keeps a carried value in a VMEM buffer of that type, so every value assigned to it must
-        have the type; the code before the reduction may also start it with a number (`m = -1e30`), which
-        the kernel broadcasts to the carried type."""
+        have the type; the code around the phases may also start it with a number (`m = -1e30`), which the
+        kernel broadcasts to the carried type. After the last phase, assignments make new values (codegen
+        renames them), so they may have any type."""
         types = {}
         for name in sorted(self.carried):
-            body = self._last("body", name)
-            kept = body if body is not None else self._last("pre", name)
+            bodies = [label for label, _ in self.regions if label.startswith("body") and not label.endswith("+")]
+            segments = [label for label, _ in self.regions if label.startswith("seg")]
+            kept = next(
+                (t for t in (self._last(b, name) for b in bodies) if t is not None),
+                next((t for t in (self._last(s, name) for s in reversed(segments)) if t is not None), None),
+            )
             node = self._assignment(name)
             if kept is None or not kept.shape:
                 raise self.nest.error(
                     f"`{name}` is carried between reduction steps, so it must be an array (kept in VMEM)", node
                 )
-            for (segment, stmt), values in self.notes.items():
+            for (label, stmt), values in self.notes.items():
                 value = values.get(name, kept)
-                if segment == "post" or _show(value) == _show(kept) or (segment == "pre" and _starts(value, kept)):
-                    continue  # (after the reduction, assignments make new values: codegen renames them)
+                code = label.startswith("seg")
+                if label == _LAST or _show(value) == _show(kept) or (code and _starts(value, kept)):
+                    continue
                 raise self.nest.error(
                     f"`{name}` is carried between reduction steps as {_show(kept)}, but this makes it "
                     f"{_show(value)}: a carried value keeps one type (start it with that type)",

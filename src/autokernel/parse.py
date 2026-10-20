@@ -9,14 +9,17 @@ A kernel function is
             for j in range(0, N, TN):
                 if <mask>:                         # optional: skip this output tile
                     continue
-                <pre>                              # runs once per tile, before the reduction
-                for k in range(0, K, TK):          # optional reduction loop: the tile's steps
-                    if <mask>:                     # optional: skip this step
+                <segment>                          # straight-line code, run once per tile
+                for k in range(0, K, TK):          # any number of reduction loops, one after another:
+                    if <mask>:                     #   optional: skip this step
                         continue
-                    <body>                         # runs once per step
-                <post>                             # runs once per tile, after the reduction
-                out = out.at[i : i + TM, j : j + TN].set(value)   # each output stored once, in post
+                    <body>                         #   runs once per step
+                <segment>                          # between and after them, more straight-line code
+                out = out.at[i : i + TM, j : j + TN].set(value)   # each output stored once, at the end
         return out                                 # the outputs, one name or a tuple of names
+
+A tile's reduction loops run one after another (the kernel's steps for a tile are those of its first
+reduction loop, then its second's, ...): a phase each.
 """
 
 from __future__ import annotations
@@ -59,11 +62,10 @@ class Nest:
     allocations: dict[str, ast.Assign]  # output -> the prologue statement allocating it
     outputs: tuple[str, ...]  # in the order the function returns them
     parallel: tuple[Loop, ...]  # outermost first
-    reduction: Loop | None
-    pre: tuple[ast.stmt, ...]
-    body: tuple[ast.stmt, ...]
-    post: tuple[ast.stmt, ...]
-    stores: dict[str, Store]  # output -> its store, in `post`
+    reductions: tuple[Loop, ...]  # in the order they run
+    bodies: tuple[tuple[ast.stmt, ...], ...]  # each reduction loop's body
+    segments: tuple[tuple[ast.stmt, ...], ...]  # the code before, between and after them: one more
+    stores: dict[str, Store]  # output -> its store, in the last segment
     _store_nodes: dict[int, Store] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
@@ -71,12 +73,15 @@ class Nest:
 
     @property
     def tile(self) -> tuple[ast.stmt, ...]:
-        """Everything a tile runs: pre, the reduction body, post."""
-        return self.pre + self.body + self.post
+        """Everything a tile runs, in order: the segments and, between them, the reduction bodies."""
+        out = self.segments[0]
+        for body, segment in zip(self.bodies, self.segments[1:], strict=True):
+            out += body + segment
+        return out
 
     @property
     def loops(self) -> tuple[Loop, ...]:
-        return self.parallel + ((self.reduction,) if self.reduction else ())
+        return self.parallel + self.reductions
 
     def store(self, stmt: ast.stmt) -> Store | None:
         """The output store `stmt` is, if it is one."""
@@ -133,8 +138,8 @@ class _Parser:
         allocations = self._allocations(prologue, outputs, body[at + 1])
 
         parallel, tile = self._parallel_loops(body[at])  # type: ignore[arg-type]
-        reduction, pre, red_body, post = self._split_tile(tile)
-        stores = self._stores(pre, red_body, post, outputs)
+        reductions, bodies, segments = self._split_tile(tile)
+        stores = self._stores(bodies, segments, outputs)
         nest = Nest(
             name=self.name,
             filename=self.filename,
@@ -145,10 +150,9 @@ class _Parser:
             allocations=allocations,
             outputs=outputs,
             parallel=parallel,
-            reduction=reduction,
-            pre=pre,
-            body=red_body,
-            post=post,
+            reductions=reductions,
+            bodies=bodies,
+            segments=segments,
             stores=stores,
         )
         self._check_names(nest)
@@ -235,27 +239,31 @@ class _Parser:
 
     def _split_tile(
         self, tile: list[ast.stmt]
-    ) -> tuple[Loop | None, tuple[ast.stmt, ...], tuple[ast.stmt, ...], tuple[ast.stmt, ...]]:
-        """(the reduction loop, pre, its body, post); with no reduction loop the whole tile is post."""
-        loops = [i for i, stmt in enumerate(tile) if isinstance(stmt, ast.For)]
-        if len(loops) > 1:
-            raise self.error("a tile has at most one reduction loop", tile[loops[1]])
-        if not loops:
-            self._check_statements(tile)
-            return None, (), (), tuple(tile)
-        at = loops[0]
-        reduction, body = self._loop(tile[at])  # type: ignore[arg-type]
-        pre, post = tile[:at], tile[at + 1 :]
-        for part in (pre, body, post):
-            self._check_statements(part)
-        return reduction, tuple(pre), tuple(body), tuple(post)
+    ) -> tuple[tuple[Loop, ...], tuple[tuple[ast.stmt, ...], ...], tuple[tuple[ast.stmt, ...], ...]]:
+        """(the reduction loops, their bodies, the segments before, between and after them)."""
+        reductions, bodies, segments, segment = [], [], [], []
+        for stmt in tile:
+            if isinstance(stmt, ast.For):
+                loop, body = self._loop(stmt)
+                self._check_statements(body)
+                reductions.append(loop)
+                bodies.append(tuple(body))
+                segments.append(tuple(segment))
+                segment = []
+            else:
+                segment.append(stmt)
+        self._check_statements(segment)
+        segments.append(tuple(segment))
+        for done in segments[:-1]:
+            self._check_statements(done)
+        return tuple(reductions), tuple(bodies), tuple(segments)
 
     # ------------------------------------------------------------------ tile statements
 
     def _check_statements(self, stmts: Iterable[ast.stmt]) -> None:
         for stmt in stmts:
             if isinstance(stmt, ast.For):
-                raise self.error("loops nest only as parallel loops around one reduction loop", stmt)
+                raise self.error("loops nest only as parallel loops around reduction loops", stmt)
             if isinstance(stmt, ast.Assign):
                 if len(stmt.targets) != 1 or not _names_only(stmt.targets[0]):
                     raise self.error("tile code assigns names: `a = ...` or `a, b = ...`", stmt)
@@ -277,14 +285,17 @@ class _Parser:
                     raise self.error("tile code can't assign inside expressions (`:=`)", node)
 
     def _stores(
-        self, pre: Iterable[ast.stmt], body: Iterable[ast.stmt], post: Iterable[ast.stmt], outputs: tuple[str, ...]
+        self,
+        bodies: tuple[tuple[ast.stmt, ...], ...],
+        segments: tuple[tuple[ast.stmt, ...], ...],
+        outputs: tuple[str, ...],
     ) -> dict[str, Store]:
-        for stmt in flatten([*pre, *body]):
+        for stmt in flatten([s for part in (*bodies, *segments[:-1]) for s in part]):
             store = as_store(stmt)
             if store and store.output in outputs:
-                raise self.error("store outputs once per tile, after the reduction loop", stmt)
+                raise self.error("store outputs once per tile, after the reduction loops", stmt)
         stores: dict[str, Store] = {}
-        for stmt in flatten(post):
+        for stmt in flatten(segments[-1]):
             store = as_store(stmt)
             if store and store.output in outputs:
                 if store.output in stores:
@@ -322,10 +333,13 @@ class _Parser:
                     if n.id in outputs:
                         what = "can't be read" if store else f"are written as `{n.id} = {n.id}.at[...].set(...)`"
                         raise self.error(f"output `{n.id}`'s tiles {what}", n)
-        loop_vars = [loop.var for loop in nest.loops]
+        loop_vars = {loop.var for loop in nest.loops}
+        parallel_vars = [loop.var for loop in nest.parallel]
         for depth, loop in enumerate(nest.loops):
             if loop.mask is None:
                 continue
+            # A parallel loop's mask sees the loops around it; a reduction's, the parallel loops and its own.
+            visible = set(parallel_vars[: depth + 1]) if depth < len(parallel_vars) else {*parallel_vars, loop.var}
             arrays = reads(loop.mask) & (params | outputs)
             if arrays:
                 raise self.error(
@@ -333,7 +347,7 @@ class _Parser:
                     f"`{sorted(arrays)[0]}`",
                     loop.mask,
                 )
-            inner = reads(loop.mask) & set(loop_vars[depth + 1 :])
+            inner = reads(loop.mask) & (loop_vars - visible)
             if inner:
                 raise self.error(
                     f"a mask reads its own and enclosing loops' variables, not `{sorted(inner)[0]}`", loop.mask
@@ -342,11 +356,11 @@ class _Parser:
         for loop in nest.loops:
             if loop.var in written:
                 raise self.error(f"loop variable `{loop.var}` can't be assigned in the tile", loop.node)
-        if nest.reduction:
-            var = nest.reduction.var
-            for stmt in flatten(nest.pre + nest.post):
-                if var in reads(stmt):
-                    raise self.error(f"`{var}` is only defined inside its reduction loop", stmt)
+        for r, reduction in enumerate(nest.reductions):
+            elsewhere = [s for b, body in enumerate(nest.bodies) if b != r for s in body]
+            for stmt in flatten([*elsewhere, *(s for segment in nest.segments for s in segment)]):
+                if reduction.var in reads(stmt):
+                    raise self.error(f"`{reduction.var}` is only defined inside its reduction loop", stmt)
 
 
 def _names_only(target: ast.expr) -> bool:

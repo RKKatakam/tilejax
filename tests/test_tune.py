@@ -71,9 +71,17 @@ def test_search_skips_what_it_tried_ignores_failures_and_keeps_to_its_budget():
     assert "doesn't build" in str(tuning)
 
 
-def test_search_needs_a_working_start():
-    with pytest.raises(KernelError, match=r"the default schedule \(start\) fails: no"):
+def test_search_needs_a_schedule_that_runs():
+    with pytest.raises(KernelError, match="no schedule tried ran: start: no"):
         search("start", lambda c: Trial(c, error="no"), lambda t: [], 5)
+
+
+def test_a_failing_start_is_replaced_by_the_first_proposal_that_runs():
+    def measure(config):
+        return Trial(config, error="out of VMEM") if config == "big" else Trial(config, profile(config, seconds=2.0))
+
+    tuning = search("big", measure, lambda t: ["small"] if t.config == "big" else [], 5)
+    assert tuning.config == "small" and [t.config for t in tuning.trials] == ["big", "small"]
 
 
 def test_a_small_gain_isnt_a_gain():
@@ -96,8 +104,8 @@ def test_proposals_follow_the_bottleneck():
     # Exposed copies: more input buffers first, then schedules that move fewer bytes.
     dma = Trial(start, profile(start, seconds=10.0, wait=5.0))
     assert proposals(k, sig, dma)[0] == Config(Tiles(), Pipeline(4, 2))
-    # (a deeper tk moves as many bytes: only a taller tm reuses y)
-    assert [c.tunable for c in proposals(k, sig, dma)[1:]] == [Tiles(tm=256)]
+    # (tk=256 covers K: one step per tile, x fetched per tile and y once)
+    assert [c.tunable for c in proposals(k, sig, dma)[1:]] == [Tiles(tm=256), Tiles(tk=256)]
     # Exposed output copies: one more output buffer.
     outs = Trial(start, profile(start, seconds=10.0, out_wait=5.0))
     assert proposals(k, sig, outs)[0] == Config(Tiles(), Pipeline(3, 3))
@@ -252,3 +260,46 @@ def test_neighbours_that_build_the_same_kernel_arent_proposed():
     proposed = proposals(matmul, sig, Trial(start, profile(start, seconds=10.0)))
     # The kernel clamps 1024 to the array's 512: only the smaller tiles change the kernel.
     assert [c.tunable for c in proposed] == [MatmulTiles(tm=256), MatmulTiles(tn=256), MatmulTiles(tk=256)]
+
+
+def test_after_a_failure_propose_less_vmem():
+    k = make_kernel(WIDE, Tiles=Tiles)
+    sig = k.signature(rand((1024, 512)), rand((512, 24448), 1))
+    failed = Trial(Config(Tiles(), Pipeline(3, 2)), error="Mosaic ran out of VMEM")
+    proposed = proposals(k, sig, failed)
+    assert proposed[0] == Config(Tiles(), Pipeline(2, 2))
+    # Then the neighbours, least VMEM first: tm=64 before tm=128's other neighbours; tm=512 doesn't fit at all.
+    assert [c.tunable for c in proposed[1:]] == [Tiles(tm=64), Tiles(tk=256), Tiles(tm=256)]
+    assert all(c.pipeline == Pipeline(2, 2) for c in proposed)
+    again = Trial(Config(Tiles(), Pipeline(2, 2)), error="still")
+    assert proposals(k, sig, again) == proposed[1:]
+    # From tm=256, tk=256 over K=256: tm=512 can't fit and tk=512 doesn't divide K, so neither is proposed.
+    sig = k.signature(rand((1024, 256)), rand((256, 24448), 1))
+    big = Trial(Config(Tiles(tm=256, tk=256), Pipeline(2, 2)), error="out of VMEM")
+    assert [c.tunable for c in proposals(k, sig, big)] == [Tiles(tm=128, tk=256), Tiles(tm=256, tk=128)]
+    blind = make_kernel(SOURCE.replace("t=Tiles()", "").replace("t.tm", "128").replace("t.tk", "128"))
+    blind_sig = blind.signature(X, Y)
+    assert proposals(blind, blind_sig, Trial(Config(None, Pipeline(2, 2)), error="x")) == []
+
+
+def test_the_default_schedule_is_the_nearest_that_builds():
+    @autokernel.tunable
+    class Rows:
+        tm: int = autokernel.choice(128, 256, 512, 1024, default=1024)
+
+    k = make_kernel(
+        """
+        def f(x, t=Rows()):
+            out = jnp.zeros((512, 128))
+            for i in range(0, 512, t.tm):
+                out = out.at[i : i + t.tm, :].set(x[i : i + t.tm, :])
+            return out
+        """,
+        Rows=Rows,
+    )
+    assert k.default_config(k.signature(rand((512, 128)))).tunable == Rows(tm=512)  # 1024 doesn't divide 512
+    with pytest.raises(KernelError, match="whole number of steps"):
+        k.default_config(k.signature(rand((96, 128))))  # nothing divides 96 rows
+    blind = make_kernel(WIDE.replace("t=Tiles()", "").replace("t.tm", "8192").replace("t.tk", "128"))
+    with pytest.raises(KernelError, match="MiB of VMEM"):
+        blind.default_config(blind.signature(rand((8192, 512)), rand((512, 24448), 1)))

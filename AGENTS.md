@@ -20,7 +20,8 @@ kernel for a **TPU v5e**, and tunes its schedule on the hardware. The scope is d
   pick the next schedules. Don't add cost models, disk caches or search options; make the profile say what
   to do instead.
 - **The examples are the spec**: matmul, causal matmul, causal attention (checked against JAX's splash
-  attention), RMSNorm fused with a projection (checked against plain JAX). A feature earns its place by making one of them better or by a new example that needs it.
+  attention), RMSNorm fused with a projection (checked against plain JAX), and a whole attention block
+  (attention, RMSNorm, feed-forward) in one kernel (checked against splash + XLA, and NumPy). A feature earns its place by making one of them better or by a new example that needs it.
 
 ## The pipeline
 
@@ -63,11 +64,17 @@ tune.py: for each candidate Config (tunable, Pipeline): build -> run -> compare 
 
 ### How a step runs (codegen.py)
 
-Decode the step (arithmetic, or SMEM tables when masked) → start the fetch `input_buffers - 1` steps ahead
-→ at a tile's first step, start the next tile's per-tile inputs and wait for this tile's → wait for this
-step's inputs → at a tile's last step, wait for the output slot → pre (first step) / body / post (last
-step, stores + output DMA starts). Masked-out tiles are filled from a constant VMEM tile, a share per
+Decode the step into (tile, phase, block, first/last of the phase) (arithmetic, or SMEM tables when
+masked) → start the fetch of the step `input_buffers - 1` ahead (its phase's operands: prefetch crosses
+phase and tile boundaries) → at a tile's first step, start the next tile's per-tile inputs and wait for
+this tile's → wait for this phase's inputs → at a tile's last step, wait for the output slot → the code
+before the phases (tile's first step) / the phase's body / the code after it (phase's last step; after the
+last phase: stores + output DMA starts). Masked-out tiles are filled from a constant VMEM tile, a share per
 tile, at most 4 in flight. Trace regions wrap the waits, the output wait and the tile code.
+
+A tile's reduction loops are its phases (`plan.Phase`); a reduction loop of one iteration is inlined into
+the code around it by plan.py (its variable bound by a synthetic assignment), so it takes no step and the
+windows it moves are fetched once. Values cross phases through VMEM scratch exactly as they cross steps.
 
 ## Measured facts that shape the code (TPU v5e, JAX 0.11.2)
 
@@ -90,6 +97,10 @@ Each of these was found on hardware; don't undo them without measuring again.
   8192×4096→4096 1.66 -> 1.49 ms (XLA unfused 1.61), 16384×2048→2048 0.876 -> 0.778 ms (XLA 0.907).
   A kernel that clamps a tunable field to the array (`min(tiles.tm, M)`) makes some neighbours the same
   kernel: proposals skip neighbours whose loops step as the current schedule's do.
+- The whole attention block (attention + RMSNorm + FFN, one kernel, two phases) beat splash (at its best
+  blocks) + RMSNorm + FFN in XLA by 1.06-1.13x on six shapes (D 1024-4096, F 4096-16384, head dim 64 and
+  128); tuning picked 256-512 query/key blocks and streamed FFN weights in 1024-wide blocks. Bigger blocks
+  ran Mosaic out of VMEM (intermediates beyond the kernel's own buffers): the tuner rules those out.
 - 128³ matmul tiles are per-step-overhead bound (~0.2 us of fixed cost per step); 512³ bf16 tiles are
   DMA/MXU balanced. The tuner's proposals follow from these: overhead -> bigger tiles.
 - `jax.named_scope` in a kernel shows up in the profiler as events on the "XLA TraceMe" line, named

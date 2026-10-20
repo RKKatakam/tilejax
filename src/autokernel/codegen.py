@@ -25,6 +25,7 @@ import builtins
 import copy
 import importlib
 import inspect
+import itertools
 import keyword
 import math
 import textwrap
@@ -175,6 +176,7 @@ class _Generator:
         # The kernel's own locals and helper functions.
         self.n_step, self.n_blocks, self.n_fill_blocks = n("step"), n("blocks"), n("fill_blocks")
         self.n_s, self.n_tile, self.n_kb, self.n_first, self.n_last = n("s"), n("tile"), n("kb"), n("first"), n("last")
+        self.n_ph = n("ph")
         self.n_at, self.n_rep, self.n_code, self.n_c, self.n_slot = n("at"), n("rep"), n("code"), n("c"), n("slot")
 
     # ------------------------------------------------------------------ the module
@@ -305,27 +307,45 @@ class _Generator:
         return w.text()
 
     def _step_fn(self, w: _Writer) -> None:
-        sch, s, tile, kb = self.schedule, self.n_s, self.n_tile, self.n_kb
+        sch, s, tile, ph, kb = self.schedule, self.n_s, self.n_tile, self.n_ph, self.n_kb
         if self.single:
             return  # a step is a tile
+        phases = len(sch.phase_counts)
         with w.block(f"def {self.n_step}({s}):"):
-            w('"""Step s: its tile, its reduction block, and whether it is the tile\'s first and last step."""')
-            if sch.steps_per_tile is not None:
+            w('"""Step s: its tile, its phase (reduction loop), the loop\'s block, and whether that is the phase\'s')
+            w('first and last step."""')
+            if not sch.step_tables and phases == 1:
                 r = sch.steps_per_tile
                 w(f"{tile}, {kb} = {_int_expr(s, '//', r)}, {_int_expr(s, '%', r)}")
-                w(f"return {tile}, {kb}, {kb} == 0, {kb} == {r - 1}")
-                return
-            step_tile, step_code = self.table_params[STEP_TILE], self.table_params[STEP_CODE]
-            r = s
-            if sch.repeats > 1:  # the tables hold one combination of the outer loops' steps
-                w(f"{self.n_rep} = {_int_expr(s, '//', sch.pattern_steps)}")
-                r = self.local("r")
-                w(f"{r} = {s} - {self.n_rep} * {sch.pattern_steps}")
-                w(f"{tile} = {self.n_rep} * {sch.pattern_tiles} + {step_tile}[{r}]")
+                w(f"return {tile}, 0, {kb}, {kb} == 0, {kb} == {r - 1}")
+            elif not sch.step_tables:
+                within = self.local("within")
+                ends = list(itertools.accumulate(sch.phase_counts))
+                past = [f"({within} >= {end}).astype(jnp.int32)" for end in ends[:-1]]  # phases already done
+                r = sch.steps_per_tile
+                w(f"{tile}, {within} = {_int_expr(s, '//', r)}, {_int_expr(s, '%', r)}")
+                w(f"{ph} = {' + '.join(past)}")
+                offset = " + ".join(f"{p} * {c}" for p, c in zip(past, sch.phase_counts, strict=False))
+                w(f"{kb} = {within} - ({offset})")
+                last = " | ".join(f"({within} == {end - 1})" for end in ends)
+                w(f"return {tile}, {ph}, {kb}, {kb} == 0, {last}")
             else:
-                w(f"{tile} = {step_tile}[{r}]")
-            w(f"{self.n_code} = {step_code}[{r}]")
-            w(f"return {tile}, {self.n_code} >> 2, ({self.n_code} & 2) != 0, ({self.n_code} & 1) != 0")
+                step_tile, step_code = self.table_params[STEP_TILE], self.table_params[STEP_CODE]
+                r = s
+                if sch.repeats > 1:  # the tables hold one combination of the outer loops' steps
+                    w(f"{self.n_rep} = {_int_expr(s, '//', sch.pattern_steps)}")
+                    r = self.local("r")
+                    w(f"{r} = {s} - {self.n_rep} * {sch.pattern_steps}")
+                    w(f"{tile} = {self.n_rep} * {sch.pattern_tiles} + {step_tile}[{r}]")
+                else:
+                    w(f"{tile} = {step_tile}[{r}]")
+                code = self.n_code
+                w(f"{code} = {step_code}[{r}]")
+                block = f"({code} >> 2)"
+                w(
+                    f"return {tile}, {_int_expr(block, '%', phases)}, {_int_expr(block, '//', phases)}, "
+                    f"({code} & 2) != 0, ({code} & 1) != 0"
+                )
 
     def _radix(self, w: _Writer, index: str, ranges: tuple[Range, ...]) -> list[str]:
         """Emit the blocks of `ranges` at row-major position `index`; their names."""
@@ -399,8 +419,8 @@ class _Generator:
             block_of = {r.var: self.blk[r.var] for r in self.plan.parallel}
             if op.kind is not Kind.ONCE:
                 self._unpack(w, at)
-            if self.plan.reduction:
-                block_of[self.plan.reduction.var] = kb
+            for r in self.plan.reductions:  # only the operand's own phase's loop moves it
+                block_of[r.var] = kb if op.phase is not None and self.plan.phases[op.phase].range is r else "0"
             src = f"{self.hbm[op.tile.array]}.at[{self._window_index(op.tile, block_of)}]"
             dst = (buf, sem) if op.kind is Kind.ONCE else (f"{buf}.at[{slot}]", f"{sem}.at[{slot}]")
             w(f"return pltpu.make_async_copy({src}, {dst[0]}, {dst[1]})")
@@ -456,10 +476,11 @@ class _Generator:
         if streamed and ahead:
             w(f"# The first {ahead} step(s)' inputs.")
             for step in range(ahead):
-                tile, kb = sch.step_at(step)
+                tile, phase, kb = sch.step_at(step)
                 at = sch.blocks_at(tile)
                 for op in streamed:
-                    w(f"{self.copy_fns[op.name]}({at}, {kb}, {step}).start()")
+                    if op.phase in (None, phase):
+                        w(f"{self.copy_fns[op.name]}({at}, {kb}, {step}).start()")
 
     def _region(self, w: _Writer, region: str) -> Any:
         if not self.trace:
@@ -473,45 +494,68 @@ class _Generator:
         w(f"@pl.when({cond})")
         return w.block(f"def {self.local(name)}():")
 
+    def _by_phase(self, ops: list[Operand]) -> dict[int | None, list[Operand]]:
+        """Streamed operands by the phase they stream in (None: every step)."""
+        groups: dict[int | None, list[Operand]] = {}
+        for op in ops:
+            groups.setdefault(op.phase, []).append(op)
+        return groups
+
+    def _in_phase(self, ph: str, phase: int | None) -> str | None:
+        """The condition that a step of phase `ph` is in `phase` (None: always)."""
+        return None if phase is None or len(self.plan.phases) == 1 else f"{ph} == {phase}"
+
     def _loop(self, w: _Writer) -> None:
         plan, sch, pipe = self.plan, self.schedule, self.pipeline
-        s, tile, kb, first, last, at = self.n_s, self.n_tile, self.n_kb, self.n_first, self.n_last, self.n_at
-        first_c, last_c = (first, last) if not self.single else (None, None)  # a single step is first and last
+        s, tile, ph, kb, at = self.n_s, self.n_tile, self.n_ph, self.n_kb, self.n_at
+        first, last = self.n_first, self.n_last
+        phases = len(plan.phases)
+        if self.single:  # a step is a tile: it is every phase's first and last step
+            tile_first = tile_last = None
+        else:
+            tile_first = first if phases == 1 else f"({ph} == 0) & {first}"
+            tile_last = last if phases == 1 else f"({ph} == {phases - 1}) & {last}"
         w("")
         w(f"@pl.loop(0, {sch.steps})")
         with w.block(f"def {self.local('_steps')}({s}):"):
             if self.single:
                 w(f"{tile}, {kb} = {s}, 0")
             else:
-                w(f"{tile}, {kb}, {first}, {last} = {self.n_step}({s})")
+                w(f"{tile}, {ph}, {kb}, {first}, {last} = {self.n_step}({s})")
             w(f"{at} = {self.n_blocks}({tile})")
 
             streamed = [op for op in plan.operands if op.kind is Kind.STREAM]
             depth = pipe.input_buffers
             if streamed:
                 with self._when(w, f"{s} + {depth - 1} < {sch.steps}", "_fetch_ahead"):
-                    ahead_tile, ahead_kb = self.local("ahead_tile"), self.local("ahead_kb")
+                    ahead_tile, ahead_ph = self.local("ahead_tile"), self.local("ahead_ph")
+                    ahead_kb = self.local("ahead_kb")
                     if self.single:
                         w(f"{ahead_tile}, {ahead_kb} = {s} + {depth - 1}, 0")
                     else:
-                        w(f"{ahead_tile}, {ahead_kb}, _, _ = {self.n_step}({s} + {depth - 1})")
+                        w(f"{ahead_tile}, {ahead_ph}, {ahead_kb}, _, _ = {self.n_step}({s} + {depth - 1})")
                     ahead_slot = _int_expr(f"{s} + {depth - 1}", "%", depth)
-                    for op in streamed:
-                        w(f"{self.copy_fns[op.name]}({self.n_blocks}({ahead_tile}), {ahead_kb}, {ahead_slot}).start()")
+                    for phase, ops in self._by_phase(streamed).items():
+                        with self._when(w, self._in_phase(ahead_ph, phase), f"_fetch_phase{phase}"):
+                            for op in ops:
+                                blocks = f"{self.n_blocks}({ahead_tile})"
+                                w(f"{self.copy_fns[op.name]}({blocks}, {ahead_kb}, {ahead_slot}).start()")
 
             per_tile = [op for op in plan.operands if op.kind is Kind.TILE]
             slots = {Kind.STREAM: _int_expr(s, "%", depth), Kind.TILE: _int_expr(tile, "%", TILE_SLOTS)}
             with self._region(w, WAIT) if per_tile or streamed else nullcontext():  # (no region to leave empty)
                 if per_tile:
-                    with self._when(w, first_c, "_tile_inputs"):
+                    with self._when(w, tile_first, "_tile_inputs"):
                         with self._when(w, f"{tile} + 1 < {sch.tiles}", "_next_tile_inputs"):
                             next_slot = _int_expr(f"{tile} + 1", "%", TILE_SLOTS)
                             for op in per_tile:
                                 w(f"{self.copy_fns[op.name]}({self.n_blocks}({tile} + 1), {next_slot}).start()")
                         for op in per_tile:
                             w(f"{self.copy_fns[op.name]}({at}, {slots[Kind.TILE]}).wait()")
-                for op in streamed:
-                    w(f"{self.copy_fns[op.name]}({at}, {kb}, {slots[Kind.STREAM]}).wait()")
+                for phase, ops in self._by_phase(streamed).items():
+                    with self._when(w, self._in_phase(ph, phase), f"_wait_phase{phase}"):
+                        for op in ops:
+                            w(f"{self.copy_fns[op.name]}({at}, {kb}, {slots[Kind.STREAM]}).wait()")
             for op in plan.operands:
                 buf = self.bufs[op.name]
                 view = buf if op.kind is Kind.ONCE else f"{buf}.at[{slots[op.kind]}]"
@@ -520,37 +564,54 @@ class _Generator:
 
             out_slots = pipe.output_buffers
             with self._region(w, OUT_WAIT):
-                cond = f"{last} & ({tile} >= {out_slots})" if not self.single else f"{tile} >= {out_slots}"
+                cond = f"{tile} >= {out_slots}" if tile_last is None else f"{tile_last} & ({tile} >= {out_slots})"
                 with self._when(w, cond, "_free_output_slot"):
                     zero = (0,) * len(plan.parallel)
                     for out in plan.outputs:
                         w(f"{self.copy_fns[out.name]}({zero}, {_int_expr(tile, '%', out_slots)}).wait()")
 
             if sch.fills:
-                with self._when(w, first_c, "_fill_skipped_tiles"):
+                with self._when(w, tile_first, "_fill_skipped_tiles"):
                     self._start_fills(w)
 
             with self._region(w, COMPUTE):
-                code = _TileCode(self)
-                if plan.nest.pre:
-                    with self._when(w, first_c, "_before_reduction"):
-                        w(*code.emit(plan.nest.pre, "pre"))
-                if plan.nest.body:
-                    w(*code.emit(plan.nest.body, "body"))
-                with self._when(w, last_c, "_after_reduction"):
-                    w(*code.emit(plan.nest.post, "post"))
+                self._tile_code(w, tile_first)
+
+    def _tile_code(self, w: _Writer, tile_first: str | None) -> None:
+        """The segments and the phase bodies: the code before the phases at a tile's first step; each
+        phase's body at its steps, with the code after it at its last step (where the body's values are
+        still in scope)."""
+        plan, code = self.plan, _TileCode(self)
+        if self.single:
+            w(*code.emit(plan.segments[0], "start", set()))
+            return
+        if plan.segments[0]:
+            with self._when(w, tile_first, "_start_tile"):
+                w(*code.emit(plan.segments[0], "start", set()))
+        for p, phase in enumerate(plan.phases):
+            with self._when(w, self._in_phase(self.n_ph, p), f"_phase{p}"):
+                w(*code.emit(phase.body, "body", set()))
+                after = plan.segments[p + 1]
+                if after:
+                    final = p == len(plan.phases) - 1
+                    carried = set(plan.carried)
+                    # At the end, carried values are just values; before it, they're stored for later steps.
+                    outside = assigned(phase.body) | carried if final else assigned(phase.body) - carried
+                    with self._when(w, self.n_last, "_end_tile" if final else f"_after_phase{p}"):
+                        w(*code.emit(after, "end" if final else "between", outside))
 
     def _loop_vars(self, w: _Writer) -> None:
-        """Bind the loop variables the tile code reads, as weakly typed ints (Python ints in the loop nest)."""
+        """Bind the loop variables the tile code reads, as weakly typed ints (Python ints in the loop nest).
+        A reduction loop of one iteration binds its variable in the tile code itself (plan.py)."""
         plan = self.plan
         used = self.value_reads
         names = [self.blk[r.var] for r in plan.parallel]
         if any(r.var in used for r in plan.parallel):
             w(f"{_tuple(names)} = {self.n_at}")
-        for r in plan.loops:
+        for r in (*plan.parallel, *(phase.range for phase in plan.phases)):
             if r.var not in used:
                 continue
-            block = self.n_kb if r is plan.reduction else self.blk[r.var]
+            block = self.blk[r.var] if r in plan.parallel else self.n_kb
             value = _scaled(block, r)
             if r.count > 1:
                 value = f"{_WEAK}({value})"
@@ -604,12 +665,14 @@ class _TileCode:
     def __init__(self, gen: _Generator) -> None:
         self.gen, self.plan = gen, gen.plan
         self.segment = ""
+        self.outside: set[str] = set()
         self.renamed: dict[str, str] = {}
 
-    def emit(self, stmts: tuple[ast.stmt, ...], segment: str) -> list[str]:
-        """Source lines for `stmts`; in `post`, assignments to names bound outside it get fresh names (the
-        code after the reduction runs in a function of its own)."""
-        self.segment = segment
+    def emit(self, stmts: tuple[ast.stmt, ...], segment: str, outside: set[str]) -> list[str]:
+        """Source lines for `stmts`. The code after a phase runs in a function of its own, inside the phase's:
+        an assignment there to a name in `outside` (the phase body's, and at the end, carried values') gives
+        it a fresh name from then on. Before the end, assignments to carried values store them."""
+        self.segment, self.outside = segment, outside
         self.renamed: dict[str, str] = {}
         lines = []
         for stmt in stmts:
@@ -641,7 +704,7 @@ class _TileCode:
         assert isinstance(stmt, ast.Assign)
         value = self._expr(stmt.value)
         target = stmt.targets[0]
-        if self.segment != "post" and isinstance(target, ast.Name) and target.id in plan.carried:
+        if self.segment != "end" and isinstance(target, ast.Name) and target.id in plan.carried:
             c = plan.carried[target.id]
             ref = gen.refs[c.name]
             value = self._cast(value, types_[c.name], c.shape, c.dtype, f"{ref}.dtype")
@@ -649,12 +712,9 @@ class _TileCode:
         return [ast.Assign([self._rename_targets(copy.deepcopy(target))], value)]
 
     def _rename_targets(self, target: ast.expr) -> ast.expr:
-        """In post, a name bound outside it gets a fresh name from its first assignment there on."""
-        if self.segment != "post":
-            return target
-        outside = assigned(self.plan.nest.body) | set(self.plan.carried)
+        """A name in `outside` gets a fresh name from its first assignment here on."""
         for node in ast.walk(target):
-            if isinstance(node, ast.Name) and node.id in outside:
+            if isinstance(node, ast.Name) and node.id in self.outside:
                 if node.id not in self.renamed:
                     self.renamed[node.id] = self.gen.local(node.id)
                 node.id = self.renamed[node.id]

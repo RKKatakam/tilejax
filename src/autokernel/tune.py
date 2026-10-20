@@ -33,8 +33,8 @@ import numpy as np
 
 from . import profiling, v5e
 from .errors import KernelError
-from .pipeline import MAX_INPUT_BUFFERS, MAX_OUTPUT_BUFFERS, Pipeline, default_pipeline, fits
-from .plan import Kind, Plan
+from .pipeline import MAX_INPUT_BUFFERS, MAX_OUTPUT_BUFFERS, Pipeline, default_pipeline, fits, vmem_bytes
+from .plan import Kind, Operand, Plan
 from .profiling import KernelProfile
 from .schedule import Schedule
 from .tunable import choices, neighbours
@@ -100,11 +100,10 @@ class Tuning:
 def search(
     start: Config, measure: Callable[[Config], Trial], propose: Callable[[Trial], Sequence[Config]], budget: int
 ) -> Tuning:
-    """Climb from `start`: measure what the best trial's profile proposes, in order, moving to the first
-    proposal that is faster; stop when none is, or after `budget` trials."""
+    """Climb from `start`: measure what the best trial proposes, in order, moving to the first proposal that
+    is faster; stop when none is, or after `budget` trials. A trial that fails is infinitely slow, so if the
+    start fails (Mosaic can't compile it, say), the first proposal that runs replaces it."""
     best = measure(start)
-    if best.profile is None:
-        raise KernelError(f"the default schedule ({start}) fails: {best.error}")
     trials = {start: best}
     improved = True
     while improved:
@@ -118,6 +117,9 @@ def search(
             if trial.seconds < best.seconds * (1 - MIN_GAIN):
                 best, improved = trial, True
                 break
+    if best.profile is None:
+        errors = "; ".join(f"{t.config}: {t.error}" for t in trials.values())
+        raise KernelError(f"no schedule tried ran: {errors}")
     return Tuning(best, list(trials.values()))
 
 
@@ -130,8 +132,12 @@ class _Stats:
 
 
 def _stats(plan: Plan, schedule: Schedule) -> _Stats:
-    copies = {Kind.STREAM: schedule.steps, Kind.TILE: schedule.tiles, Kind.ONCE: 1}
-    moved = sum(copies[op.kind] * _bytes(op.tile.shape, op.tile.dtype) for op in plan.operands)
+    def copies(op: Operand) -> int:
+        if op.kind is Kind.STREAM:
+            return schedule.steps if op.phase is None else schedule.phase_steps[op.phase]
+        return schedule.tiles if op.kind is Kind.TILE else 1
+
+    moved = sum(copies(op) * _bytes(op.tile.shape, op.tile.dtype) for op in plan.operands)
     moved += sum((schedule.tiles + schedule.fills) * _bytes(o.tile.shape, o.dtype) for o in plan.outputs)
     return _Stats(schedule.steps, moved)
 
@@ -148,8 +154,9 @@ def _bytes(shape: tuple[int, ...], dtype: Any) -> int:
 def proposals(kernel: Kernel, signature: Signature, trial: Trial) -> list[Config]:
     """The schedules to try after `trial`, most promising first, as its profile's bottleneck says (see the
     module docstring). Schedules that don't build or don't fit in VMEM aren't proposed."""
-    assert trial.profile is not None
     config, profile = trial.config, trial.profile
+    if profile is None:  # it didn't run: the neighbours that need the least VMEM first, then less buffering
+        return _smaller(kernel, signature, config)
     plan, schedule = kernel.build(signature, config.tunable)
     here, pipe, loops = _stats(plan, schedule), config.pipeline, _loop_steps(plan)
     exposed = EXPOSED_SHARE * profile.device_s
@@ -178,6 +185,21 @@ def proposals(kernel: Kernel, signature: Signature, trial: Trial) -> list[Config
     else:
         near = sorted(near, key=lambda n: n[0].steps)
     return moves + [c for _, c in near]
+
+
+def _smaller(kernel: Kernel, signature: Signature, config: Config) -> list[Config]:
+    """After `config` failed to run: two buffers each, then the neighbouring tunables, least VMEM first."""
+    least = Pipeline(2, 2)
+    found = [] if config.pipeline == least else [Config(config.tunable, least)]
+    near = []
+    for tunable in neighbours(config.tunable) if config.tunable is not None else ():
+        try:
+            plan, schedule = kernel.build(signature, tunable)
+        except KernelError:
+            continue
+        if fits(plan, schedule, least):
+            near.append((vmem_bytes(plan, schedule, least), Config(tunable, least)))
+    return found + [c for _, c in sorted(near, key=lambda n: n[0])]
 
 
 def random_inputs(signature: Signature, seed: int = 0) -> list[jax.Array]:

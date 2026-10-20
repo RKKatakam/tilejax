@@ -243,7 +243,7 @@ def test_names_the_kernel_uses_itself_are_renamed():
     x = rand((256, 256))
     check(kernel, x)
     src = kernel.source(x)
-    assert "def f_kernel2(" in src and "def step2(s2):" in src and "tile2, kb, first, last = step2(s2)" in src
+    assert "def f_kernel2(" in src and "def step2(s2):" in src and "tile2, ph, kb, first, last = step2(s2)" in src
 
 
 def helper_scale(v):
@@ -575,3 +575,114 @@ def test_a_number_starting_an_integer_carried_value_is_cast():
     x = rand((8, 256))
     check(kernel, x)
     assert "acc_ref[...] = jnp.broadcast_to(0, (8, 128)).astype(acc_ref.dtype)" in kernel.source(x)
+
+
+TWO_PASS = """
+def f(x, w):
+    M, D = x.shape
+    out = jnp.zeros((M, 256))
+    for i in range(0, M, 128):
+        sum_sq = jnp.zeros((128, 128))
+        for k in range(0, D, 128):
+            xk = x[i : i + 128, k : k + 128]
+            sum_sq += xk * xk
+        scale = jax.lax.rsqrt(jnp.sum(sum_sq, axis=1, keepdims=True) / D + 1e-6)
+        acc = jnp.zeros((128, 256))
+        for k2 in range(0, D, 128):
+            acc += (x[i : i + 128, k2 : k2 + 128] * scale) @ w[k2 : k2 + 128, :]
+        out = out.at[i : i + 128, :].set(acc)
+    return out
+"""
+
+
+def test_two_phases_one_after_another():
+    kernel = make_kernel(TWO_PASS)
+    x, w = rand((256, 384)), rand((384, 256), 1)
+    out = check(kernel, x, w)
+    xf = f64(x)
+    want = xf / np.sqrt(np.mean(xf * xf, axis=1, keepdims=True) + 1e-6) @ f64(w)
+    np.testing.assert_allclose(f64(out), want, rtol=1e-4, atol=1e-4)
+    lowered = kernel.lower(x, w)
+    assert [p.range.var for p in lowered.plan.phases] == ["k", "k2"] and lowered.steps == 2 * 6
+    assert {op.name: op.phase for op in lowered.plan.operands} == {"x": 0, "x2": 1, "w": 1}
+    assert set(lowered.plan.carried) == {"sum_sq", "scale", "acc"}
+    src = lowered.source
+    assert "(within >= 3).astype(jnp.int32)" in src and "def _phase1():" in src and "def _after_phase0():" in src
+    assert "x2_copy(blocks(ahead_tile), ahead_kb" in src  # the next phase's inputs are fetched ahead too
+
+
+MASKED_PHASES = """
+def f(x, w):
+    out = jnp.zeros((256, 128))
+    for i in range(0, 256, 128):
+        a = jnp.zeros((128, 128))
+        for k in range(0, 384, 128):
+            if k > i:
+                continue
+            y = x[i : i + 128, k : k + 128]
+            a += y
+        y = y * 2
+        a = a + y
+        t = a * 0
+        for c in range(0, 128, 128):
+            t = t + w[c : c + 128, :]
+        b = jnp.zeros((128, 128))
+        for k2 in range(0, 256, 128):
+            if k2 > i:
+                continue
+            b += x[i : i + 128, k2 : k2 + 128] @ w[0:128, :]
+        b = b * 3
+        out = out.at[i : i + 128, :].set(a + b + t)
+    return out
+"""
+
+
+def test_masked_phases_and_a_loop_of_one_iteration():
+    kernel = make_kernel(MASKED_PHASES)
+    x, w = rand((256, 384)), rand((128, 128), 1) / 8
+    out = check(kernel, x, w)
+    xf, wf = f64(x), f64(w)
+    for i in (0, 1):
+        rows = xf[i * 128 : (i + 1) * 128]
+        a = sum(rows[:, k * 128 : (k + 1) * 128] for k in range(i + 1))
+        a = a + 2 * rows[:, i * 128 : (i + 1) * 128]
+        b = 3 * sum(rows[:, k * 128 : (k + 1) * 128] @ wf for k in range(i + 1))
+        np.testing.assert_allclose(f64(out[i * 128 : (i + 1) * 128]), a + b + (a * 0 + wf), rtol=1e-4, atol=1e-4)
+    lowered = kernel.lower(x, w)
+    sch = lowered.schedule
+    assert [p.range.var for p in lowered.plan.phases] == ["k", "k2"] and sch.step_tables
+    assert sch.steps == 2 + 4 and sch.phase_steps == (3, 3)
+    assert [sch.step_at(s) for s in range(sch.steps)] == [
+        (0, 0, 0),
+        (0, 1, 0),
+        (1, 0, 0),
+        (1, 0, 1),
+        (1, 1, 0),
+        (1, 1, 1),
+    ]
+    src = lowered.source
+    assert "y2 = y * 2" in src and "a_ref[...] = a_ref[...] + y2" in src  # the phase's `y`, renamed after it
+    assert "c = 0" in src and "w_buf" in src  # the loop of one iteration runs inline; its window is fetched once
+
+
+def test_phases_back_to_back():
+    kernel = make_kernel(
+        """
+        def f(x):
+            out = jnp.zeros((128, 128))
+            for i in range(0, 128, 128):
+                a = jnp.zeros((128, 128))
+                for k in range(0, 256, 128):
+                    a += x[i : i + 128, k : k + 128]
+                for k2 in range(0, 256, 128):
+                    a = jnp.maximum(a, x[i : i + 128, k2 : k2 + 128])
+                out = out.at[i : i + 128, :].set(a)
+            return out
+        """
+    )
+    x = rand((128, 256))
+    out = check(kernel, x)
+    xf = f64(x)
+    total = xf[:, :128] + xf[:, 128:]
+    np.testing.assert_allclose(f64(out), np.maximum(np.maximum(total, xf[:, :128]), xf[:, 128:]), rtol=1e-6)
+    assert "_after_phase0" not in kernel.source(x)

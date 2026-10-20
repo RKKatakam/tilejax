@@ -38,12 +38,12 @@ def test_a_nest_parses_into_its_parts():
 
     nest = parse(f)
     assert nest.params == ("x", "y") and nest.outputs == ("out",)
-    assert [loop.var for loop in nest.parallel] == ["i", "j"] and nest.reduction.var == "k"
-    assert nest.parallel[0].mask is None and nest.parallel[1].mask is not None and nest.reduction.mask is not None
-    assert len(nest.prologue) == 2 and len(nest.pre) == 1 and len(nest.body) == 1 and len(nest.post) == 1
-    assert nest.store(nest.post[0]) is nest.stores["out"] and nest.store(nest.pre[0]) is None
+    assert [loop.var for loop in nest.parallel] == ["i", "j"] and [loop.var for loop in nest.reductions] == ["k"]
+    assert nest.parallel[0].mask is None and nest.parallel[1].mask is not None and nest.reductions[0].mask is not None
+    assert len(nest.prologue) == 2 and [len(s) for s in nest.segments] == [1, 1] and len(nest.bodies[0]) == 1
+    assert nest.store(nest.segments[1][0]) is nest.stores["out"] and nest.store(nest.segments[0][0]) is None
     assert [loop.var for loop in nest.loops] == ["i", "j", "k"]
-    assert nest.error("boom", nest.post[0]).args[0].startswith(f"{__file__}:")
+    assert nest.error("boom", nest.segments[1][0]).args[0].startswith(f"{__file__}:")
 
 
 def test_a_nest_without_a_reduction_is_all_post():
@@ -55,7 +55,7 @@ def test_a_nest_without_a_reduction_is_all_post():
 
     nest = parse(f)
     assert (
-        nest.reduction is None and nest.pre == nest.body == () and len(nest.post) == 1 and nest.loops == nest.parallel
+        nest.reductions == nest.bodies == () and [len(s) for s in nest.segments] == [1] and nest.loops == nest.parallel
     )
 
 
@@ -194,9 +194,9 @@ def test_loops():
         out = jnp.zeros(1)
         for i in range(1):
             for k in range(1):
-                pass
+                a = 1
             for k2 in range(1):
-                pass
+                b = 2
             out = out.at[i].set(1)
         return out
 
@@ -213,7 +213,8 @@ def test_loops():
         assert "`for v in range(start, stop, step)`" in error(fn)
     assert "`else` block" in error(with_else)
     assert "nothing to run" in error(only_a_mask)
-    assert "at most one reduction loop" in error(two_reductions)
+    nest = parse(two_reductions)  # reduction loops run one after another: phases
+    assert [loop.var for loop in nest.reductions] == ["k", "k2"] and [len(s) for s in nest.segments] == [0, 0, 1]
     assert "loops nest only as parallel loops" in error(nested_reduction)
 
 

@@ -42,7 +42,8 @@ def test_tables_walk_exactly_the_nests_steps():
     ]
     got = []
     for step in range(sch.steps):
-        tile, k = sch.step_at(step)
+        tile, phase, k = sch.step_at(step)
+        assert phase == 0
         got.append((sch.blocks_at(tile), k))
     assert got == want
     assert sch.tiles == 30 and sch.total_tiles == 48 and sch.fills == 18 and sch.repeats == 3
@@ -73,7 +74,7 @@ def test_without_masks_steps_are_arithmetic():
     ("tile_mask", "step_mask", "message"),
     [
         ("True", "False", "the masks skip every output tile"),
-        ("False", "k >= 0 * i", "skips every reduction step of the tile at i=0"),
+        ("False", "k >= 0 * i", "skips every step of `k`'s loop for the tile at i=0"),
         ("False", "undefined", "can't evaluate `undefined`"),
         ("False", "jnp.ones(2) > 0", "masks are Python conditions on loop variables"),
     ],
@@ -154,3 +155,12 @@ def test_a_causal_matmul_of_one_tile():
     run_checking_races(causal_matmul, x, y, tiles)
     causal_matmul.verify(x, y, tiles)
     assert causal_matmul.lower(x, y, tiles).schedule.tables == {}
+
+
+def test_phases_decode_arithmetically():
+    from test_codegen import TWO_PASS
+
+    sch = schedule_of(TWO_PASS, spec(256, 384), spec(384, 256))
+    assert not sch.step_tables and sch.phase_counts == (3, 3) and sch.phase_steps == (6, 6)
+    want = [(tile, phase, k) for tile in range(2) for phase in range(2) for k in range(3)]
+    assert [sch.step_at(s) for s in range(sch.steps)] == want

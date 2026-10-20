@@ -128,3 +128,16 @@ def test_rmsnorm_matmul_tunes_and_matches_plain_jax():
     want = f64(rmsnorm_then_matmul(x, gamma, w))
     np.testing.assert_allclose(f64(out), want, rtol=2e-2, atol=2e-2 * np.abs(want).max())
     rmsnorm_matmul.verify(x, gamma, w)
+
+
+def test_attention_block_natively_matches_splash_then_norm_and_ffn():
+    from attention_block import BlockTiles, attention_block, make_inputs, splash_then_norm_and_ffn
+
+    inputs = make_inputs(2, 8, 1024, 128, 4096)
+    unfused = splash_then_norm_and_ffn(8, 1024)(*inputs)
+    fused = attention_block(*inputs, BlockTiles())
+    scale = float(jnp.max(jnp.abs(unfused.astype(jnp.float32))))
+    np.testing.assert_allclose(f64(fused), f64(unfused), atol=3e-2 * scale)
+    tuned = jax.jit(attention_block)(*inputs)  # tunes on this first call
+    np.testing.assert_allclose(f64(tuned), f64(unfused), atol=3e-2 * scale)
+    print(attention_block.tuning(*inputs[:3], *inputs[3:]))

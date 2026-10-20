@@ -23,3 +23,4 @@ jobs:
       - run: uv run python examples/causal_matmul.py
       - run: uv run python examples/causal_attention.py
       - run: uv run python examples/rmsnorm_matmul.py
+      - run: uv run python examples/attention_block.py
