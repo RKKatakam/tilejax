@@ -103,6 +103,63 @@ The causal kernel skips every tile above the diagonal, so it does half of XLA's 
 | 1, 16, 4096 | 512 × 512 | 0.778 | **0.606** | 1.28× |
 | 1, 16, 4096 | 1024 × 1024 | 0.695 | **0.649** | 1.07× |
 
+## A modern transformer, kernel by kernel
+
+Every block of today's open decoders, as autokernel kernels (each a gridless loop nest, tuned on the
+chip), checked against float64 NumPy and timed against the strongest JAX baseline: XLA, JAX's Pallas
+kernels (splash attention, megablox, paged and ragged-paged attention), at their best block sizes.
+Fake weights and inputs, small models that fit a 16 GB v5e; bf16; ms per call, wall clock under
+`jax.jit`, after tuning; reproduce with `benchmarks/<name>.py`.
+
+| Block | Example | Baseline | autokernel |
+| --- | --- | --- | --- |
+| Qwen3 dense prefill (QK-norm, RoPE, GQA, SwiGLU), tokens → logits | [qwen3.py](examples/qwen3.py) | plain JAX + splash at its best blocks | **1.07–1.69×** (170–183 TFLOP/s) |
+| GQA attention + output projection (+ FFN), per layer | [gqa_attention.py](examples/gqa_attention.py) | splash + XLA | **1.11–1.52×** |
+| Sliding-window and gated (Qwen3-Next) attention | [gqa_attention.py](examples/gqa_attention.py) | splash (LocalMask) + XLA | **1.07–1.10×** |
+| MLA prefill block (DeepSeek-V3, Kimi K2) | [mla.py](examples/mla.py) | splash with 192-wide heads + XLA | **1.38–1.57×** |
+| Gated DeltaNet (Qwen3-Next), chunked | [linear_attention.py](examples/linear_attention.py) | chunked plain JAX (XLA) | **2.75–6.40×** |
+| KDA (Kimi Linear), chunked | [linear_attention.py](examples/linear_attention.py) | chunked plain JAX (XLA) | **3.66–9.39×** |
+| Gated DeltaNet layer (projections, conv, gates, norm) | [linear_attention_layer.py](examples/linear_attention_layer.py) | plain JAX | **1.32–1.97×** |
+| MoE experts, prefill (128 / 64 experts) | [moe.py](examples/moe.py) | megablox at its best tiling, `ragged_dot` | **1.29–1.45×** |
+| MoE, decode batches | [moe.py](examples/moe.py) | megablox, `ragged_dot` | parity (bandwidth bound, ~700 GB/s) |
+| GQA decode attention over a KV cache (ragged lengths) | [decode.py](examples/decode.py) | paged / ragged-paged attention, XLA | **0.97–1.40×** (up to 711 GB/s) |
+| Absorbed MLA decode attention | [decode.py](examples/decode.py) | XLA | **1.3–23×** (0.65× at B32 H16) |
+| Decode step, dense GQA model | [decode_model.py](examples/decode_model.py) | plain JAX + the best JAX decode kernel | **1.17–1.45×** |
+| A stack of FFN layers in one kernel (repeat loop) | [layer_stack.py](examples/layer_stack.py) | XLA / a kernel per layer | **1.02–1.22×** / 1.01–1.07× (744 GB/s) |
+| Whole decode step in one kernel (cross-layer prefetch) | [decode_megakernel.py](examples/decode_megakernel.py) | XLA / per-layer kernels | **1.03–1.45×** / 1.07× (up to 90% of HBM bandwidth) |
+
+**Whole models**, tokens to logits (prefill) and one token per sequence per step over a KV cache
+(decode), built only from autokernel kernels plus plain-JAX glue (embedding lookups, routing sorts, cache
+appends), against the same models in plain JAX with the best JAX kernels for each part. Speedups over
+the shapes benchmarked (prefill: batch 1-4, prompts 2048-8192; decode: batch 1-32, contexts 1k-8k):
+
+| Model (fake weights, small configs) | Example | Prefill | Decode |
+| --- | --- | --- | --- |
+| Qwen3 dense (d 2048, GQA 16/8, 4 layers) | [qwen3_models.py](examples/qwen3_models.py) | **1.11–1.48×** | **1.01–1.39×** |
+| Qwen3-MoE (128 experts, top-8) | [qwen3_models.py](examples/qwen3_models.py) | **1.14–1.50×** | **1.02–1.11×** |
+| DeepSeek-V3-like (MLA, 128 experts, grouped routing) | [deepseek.py](examples/deepseek.py) | **1.15–1.28×** | 0.96–1.20× |
+| Kimi-K2-like (MLA, 192 experts) | [deepseek.py](examples/deepseek.py) | **1.02–1.11×** | 0.97–1.21× |
+| Qwen3-Next-like (3:1 Gated DeltaNet : gated attention, MoE) | [hybrid_models.py](examples/hybrid_models.py) | **1.27–1.58×** | 0.99–1.05× |
+| Kimi-Linear-like (3:1 KDA : MLA, MoE) | [hybrid_models.py](examples/hybrid_models.py) | **1.55–2.00×** | 0.89–0.97× |
+
+Where autokernel is not ahead, the time is in plain-JAX glue the kernels don't cover (MoE routing and row
+gathers, the hybrid models' single-token linear-attention update) or the step is bandwidth bound already
+(small decode batches read every weight once, as the baselines do, at 80–90% of the v5e's 819 GB/s).
+Logits match the baselines to bf16 rounding; MoE models can differ more where a token's router scores are
+near a tie and the two pick different experts.
+
+**How these kernels are built.** Each is one loop nest (README "Writing kernels"), and the compiler
+features they needed came from them:
+
+- *Index arrays and runtime masks* (`lengths[b]`, `if j >= lengths[b]: continue`): decode attention reads
+  only each sequence's cache; MoE kernels visit only the experts a tile's tokens chose; paged attention
+  reads pages through `k_pages[block_table[b, p], :, :]`.
+- *Repeat loops*: a stack of layers in one kernel, the next layer's weights fetched while this one runs
+  (cross-layer prefetch); the whole decode step of a model is one kernel.
+- *Outputs stored per step*: chunked linear attention stores each chunk's outputs from the step that
+  computes them, carrying only the recurrent state.
+- *Per-tile windows fetched once*: MoE tiles of one expert read its weights once.
+
 ## Writing kernels
 
 ```python
@@ -183,9 +240,10 @@ def f(x, y, tiles=Tiles()):                   # the input arrays; optionally las
 
 Anything else is rejected with a `KernelError` naming the line, before anything runs.
 
-The [examples](examples/) are matmul, causal matmul, causal multi-head (splash) attention, RMSNorm fused
-with the projection after it, and a whole attention block (attention, RMSNorm, feed-forward layer) in one
-kernel, tested against NumPy, JAX's own splash attention, and plain JAX.
+The [examples](examples/) start with matmul, causal matmul, causal multi-head (splash) attention, RMSNorm
+fused with the projection after it, and a whole attention block (attention, RMSNorm, feed-forward layer)
+in one kernel; then every block of a modern decoder and whole models built from them (above, "A modern
+transformer"), each tested against NumPy and the JAX baselines.
 
 **A whole attention block in one kernel** ([examples/attention_block.py](examples/attention_block.py)):
 causal multi-head attention, the post-attention RMSNorm and the feed-forward layer
@@ -350,7 +408,10 @@ src/autokernel/
   v5e.py        the chip: memories and layout rules
   errors.py     KernelError
 examples/       matmul, causal matmul, causal attention (+ JAX splash), RMSNorm fused with a projection,
-                a whole attention block, a whole transformer
+                a whole attention block, a whole transformer; Qwen3 (GQA, QK-norm, RoPE, sliding window,
+                gated attention, SwiGLU), MLA, MoE, KV-cache decoding (paged too), linear attention
+                (Gated DeltaNet, KDA), whole Qwen3 / Qwen3-MoE / DeepSeek-V3 / Kimi-K2 / Qwen3-Next /
+                Kimi-Linear-like models, a decode step in one kernel
 benchmarks/     timing and profiling scripts for a TPU v5e
 tests/
 ```
