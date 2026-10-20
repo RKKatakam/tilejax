@@ -4,7 +4,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from helpers import f64, lower_for_v5e, run_checking_races, spec
-from layer_stack import StackTiles, ffn_layer, ffn_stack, layer_by_layer, make_inputs, plain_jax
+from layer_stack import StackTiles, ffn_layer, ffn_stack, layer_by_layer, make_inputs, plain_jax, split_layers
 
 
 def _stack(x, gamma, w_gate, w_up, w_down, eps=1e-6):
@@ -26,7 +26,8 @@ def test_ffn_stack(rows, block_f):
     ffn_stack.verify(*inputs, tiles)
     lowered = ffn_stack.lower(*inputs, tiles)
     assert [r.range.var for r in lowered.plan.repeats] == ["layer"] and set(lowered.plan.carried) == {"h", "n", "y"}
-    np.testing.assert_allclose(f64(layer_by_layer(*inputs)), want, atol=3e-2 * np.abs(want).max())
+    layers = split_layers(*inputs[1:])
+    np.testing.assert_allclose(f64(layer_by_layer(inputs[0], layers)), want, atol=3e-2 * np.abs(want).max())
     np.testing.assert_allclose(f64(plain_jax(*inputs)), want, atol=3e-2 * np.abs(want).max())
     run_checking_races(ffn_layer, inputs[0], inputs[1][0], *(w[0] for w in inputs[2:]), tiles)
 

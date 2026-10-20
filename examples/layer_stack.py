@@ -81,10 +81,16 @@ def ffn_layer(x, gamma, w_gate, w_up, w_down, tiles=StackTiles()):
     return out
 
 
-def layer_by_layer(x, gamma, w_gate, w_up, w_down):
-    """The stack as one `ffn_layer` call per layer."""
-    for layer in range(w_up.shape[0]):
-        x = ffn_layer(x, gamma[layer], w_gate[layer], w_up[layer], w_down[layer])
+def split_layers(gamma, w_gate, w_up, w_down) -> list[tuple]:
+    """The stacked weights as one tuple of arrays per layer (slicing a layer out of the stack under jit
+    would copy its weights before every call)."""
+    return [(gamma[i], w_gate[i], w_up[i], w_down[i]) for i in range(w_up.shape[0])]
+
+
+def layer_by_layer(x, layers):
+    """The stack as one `ffn_layer` call per layer, on `split_layers`' weights."""
+    for weights in layers:
+        x = ffn_layer(x, *weights)
     return x
 
 

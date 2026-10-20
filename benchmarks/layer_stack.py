@@ -15,7 +15,7 @@ import jax
 import jax.numpy as jnp
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "examples"))
-from layer_stack import ffn_layer, ffn_stack, layer_by_layer, make_inputs, plain_jax
+from layer_stack import ffn_layer, ffn_stack, layer_by_layer, make_inputs, plain_jax, split_layers
 from timing import require_tpu, time_ms
 
 SHAPES = [  # tokens, d_model, ffn, layers
@@ -41,7 +41,7 @@ def main() -> None:
         ffn_layer(x, gamma[0], w_gate[0], w_up[0], w_down[0])
         times = {
             "plain JAX (XLA)": time_ms(jax.jit(plain_jax), *inputs),
-            "a kernel per layer": time_ms(jax.jit(layer_by_layer), *inputs),
+            "a kernel per layer": time_ms(jax.jit(layer_by_layer), x, split_layers(*inputs[1:])),
             "one kernel, a repeat loop": time_ms(jax.jit(ffn_stack), *inputs),
         }
         want = plain_jax(*inputs).astype(jnp.float32)

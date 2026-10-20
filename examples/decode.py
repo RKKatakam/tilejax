@@ -76,6 +76,7 @@ import jax
 import jax.numpy as jnp
 
 import autokernel
+from autokernel import v5e
 
 LANES = 128  # TPU vector lanes
 MASK_VALUE = -1e30  # finite, so exp(old max - new max) never computes -inf + inf
@@ -326,6 +327,7 @@ def jax_ragged_paged_attention(q, kv_pages, block_tables, lengths, **block_sizes
     from jax.experimental.pallas.ops.tpu.ragged_paged_attention import ragged_paged_attention
 
     b, t, h, dh = q.shape
+    block_sizes.setdefault("vmem_limit_bytes", v5e.VMEM_LIMIT)  # as autokernel's kernels get (its default OOMs)
     cu_q_lens = jnp.arange(b + 1, dtype=jnp.int32) * t
     num_seqs = jnp.array([b], jnp.int32)
     out = ragged_paged_attention(
