@@ -1,0 +1,33 @@
+# benchmarks/moe_megakernel.py on a Colab TPU v5e (jax 0.11.2), 2026-10-21.
+$ cd /content/ak && PYTHONPATH=/content/ak/src PYTHONUNBUFFERED=1 python benchmarks/moe_megakernel.py
+2,2048,128,768:1: tuned in 9 s
+2,2048,128,768:1: 153 MB to read; ms (GB/s)
+  one kernel, routing inside      0.225  ( 680.4)
+  moe.py's layer per layer        0.297  ( 516.3)
+  max |one kernel - per layer| 0.0156; tuned MoeTiles(block_d=512, block_e=256), 3 input / 1 output buffers
+2,2048,128,768:4: tuned in 10 s
+2,2048,128,768:4: 531 MB to read; ms (GB/s)
+  one kernel, routing inside      0.724  ( 732.9)
+  moe.py's layer per layer        0.758  ( 700.0)
+  max |one kernel - per layer| 0.0156; tuned MoeTiles(block_d=512, block_e=256), 3 input / 1 output buffers
+2,2048,128,768:8: tuned in 11 s
+2,2048,128,768:8: 984 MB to read; ms (GB/s)
+  one kernel, routing inside      1.326  ( 742.0)
+  moe.py's layer per layer        1.362  ( 722.1)
+  max |one kernel - per layer| 0.0156; tuned MoeTiles(block_d=512, block_e=256), 3 input / 1 output buffers
+2,2048,128,768:32: tuned in 15 s
+2,2048,128,768:32: 2116 MB to read; ms (GB/s)
+  one kernel, routing inside      2.823  ( 749.6)
+  moe.py's layer per layer        2.875  ( 735.9)
+  max |one kernel - per layer| 0.0156; tuned MoeTiles(block_d=512, block_e=256), 3 input / 1 output buffers
+2,2048,128,768:64: tuned in 16 s
+2,2048,128,768:64: 2380 MB to read; ms (GB/s)
+  one kernel, routing inside      3.179  ( 748.7)
+  moe.py's layer per layer        3.233  ( 736.2)
+  max |one kernel - per layer| 0.0156; tuned MoeTiles(block_d=512, block_e=256), 3 input / 1 output buffers
+shape (layers,d,experts,ffn:tokens)  one kernel  per layer  speedup
+2,2048,128,768:1                          0.225      0.297    1.32x
+2,2048,128,768:4                          0.724      0.758    1.05x
+2,2048,128,768:8                          1.326      1.362    1.03x
+2,2048,128,768:32                         2.823      2.875    1.02x
+2,2048,128,768:64                         3.179      3.233    1.02x

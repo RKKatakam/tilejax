@@ -129,7 +129,8 @@ Fake weights and inputs, small models that fit a 16 GB v5e; bf16; ms per call, w
 | Decode step, dense GQA model | [decode_model.py](examples/decode_model.py) | plain JAX + the best JAX decode kernel | **1.17–1.45×** |
 | A stack of FFN layers in one kernel (repeat loop) | [layer_stack.py](examples/layer_stack.py) | XLA / a kernel per layer | **1.02–1.22×** / 1.01–1.07× (744 GB/s) |
 | KDA decode step (Kimi Linear), paged states updated in place | [kda_decode.py](examples/kda_decode.py) | vLLM TorchTPU's fused `decode_kda` | **1.00–1.44×**, bit-identical (up to 695 GB/s) |
-| Whole decode step in one kernel (cross-layer prefetch) | [decode_megakernel.py](examples/decode_megakernel.py) | XLA / per-layer kernels | **1.03–1.45×** / 1.07× (up to 90% of HBM bandwidth) |
+| Whole decode step in one kernel (cross-layer prefetch) | [decode_megakernel.py](examples/decode_megakernel.py) | XLA / per-layer kernels | **1.04–2.23×** / **1.06–1.55×** (up to 90% of HBM bandwidth) |
+| MoE layers decoding in one kernel, the routing inside it | [moe_megakernel.py](examples/moe_megakernel.py) | moe.py's layer per layer (XLA routing + `moe_decode`) | **1.02–1.32×** (680–750 GB/s) |
 
 **Whole models**, tokens to logits (prefill) and one token per sequence per step over a KV cache
 (decode), built only from autokernel kernels plus plain-JAX glue (embedding lookups, routing sorts, cache
@@ -162,6 +163,68 @@ features they needed came from them:
 - *Outputs stored per step*: chunked linear attention stores each chunk's outputs from the step that
   computes them, carrying only the recurrent state.
 - *Per-tile windows fetched once*: MoE tiles of one expert read its weights once.
+- *Computed index arrays* (below, "Megakernels"): a MoE layer's routing computed inside the kernel picks
+  which experts' weights later steps read, so a whole MoE stack is one kernel.
+
+### Megakernels: what Inferact's TPU megakernels showed us
+
+Inferact's [tpu-megakernels](https://github.com/Inferact/tpu-megakernels) run Kimi K3 and Qwen3.8 decode as
+one hand-written Pallas kernel per step. Read against autokernel, three of their single-chip techniques
+were missing: routing decided inside the kernel, one VMEM pool shared by every weight, and few, big steps.
+Each is now in the compiler, measured on a v5e (raw logs: [decode](benchmarks/results/decode_megakernel_v5e.txt),
+[MoE](benchmarks/results/moe_megakernel_v5e.txt)):
+
+**Fewer, bigger, cheaper steps** (the decode megakernel, `benchmarks/decode_megakernel.py`, ms per step):
+
+| Model (layers, d, H/Hkv, ffn, vocab) | B | mean context | before | after | per-layer kernels | XLA |
+| --- | --- | --- | --- | --- | --- | --- |
+| 16, 2048, 16/8, 6144, 32k | 1 | 1024 | 2.493 | **2.486** | 2.655 | 2.574 |
+| 16, 2048, 16/8, 6144, 32k | 8 | 512 | 2.802 | **2.701** | 3.002 | 3.189 |
+| 16, 2048, 16/8, 6144, 32k | 8 | 2048 | 3.718 | **3.617** | 3.988 | 5.396 |
+| 8, 2048, 16/8, 6144, 32k | 8 | 4096 | 2.581 | **2.531** | 2.678 | 3.816 |
+| 8, 2048, 16/8, 6144, 32k | 32 | 1024 | 3.085 | **2.891** | 3.334 | 4.197 |
+| 8, 2048, 16/8, 6144, 32k | 64 | 512 | 3.330 | **2.972** | 3.826 | 4.283 |
+| 8, 2048, 16/8, 6144, 32k | 64 | 32 | | **1.923** | 2.978 | 4.285 |
+
+- **Only the valid cache rows are copied.** The profile showed every shape copy-bound, and at batch 64 a
+  fifth of the attention's copies were rows past each sequence's length, a 256-row block per step. The
+  attention reads `autokernel.rows(...)` windows now: along a tiled dim a ragged copy is rounded up to whole
+  tiles (16 rows for bf16), its start and size annotated for Mosaic. Batch 64 × 512 went 3.33 -> 2.97 ms,
+  at ~747 GB/s of the bytes it must read.
+- **An attention step takes a group of sequences** (`MegaTiles.group`, tuned): a step reads G sequences'
+  blocks up to the group's longest cache. At short contexts the per-step cost dominates: 64 sequences of
+  ~32 positions, 1760 -> 1446 µs with groups of 8 (tuned on those lengths). Past ~512 positions reading the
+  shorter sequences up to the longest costs more than the steps saved, and the tuner keeps G = 1.
+- **Cheaper steps.** A step decodes two steps' table codes: their fields are now packed with power-of-two
+  radices (shifts and masks, not integer divisions), and each slot index is computed once a step. A
+  phase's inputs are waited for, and its slots bound, in the phase's own branch, streamed inputs after the
+  code before the phase (it runs while they arrive): neutral on these kernels (within 0.2%), and what
+  routing inside a kernel needs.
+- **Not a win here:** deeper pipelines. The queue is not drained at phase boundaries (the code between
+  phases is 44 µs of 3.1 ms at batch 64): 3 -> 4 -> 6 input slots gave 3126 -> 3101 -> 3085 µs. So copies
+  are still fetched a fixed number of steps ahead, not a number of bytes.
+
+**One ring for windows of one shape** (`pipeline.rings`). A step only uses its own slot of a ring (the
+step's index modulo its depth), so windows that different phases stream share a ring when their tile
+shapes and dtypes match: VMEM for the decode megakernel 50.2 -> 44.2 MiB (B1), for Gemma 4's 53.7 -> 42.5
+MiB (B1; its sliding and full layers' weights and caches share), room the tuner can spend on bigger
+blocks.
+
+**Routing inside the kernel** (computed index arrays, `examples/moe_megakernel.py`): each MoE layer's
+router is a phase, its top-k and the list of chosen experts are computed at the router's last step, and
+the experts' phase is bounded by and reads through that list. Two Qwen3-30B-A3B layers (128 experts of 768,
+top-8), ms per call under `jax.jit`:
+
+| tokens | one kernel, routing inside | moe.py per layer (XLA routing + `moe_decode`) | speedup | one kernel GB/s |
+| --- | --- | --- | --- | --- |
+| 1 | **0.225** | 0.297 | 1.32× | 680 |
+| 4 | **0.724** | 0.758 | 1.05× | 733 |
+| 8 | **1.326** | 1.362 | 1.03× | 742 |
+| 32 | **2.823** | 2.875 | 1.02× | 750 |
+| 64 | **3.179** | 3.233 | 1.02× | 749 |
+
+From 4 tokens both read the chosen experts near the HBM limit, and one kernel saves the routing's XLA ops,
+a launch and a pipeline fill per layer. A token reads only 8 experts a layer, so those dominate at 1 token.
 
 ### MoE layers at full width: autokernel vs `ragged_dot` and megablox
 
@@ -479,7 +542,19 @@ def f(x, y, tiles=Tiles()):                   # the input arrays; optionally las
 - **Inputs are read as tiles.** Each index is `v : v + size` or `v` for a loop variable `v`, `:`, a constant
   slice (`8:16`) or a constant int. Integer indices come before sliced dims (`q[b, h, i : i + T, :]`).
   Tiles follow the TPU layout: the last dim a multiple of 128, the second-to-last a multiple of 8 (16 for
-  bf16, 32 for 8-bit), each unless it is the whole dim.
+  bf16, 32 for 8-bit), each unless it is the whole dim. A slice may also start at an expression of loop
+  variables, `e : e + size` (`k_cache[layer : layer + 1, j // S * G : j // S * G + G, ...]`).
+- **Ragged rows**: `x[autokernel.rows(start, stop, n), ...]` reads n rows from `start` (bounds that may read
+  index arrays) of which only those before `stop` are copied; a store there writes only those (an output
+  updated in place). Along one of an array's last two dims a read copies whole tiles (`start` a multiple
+  of 8 rows for 32 bits, 16 for 16, 128 lanes; the rows past `stop` are unspecified) and stores can't be
+  ragged. One `rows` per tile, right after the integer indices (NumPy's indexing would reorder it otherwise).
+- **Gathered windows**: an index array's slice as an index, `pages[page_table[b, p : p + n], :, :]`, gathers n
+  windows (n copies) into one tile.
+- **Pairs of rows as words**: `autokernel.pairs(x[...])` reads a 16-bit tile whose second-to-last dim is 2
+  (a page holding each head's key and value side by side) as the uint32 words a TPU packs them into, row 0
+  in the low halves: the kernel reads its VMEM slot as words, no shuffles. `pairs(...)[..., g, :]` is a
+  strided load of every `g`-th row; `out.at[...].set(autokernel.unpairs(words, dtype))` stores words back.
 - **Outputs stored per step**: a reduction loop's body (outside repeat loops) may store an output, a tile
   per step, placed by the parallel loops and the reduction loop's variable (`out = out.at[i : i + C, :].set(y)`
   in a scan over chunks `i`, with the state carried): each step's tile goes to HBM while the next steps run.
@@ -531,6 +606,16 @@ def f(x, y, tiles=Tiles()):                   # the input arrays; optionally las
   kernel loops over only the steps that run: a KV-cache read stops at each sequence's length, a grouped
   matmul visits only the experts whose tokens meet a tile. The function itself branches on array values
   there, so it runs as plain JAX eagerly (not under `jax.jit`); the kernel runs anywhere.
+- **Runtime ranges**: a reduction loop's bounds may read index arrays (`for p in range(0, lengths[b], 128)`,
+  `range(n[0])`), as may the bounds of a kernel's one parallel loop (`for k in range(n_tiles[0])`: tiles
+  counted as the kernel runs; its outputs are inputs updated in place). Such a kernel finds its steps as
+  it runs, with a cursor in SMEM, no tables: a loop with no blocks takes one empty step, and its loops
+  can't be masked (put the condition in the bounds). Repeat loops may hold runtime ranges.
+- **Computed index arrays**: a value the tile code computes (int32, one or two dims) may place later loops'
+  windows and bound them, `w_gate[layer, chosen[c // F], :, c % F : c % F + be]` with `for c in range(0,
+  n[0] * F, be)`: routing inside a kernel. It is computed in code after a reduction loop (the kernel learns
+  it at the loop's last step, copies it into SMEM, then starts the inputs of the steps that read it) and
+  read by later loops in the same iteration of its repeat loop, if it is in one. Masks can't read it.
 - **Constants** the tile code reads (module globals, closure values, prologue names) are read when a kernel
   is first built for an input shape, as `jax.jit` does, and written into the generated source: numbers,
   strings, dtypes, tuples, modules, and functions (imported, or their source copied).

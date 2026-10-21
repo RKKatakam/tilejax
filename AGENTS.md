@@ -28,6 +28,7 @@ kernel for a **TPU v5e**, and tunes its schedule on the hardware. The scope is d
     (`qwen3_models.py`);
   - DeepSeek-V3 / Kimi K2: MLA prefill (`mla.py`), absorbed MLA decode, whole models (`deepseek.py`);
   - MoE: routers, dropless grouped SwiGLU experts over runtime masks and windows, shared experts (`moe.py`);
+    a stack of MoE layers decoding in one kernel, each layer's routing computed inside it (`moe_megakernel.py`);
   - linear attention: chunked Gated DeltaNet and KDA (`linear_attention.py`, `linear_attention_layer.py`),
     hybrid Qwen3-Next / Kimi Linear models (`hybrid_layers.py`, `hybrid_models.py`);
   - a real model: Gemma 4 E2B's text decoder with its weights, greedy generation against vLLM (`gemma4.py`,
@@ -190,6 +191,22 @@ Each of these was found on hardware; don't undo them without measuring again.
   whole cache out twice (1 ms each at 75k positions): `rpa_write` writes them instead. TPU gathers and
   scatters of int tables cost ~7 ns an entry, which is why runtime ranges step with a cursor, not tables.
 
+- Decode megakernel profile (`benchmarks/decode_megakernel_profile.py`): every shape copy-bound, 733 GB/s at
+  B1 down to 643 at B64 x 512. Deeper pipelines didn't help (3 -> 6 input slots: 3126 -> 3085 us at B64;
+  the code between phases is 44 us of 3.1 ms): the B64 loss was copying whole 256-row cache blocks past
+  each sequence's length (a fifth of its attention bytes). Ragged reads fixed it (3.33 -> 2.97 ms, ~747
+  GB/s of what must be read). At 64 sequences of ~32 positions the per-step cost dominates: attention steps
+  over groups of 8 sequences, 1760 -> 1446 us; past ~512 positions groups read more than they save.
+- A ragged copy along a tiled dim must be whole tiles, and Mosaic must see it: its size rounded up and its
+  start and size wrapped in `pl.multiple_of` (else "Slice sizes / Offsets along tiled dimensions must be
+  aligned to tiles"). A VMEM -> SMEM DMA of a staging buffer and per-element scalar extraction both work
+  for turning a computed int32 vector into SMEM scalars (`benchmarks/probe_computed_indices.py`).
+- Routing inside the kernel (`moe_megakernel.py`, two Qwen3-30B-A3B layers): 1.32x moe.py's per-layer
+  decode at 1 token (0.225 vs 0.297 ms), 1.02-1.05x from 4 to 64 (both near 750 GB/s). Each layer's first
+  expert blocks wait for the routing (no prefetch can cross it): 680 GB/s at 1 token.
+- Tuning is per input signature, not per lengths: a short-context batch with the same cache shape reuses a
+  long one's tuning (the attention group size most). Benchmarks give short contexts caches of their own.
+
 ## Commands
 
 ```bash
@@ -202,7 +219,9 @@ uv run python examples/matmul.py        # prints the generated source
 Tests: `test_parse.py` (every syntax rule), `test_plan.py`, `test_schedule.py`, `test_codegen.py` (every
 emission path runs in the interpreter with the race detector and cross-lowers to Mosaic for a v5e),
 `test_index_arrays.py` (SMEM index arrays, runtime masks and windows), `test_in_place.py` (outputs updated in place,
-stores at index-array windows), `test_bursts.py` (copies in bursts), `test_repeat_loops.py`, `test_step_outputs.py` (outputs stored per step), `test_api.py`, `test_profiling.py` (synthetic traces), `test_tunable.py`, `test_tune.py` (the search and
+stores at index-array windows), `test_bursts.py` (copies in bursts), `test_repeat_loops.py`, `test_step_outputs.py` (outputs stored per step),
+`test_runtime_ranges.py` (runtime ranges and tiles, ragged rows, gathered windows, pairs), `test_computed_indices.py`
+(routing inside a kernel), `test_api.py`, `test_profiling.py` (synthetic traces), `test_tunable.py`, `test_tune.py` (the search and
 proposals with synthetic profiles; tuning end to end with `tune._can_time` and `profiling.measure` faked,
 kernels really running in the interpreter), `test_examples.py`, `test_tpu.py` (`tpu` marker: real hardware
 only). `helpers.make_kernel(source, **globals)` builds a kernel from a source string, which

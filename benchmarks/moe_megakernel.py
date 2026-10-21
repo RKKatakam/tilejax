@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 import jax
@@ -26,11 +27,12 @@ from moe_megakernel import TOP_K, Config, init_params, layer_params, megakernel_
 from moe_megakernel import xla_layers as xla_stack
 from timing import require_tpu, time_ms
 
-SHAPES = [  # layers, d_model, experts, ffn : tokens  (Qwen3-30B-A3B's layers)
-    "4,2048,128,768:1",
-    "4,2048,128,768:8",
-    "4,2048,128,768:32",
-    "4,2048,128,768:64",
+SHAPES = [  # layers, d_model, experts, ffn : tokens  (Qwen3-30B-A3B's layers; two: 2.4 GB, and again per layer)
+    "2,2048,128,768:1",
+    "2,2048,128,768:4",
+    "2,2048,128,768:8",
+    "2,2048,128,768:32",
+    "2,2048,128,768:64",
 ]
 
 
@@ -59,7 +61,9 @@ def main() -> None:
         config = Config(layers, d, e, TOP_K, f)
         params = init_params(config)
         x = jax.random.normal(jax.random.key(1), (int(tokens), d), jnp.bfloat16)
+        start = time.perf_counter()
         megakernel_layers(x, params)  # tune eagerly, on these tokens
+        print(f"{shape}: tuned in {time.perf_counter() - start:.0f} s", flush=True)
         layers_ = layer_params(params, config, gate_up=args.xla)
         per_layer(x, layers_, config)
         times = {
