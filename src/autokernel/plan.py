@@ -157,6 +157,21 @@ class Index:
 
 
 @dataclass(frozen=True)
+class Computed:
+    """A computed index array: a value the tile code computes (int32, 1-D or 2-D) whose elements index the
+    windows of later phases, or bound their loops (`w[layer, chosen[c], :, :]`, `range(n[0] * F)`). Its
+    statement runs at the last step of phase `phase` (in an iteration of repeat loop `repeat`, if any); the
+    kernel copies the value into SMEM there, and the phases `consumers` read it when the kernel runs."""
+
+    name: str
+    shape: tuple[int, ...]
+    dtype: np.dtype
+    phase: int
+    repeat: int | None
+    consumers: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class Phase:
     """A reduction loop that takes steps: the tile's steps for it, and its body. In a repeat loop it takes
     them once per iteration; the repeat loop's first phase runs the loop's own code before it (`before`) at
@@ -219,6 +234,7 @@ class Plan:
     repeat_loops: tuple[Range, ...]  # every repeat loop (one of one iteration runs inline)
     operands: tuple[Operand, ...]
     indices: tuple[Index, ...]  # the index arrays, in parameter order
+    computed: tuple[Computed, ...]  # the computed index arrays
     reads: Mapping[str, Operand]  # `read_key` of a tile read -> its operand
     # Reads of windows only a repeat loop moves, outside phase bodies: (line, column) -> the phase whose
     # steps run them (they stream with that phase).
@@ -272,8 +288,10 @@ class Plan:
 
     @property
     def cursor(self) -> bool:
-        """Does a loop have runtime bounds, so the kernel finds each step (and tile) as it runs?"""
-        return any(r.bounds is not None for r in (*self.parallel, *(phase.range for phase in self.phases)))
+        """Does a loop have runtime bounds (or a window read computed indices), so the kernel finds each step
+        (and tile) as it runs?"""
+        ranges = (*self.parallel, *(phase.range for phase in self.phases))
+        return any(r.bounds is not None for r in ranges) or bool(self.computed)
 
     def eval(self, node: ast.expr, values: Mapping[str, Any] | None = None) -> Any:
         """Evaluate an expression of the function on the prologue's names (and `values`, e.g. loop values)."""
@@ -324,6 +342,7 @@ class _Planner:
     def plan(self) -> Plan:
         outputs = self._prologue()
         self.indices = {index.name: index for index in self._index_arrays()}
+        self.computed = self._computed_names()
         aliased = self._aliases()
         parallel = tuple(self._range(loop) for loop in self.nest.parallel)
         reductions = tuple(self._range(loop) for loop in self.nest.reductions)
@@ -335,7 +354,7 @@ class _Planner:
         packed = self._packed(reads_)
         packed_names = self._packed_names(packed)
         stored_by = {name: self._storing_phase(name, phases) for name in self.nest.outputs}
-        if any(r.bounds is not None for r in (*parallel, *(phase.range for phase in phases))):
+        if any(r.bounds is not None for r in (*parallel, *(phase.range for phase in phases))) or self.computed:
             self._check_cursor(stored_by, outputs)
         output_tiles = {name: self._output_tile(name, *outputs[name], parallel) for name in self.nest.outputs}
         unpacked = self._unpacked(output_tiles)
@@ -350,6 +369,7 @@ class _Planner:
         for name in self.nest.outputs:
             self._check_store(output_tiles[name], types.stores[name])
         carried = {name: Carried(name, aval.shape, aval.dtype) for name, aval in types.carried.items()}
+        computed = self._computed(types.assigned, phases, segments, repeats, operands)
         return Plan(
             nest=self.nest,
             inputs=self.inputs,
@@ -362,6 +382,7 @@ class _Planner:
             repeat_loops=repeat_loops,
             operands=operands,
             indices=tuple(self.indices.values()),
+            computed=computed,
             reads=reads_,
             read_phases=self.read_phases,
             outputs=tuple(
@@ -443,7 +464,13 @@ class _Planner:
     # ------------------------------------------------------------------ loops
 
     def _range(self, loop: Loop) -> Range:
-        if any(element_reads(b, self.indices) for b in loop.bounds):
+        if loop.mask is not None and element_reads(loop.mask, assigned(self.nest.tile)):
+            raise self.error(
+                "a mask can't read values the tile code computes (it is evaluated before the kernel runs): bound "
+                "the loop with them instead",
+                loop.mask,
+            )
+        if any(element_reads(b, {*self.indices, *self.computed}) for b in loop.bounds):
             return self._runtime_range(loop)
         bounds = [self.eval(b) for b in loop.bounds]
         if not all(isinstance(b, int | np.integer) for b in bounds):
@@ -490,14 +517,15 @@ class _Planner:
             "`:`, or constants (`start:stop`, an int)"
         )
         loop_vars = reads(index) & self.ranges.keys()
-        computed = reads(index) & assigned(self.nest.tile)
+        computed = reads(index) & assigned(self.nest.tile) - self.computed
         if computed and (self._is_rows(index) or isinstance(index, ast.Subscript)):
             raise self.error(
                 f"{text}: a window's index can't read `{sorted(computed)[0]}`, which the tile code computes: the "
                 "kernel copies the window before the tile code runs",
                 index,
             )
-        if isinstance(index, ast.Subscript) and isinstance(index.value, ast.Name) and index.value.id in self.indices:
+        elements = {*self.indices, *self.computed}
+        if isinstance(index, ast.Subscript) and isinstance(index.value, ast.Name) and index.value.id in elements:
             sliced = [i for i in _dims(index) if isinstance(i, ast.Slice)]
             if not sliced:
                 return Window(None, 0, None, index, frozenset(loop_vars))  # bounds: clamped when the kernel runs
@@ -537,7 +565,7 @@ class _Planner:
             return self._checked(Window(None, start, stop - start), dim, text, index)
         if isinstance(index, ast.Name) and index.id in self.ranges:
             return self._checked(Window(index.id, 0, None), dim, text, index)
-        computed = reads(index) & assigned(self.nest.tile)
+        computed = reads(index) & assigned(self.nest.tile) - self.computed
         if loop_vars or computed:
             more = f": `{sorted(computed)[0]}` is computed by the tile code" if computed else ""
             raise self.error(f"{usage}, or an element of an index array written in place (`w[ids[e], :]`){more}", index)
@@ -883,6 +911,81 @@ class _Planner:
             found.append(Index(name, p, tuple(spec.shape), np.dtype(spec.dtype)))
         return found
 
+    def _computed_names(self) -> set[str]:
+        """The values the tile code computes whose elements index tile reads or bound loops: computed index
+        arrays."""
+        made = assigned(self.nest.tile)
+        arrays = set(self.nest.params)
+        trees: list[ast.AST] = [bound for loop in self.nest.loops for bound in loop.bounds]
+        for stmt in flatten(self.nest.tile):
+            trees += [
+                n.slice
+                for n in ast.walk(stmt)
+                if isinstance(n, ast.Subscript) and isinstance(n.value, ast.Name) and n.value.id in arrays
+            ]
+        return {n.value.id for tree in trees for n in element_reads(tree, made)}  # type: ignore[attr-defined]
+
+    def _computed(
+        self,
+        types: Mapping[int, Mapping[str, jax.ShapeDtypeStruct]],
+        phases: tuple[Phase, ...],
+        segments: tuple[tuple[ast.stmt, ...], ...],
+        repeats: tuple[Repeat, ...],
+        operands: tuple[Operand, ...],
+    ) -> tuple[Computed, ...]:
+        """The computed index arrays: each assigned once, int32 of one or two dims, by code after a phase
+        (which runs at its last step), and read by the windows a later phase streams, or its loop's bounds,
+        in the same iteration of the repeat loop the code is in (if any)."""
+        found = []
+        for name in sorted(self.computed):
+            stmts = [stmt for stmt in flatten(self.nest.tile) if name in assigned([stmt])]
+            if len(stmts) != 1:
+                raise self.error(f"`{name}`'s elements index windows or bound loops: assign it once", stmts[1])
+            stmt = stmts[0]
+            k = next((k for k, seg in enumerate(segments) if any(x is stmt for x in flatten(seg))), 0)
+            after = next((r for r, rep in enumerate(repeats) if any(x is stmt for x in flatten(rep.after))), None)
+            if not k and after is None:
+                raise self.error(
+                    f"`{name}`'s elements index windows or bound loops, so it is computed after a reduction loop "
+                    "(the kernel learns it at the loop's last step): put one before its statement (a loop of one "
+                    "iteration runs inline, as code)",
+                    stmt,
+                )
+            phase = repeats[after].last - 1 if after is not None else k - 1
+            repeat = None if after is not None else phases[phase].repeat
+            aval = types[id(stmt)][name]
+            if np.dtype(aval.dtype) != np.int32 or len(aval.shape) not in (1, 2):
+                raise self.error(
+                    f"`{name}`'s elements index windows or bound loops: it must be int32 of 1 or 2 dims, not "
+                    f"{np.dtype(aval.dtype).name}{list(aval.shape)}",
+                    stmt,
+                )
+            consumers = set()
+            for op in operands:
+                if not any(element_reads(w.index, {name}) for w in op.tile.windows if w.index is not None):
+                    continue
+                if op.kind is not Kind.STREAM:
+                    raise self.error(
+                        f"{op.tile.text}: only windows a reduction loop moves may be placed by `{name}`, which the "
+                        "tile code computes",
+                        stmt,
+                    )
+                consumers.add(op.phase)
+            consumers |= {
+                p for p, ph in enumerate(phases) if ph.range.bounds and element_reads(ph.range.bounds[1], {name})
+            }
+            for p in sorted(consumers):  # type: ignore[type-var]
+                if p <= phase or (repeat is not None and phases[p].repeat != repeat):  # type: ignore[operator]
+                    where = "in the same iteration of its repeat loop" if repeat is not None else "after it"
+                    raise self.error(
+                        f"`{name}` is computed at the last step of reduction loop "
+                        f"`{phases[phase].range.var}`: only later loops {where} may read it",
+                        stmt,
+                    )
+            shape, dtype = tuple(aval.shape), np.dtype(aval.dtype)
+            found.append(Computed(name, shape, dtype, phase, repeat, tuple(sorted(consumers))))  # type: ignore[arg-type]
+        return tuple(found)
+
     def _check_element_bounds(self) -> None:
         """Elements of index arrays read at loop values outside the array are errors, found when planning by
         evaluating each index at every value of the loops it reads (index arrays are in SMEM, unchecked)."""
@@ -908,10 +1011,11 @@ class _Planner:
                         )
 
     def _check_cursor(self, stored_by: dict[str, int | None], outputs: dict[str, Any]) -> None:
-        """A kernel with runtime ranges finds its steps as it runs, from the bounds alone: its reduction loops
-        have no masks, there are no repeat loops, and outputs are stored per tile; with a runtime count of
+        """A kernel with runtime ranges (or computed index arrays) finds its steps as it runs, from the bounds
+        alone: its reduction loops have no masks, and outputs are stored per tile; with a runtime count of
         tiles, nothing masks tiles and every output is an input updated in place (no tile stores the rest)."""
-        node = next(loop.node for loop in self.nest.loops if self.ranges[loop.var].bounds is not None)
+        bounded = [loop.node for loop in self.nest.loops if self.ranges[loop.var].bounds is not None]
+        node = bounded[0] if bounded else self.nest.parallel[0].node
         if self.ranges[self.nest.parallel[0].var].bounds is not None:
             plain = [name for name, (_, _, fill) in outputs.items() if fill is not None]
             if plain:
@@ -921,8 +1025,6 @@ class _Planner:
                 )
         if any(r.mask is not None for r in self.ranges.values() if r.var in {lp.var for lp in self.nest.reductions}):
             raise self.error("a kernel with runtime loop bounds can't mask its reduction loops", node)
-        if self.nest.repeats:
-            raise self.error("a kernel with runtime loop bounds can't have repeat loops", node)
         if any(phase is not None for phase in stored_by.values()):
             raise self.error("a kernel with runtime loop bounds stores its outputs per tile", node)
 

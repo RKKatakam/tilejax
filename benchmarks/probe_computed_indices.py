@@ -55,6 +55,36 @@ def kernel_extract(scores_ref, table_hbm, out_ref, stage, ids_smem, rows, sems):
     out_ref[...] = rows[...]
 
 
+def ids_1d(scores):
+    """The ids as a 1-D (N,) int32 vector (as `jnp` top-k code would give them)."""
+    return ids_of(scores)[0, :N]
+
+
+def kernel_dma_1d(scores_ref, table_hbm, out_ref, stage, ids_smem, rows, sems):
+    """A 1-D vector reshaped to (1, N) into the staging buffer's first lanes, then DMA'd to SMEM."""
+    stage[:, :N] = ids_1d(scores_ref[...]).reshape(1, N)
+    copy = pltpu.make_async_copy(stage, ids_smem, sems.at[N])
+    copy.start()
+    copy.wait()
+    for k in range(N):
+        pltpu.make_async_copy(table_hbm.at[pl.ds(ids_smem[0, k], 1)], rows.at[pl.ds(k, 1)], sems.at[k]).start()
+    for k in range(N):
+        pltpu.make_async_copy(table_hbm.at[pl.ds(ids_smem[0, k], 1)], rows.at[pl.ds(k, 1)], sems.at[k]).wait()
+    out_ref[...] = rows[...]
+
+
+def kernel_extract_1d(scores_ref, table_hbm, out_ref, stage, ids_smem, rows, sems):
+    """Each element of a 1-D vector extracted as a scalar into SMEM."""
+    ids = ids_1d(scores_ref[...])
+    for k in range(N):
+        ids_smem[0, k] = ids[k]
+    for k in range(N):
+        pltpu.make_async_copy(table_hbm.at[pl.ds(ids_smem[0, k], 1)], rows.at[pl.ds(k, 1)], sems.at[k]).start()
+    for k in range(N):
+        pltpu.make_async_copy(table_hbm.at[pl.ds(ids_smem[0, k], 1)], rows.at[pl.ds(k, 1)], sems.at[k]).wait()
+    out_ref[...] = rows[...]
+
+
 def run(body, scores, table, interpret):
     return pl.pallas_call(
         body,
@@ -77,7 +107,13 @@ def main() -> None:
     scores = jnp.asarray(rng.permutation(128)[None, :].astype(np.float32))
     table = jnp.asarray(rng.standard_normal((ROWS, D)), jnp.float32)
     want = np.asarray(table)[np.argsort(-np.asarray(scores)[0])[:N]]  # the rows of the N best lanes
-    for name, body in (("vmem -> smem dma", kernel_dma), ("scalar extract", kernel_extract)):
+    bodies = {
+        "vmem -> smem dma": kernel_dma,
+        "scalar extract": kernel_extract,
+        "1-D reshaped, dma": kernel_dma_1d,
+        "1-D scalar extract": kernel_extract_1d,
+    }
+    for name, body in bodies.items():
         try:
             out = jax.jit(functools.partial(run, body, interpret=interpret))(scores, table)
             print(f"{name}: ok, matches: {np.allclose(np.asarray(out), want)}", flush=True)

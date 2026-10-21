@@ -448,13 +448,6 @@ def test_pairs_errors(code, message):
         ),
         (
             "out = jnp.zeros((8, 128))\n    for i in range(0, 8, 8):\n        acc = jnp.zeros((8, 128))\n"
-            "        for j in range(n[0]):\n            acc += x[i : i + 8, 0:128]\n"
-            "        for l in range(2):\n            for k in range(0, 256, 128):\n"
-            "                acc += x[i : i + 8, k : k + 128]\n        out = out.at[i : i + 8, :].set(acc)",
-            "a kernel with runtime loop bounds can't have repeat loops",
-        ),
-        (
-            "out = jnp.zeros((8, 128))\n    for i in range(0, 8, 8):\n        acc = jnp.zeros((8, 128))\n"
             "        for j in range(2):\n            acc += x[n[j : j + 2], 0:128].sum(axis=0)\n"
             "        out = out.at[i : i + 8, :].set(acc)",
             "breaks the TPU layout",
