@@ -33,6 +33,7 @@ import copy
 import inspect
 import itertools
 import traceback
+import types
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import Enum
@@ -44,7 +45,7 @@ import numpy as np
 from jax._src import core as jax_core
 from jax._src import source_info_util
 
-from . import mxu, v5e
+from . import mxu, packing, v5e
 from .errors import KernelError
 from .parse import Loop, Nest
 from .tilecode import as_store, assigned, element_reads, first_reads, flatten, reads
@@ -219,6 +220,8 @@ class Plan:
     assigned_types: Mapping[int, Mapping[str, jax.ShapeDtypeStruct]]  # id(stmt) -> the types it assigns
     constants: Mapping[str, Any]  # names the tile code reads from the module, closure and prologue
     scopes: tuple[str, ...]  # the names of the tile code's `jax.named_scope`s
+    # Tile reads taken as words (`autokernel.pairs(x[...])`): the call's (line, column) -> the operand read.
+    packed: Mapping[tuple[int, int], str]
     tile_ops: int  # operations in a tile's code traced as plain JAX (each phase body twice): its size
     env: dict[str, Any]  # the function's module and closure values, with the prologue's names over them
 
@@ -313,6 +316,7 @@ class _Planner:
         self._check_element_bounds()
         phases, segments, repeats = self._phases(reductions, repeat_loops)
         operands, reads_ = self._operands(phases, segments, repeats)
+        packed = self._packed(reads_)
         stored_by = {name: self._storing_phase(name, phases) for name in self.nest.outputs}
         output_tiles = {name: self._output_tile(name, *outputs[name], parallel) for name in self.nest.outputs}
         self._check_reads_before_assignment()
@@ -348,6 +352,7 @@ class _Planner:
             assigned_types=types.assigned,
             constants=self._constants(),
             scopes=scopes,
+            packed=packed,
             tile_ops=types.ops,
             env=self.env,
         )
@@ -646,6 +651,33 @@ class _Planner:
                 by_key[key] = operands[operands.index(operand)] = replace(operand, in_body=True)
         return tuple(operands), by_key
 
+    def _packed(self, reads_: Mapping[str, Operand]) -> dict[tuple[int, int], str]:
+        """The calls of `autokernel.pairs` in tile code, each on a tile read of a 16-bit (..., 2, d) window."""
+        found = {}
+        for stmt in self.nest.tile:
+            for node in ast.walk(stmt):
+                if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name | ast.Attribute)):
+                    continue
+                try:
+                    func = self.eval(node.func)
+                except KernelError:
+                    continue  # a method of a value, a local function: not `pairs`
+                if func is not packing.pairs:
+                    continue
+                arg = node.args[0] if len(node.args) == 1 and not node.keywords else None
+                operand = reads_.get(_read_key(arg, self.read_phases)) if isinstance(arg, ast.Subscript) else None
+                if operand is None:
+                    raise self.error("autokernel.pairs takes a tile read of an input, `pairs(x[...])`", node)
+                tile = operand.tile
+                if tile.dtype.itemsize != 2 or len(tile.shape) < 2 or tile.shape[-2] != 2:
+                    raise self.error(
+                        f"autokernel.pairs takes a 16-bit tile of pairs of rows (..., 2, d), not {tile.dtype.name}"
+                        f"{list(tile.shape)}",
+                        node,
+                    )
+                found[(node.lineno, node.col_offset)] = operand.name
+        return found
+
     def _index_arrays(self) -> list[Index]:
         """The inputs read element by element (`lengths[b]`), in parameter order: int32, read only that way,
         indexed by loop variables and constants."""
@@ -761,7 +793,8 @@ class _Planner:
             if r is None:
                 if window.offset != 0 or window.size != dim:
                     raise self.error(f"{tile.text}: dims no loop places are stored whole, with `:`", store.node)
-            elif r.start != 0 or r.count * r.step != dim or (window.size or 1) != r.step:
+            elif (window.size or 1) != r.step or (fill is not None and (r.start != 0 or r.count * r.step != dim)):
+                # (An input updated in place may be stored in part: the rest keeps the input's values.)
                 raise self.error(
                     f"{tile.text}: loop `{r.var}` must cover the dim of {dim} exactly, one step per tile", store.node
                 )
@@ -800,7 +833,9 @@ class _Planner:
         own = assigned(nest.tile) | {r.var for r in nest.loops} | set(nest.params) | set(nest.outputs)
         masks = [r.mask for r in self.ranges.values() if r.runtime]  # evaluated in the generated source
         names = set().union(*(reads(stmt) for stmt in flatten(nest.tile)), *(reads(m) for m in masks)) - own
-        return {name: self.env[name] for name in sorted(names) if name in self.env}
+        # (`autokernel.pairs` becomes a read of the VMEM buffer: the kernel needs neither it nor autokernel.)
+        names = {n for n in names if n in self.env and not _is_autokernel(self.env[n])}
+        return {name: self.env[name] for name in sorted(names)}
 
     def _scopes(self) -> tuple[str, ...]:
         scopes = []
@@ -1046,6 +1081,11 @@ class _TypeTrace:
         for (_, stmt), values in self.notes.items():
             assigned_.setdefault(stmt, {}).update(values)  # a body statement: its type in the second step
         return assigned_
+
+
+def _is_autokernel(value: Any) -> bool:
+    """Is `value` autokernel's package or `autokernel.pairs` (which only the planner reads)?"""
+    return value is packing.pairs or (isinstance(value, types.ModuleType) and value.__name__ == __package__)
 
 
 def _count_ops(jaxpr: Any) -> int:

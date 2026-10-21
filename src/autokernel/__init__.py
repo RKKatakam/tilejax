@@ -6,6 +6,8 @@
 - `kernel.source(...)` is the generated Pallas source; `kernel.verify(...)` checks the kernel against the
   loop nest run as plain JAX; `kernel.tuning(...)` is what tuning tried and chose.
 - `autokernel.profile(kernel, ...)` says where the time goes on a v5e, from `jax.named_scope` regions.
+- `autokernel.pairs(x[...])` in kernel code reads a 16-bit tile's pairs of rows as the 32-bit words a TPU
+  packs them into.
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ from typing import Any
 from . import profiling
 from .api import Kernel, Lowered, kernel
 from .errors import KernelError
+from .packing import pairs
 from .pipeline import Pipeline
 from .profiling import KernelProfile, enable_profiling
 from .tunable import choice, tunable
@@ -32,6 +35,7 @@ __all__ = [
     "choice",
     "enable_profiling",
     "kernel",
+    "pairs",
     "profile",
     "tunable",
 ]

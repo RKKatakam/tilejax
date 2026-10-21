@@ -72,6 +72,7 @@ FILLS_IN_FLIGHT = 4
 MODULES = {"jax": jax, "jnp": jnp, "np": np, "pl": pl, "pltpu": pltpu}
 _WEAK = "_weak"
 _PHASE_STEPS = "_phase_steps"
+_PAIRS = "_pairs"
 
 
 def generate(plan: Plan, schedule: Schedule, pipeline: Pipeline, *, trace: bool = False) -> tuple[str, str]:
@@ -173,7 +174,16 @@ class _Generator:
         self.definitions = _Definitions(plan.constants, nest)
         # (The steps function reads the module's names with the loop variables and index arrays as locals.)
         self.module = _Namer(
-            {*self.definitions.defined, *MODULES, *mxu.FUNCTIONS, _WEAK, _PHASE_STEPS, *self.indices}
+            {
+                *self.definitions.defined,
+                *MODULES,
+                *mxu.FUNCTIONS,
+                _WEAK,
+                _PHASE_STEPS,
+                _PAIRS,
+                "functools",
+                *self.indices,
+            }
             | {r.var for r in plan.loops}
         )
         self.kernel_name = self.module(f"{nest.name}_kernel")
@@ -209,6 +219,9 @@ class _Generator:
         self.fill_copies = {out.name: n(f"{out.name}_fill_copy") for out in self.filled}
         self.copy_fns = {name: n(f"{name}_copy") for name in [op.name for op in plan.operands] + list(nest.outputs)}
         self.views = {op.name: n(f"{op.name}_ref") for op in plan.operands}
+        # Operands read as words (`autokernel.pairs`): their VMEM slots seen as uint32, (rows, d).
+        self.words = {name: n(f"{name}_words") for name in sorted(set(plan.packed.values()))}
+        self.n_interpret = n("interpret")  # (the interpreter can't see a VMEM buffer as another dtype)
         # Per-tile windows consecutive tiles may share: copied only when they move; SMEM holds each one's slot.
         self.shared = [op for op in plan.operands if op.kind is Kind.TILE and _may_stay(op, plan)]
         self.tile_slots = n("tile_slots")
@@ -237,7 +250,7 @@ class _Generator:
         tunable = f", {self.plan.tunable}" if self.plan.tunable is not None else ""
         w(f"# for {inputs}{tunable}; {self.pipeline}{'; with trace regions' if self.trace else ''}.")
         w("")
-        w("import jax", "import jax.numpy as jnp", "import numpy as np")
+        w(*(["import functools"] if self.words else []), "import jax", "import jax.numpy as jnp", "import numpy as np")
         w("from jax.experimental import pallas as pl", "from jax.experimental.pallas import tpu as pltpu")
         definitions = self.definitions
         if definitions.imports:
@@ -256,6 +269,12 @@ class _Generator:
         if self._uses_mxu(kernel):
             for fn in mxu.FUNCTIONS.values():
                 w("", "", *inspect.getsource(fn).splitlines())
+        if self.words:
+            w("", "")
+            with w.block(f"def {_PAIRS}(x):"):
+                w("# autokernel.pairs: a 16-bit tile's pairs of rows (..., 2, d) as uint32 words (..., d), for the")
+                w("# interpreter (on a TPU the kernel reads its VMEM buffer as words).")
+                w("return jax.lax.bitcast_convert_type(jnp.swapaxes(x, -1, -2), jnp.uint32)")
         if self.uses_weak:
             w("", "")
             with w.block(f"def {_WEAK}(x):"):
@@ -361,7 +380,11 @@ class _Generator:
             if runtime:
                 w(f"{', '.join(runtime)} = {self.steps_name}({', '.join(param[i] for i in self.indices)})")
             with w.block("return pl.pallas_call("):
-                w(f"{self.kernel_name},")
+                w(
+                    f"functools.partial({self.kernel_name}, {self.n_interpret}=bool(interpret)),"
+                    if self.words
+                    else f"{self.kernel_name},"
+                )
                 shapes = [f"jax.ShapeDtypeStruct({out.shape}, jnp.{out.dtype.name})" for out in plan.outputs]
                 w(f"out_shape={shapes[0] if len(shapes) == 1 else '(' + ', '.join(shapes) + ',)'},")
                 with w.block("in_specs=["):
@@ -443,6 +466,8 @@ class _Generator:
         for out in self.fill_bufs:
             params += [self.fill_bufs[out], self.fill_sems[out]]
         params += [self.tile_slots] if self.shared else []
+        if self.words:
+            params.append(f"*, {self.n_interpret}")
         with w.block(f"def {self.kernel_name}({', '.join(params)}):"):
             self._step_fn(w)
             self._blocks_fn(w)
@@ -887,6 +912,12 @@ class _Generator:
                     slot = slots.get(op.kind)
                 view = buf if op.kind is Kind.ONCE else f"{buf}.at[{slot}]"
                 w(f"{self.views[op.name]} = {view}")
+                if op.name in self.words:  # (a 16-bit (..., 2, d) slot holds (..., d) words)
+                    words = f"{buf}.bitcast(jnp.uint32)" + ("" if op.kind is Kind.ONCE else f".at[{slot}]")
+                    shape = f"{math.prod(op.tile.shape[:-2])}, {op.tile.shape[-1]}"
+                    w(f"{self.words[op.name]} = {words}.reshape({shape})")
+                    with w.block(f"if {self.n_interpret}:"):
+                        w(f"{self.words[op.name]} = {_PAIRS}({self.views[op.name]}[...]).reshape({shape})")
             self._loop_vars(w)
 
             out_slots = pipe.output_buffers
@@ -1201,6 +1232,13 @@ class _TileCode:
         scalars = {r.var for r in plan.loops} | set(plan.constants)
 
         class Rewrite(ast.NodeTransformer):
+            def visit_Call(self, node: ast.Call) -> ast.expr:
+                operand = plan.packed.get((node.lineno, node.col_offset))
+                if operand is None:
+                    return self.generic_visit(node)  # type: ignore[return-value]
+                shape = (*next(op for op in plan.operands if op.name == operand).tile.shape[:-2], -1)
+                return _parse_expr(f"{gen.words[operand]}[...].reshape({shape})")
+
             def visit_Subscript(self, node: ast.Subscript) -> ast.expr:
                 operand = plan.reads.get(plan.read_key(node))
                 if operand is not None:
