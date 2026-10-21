@@ -28,7 +28,8 @@ kernel for a **TPU v5e**, and tunes its schedule on the hardware. The scope is d
     (`qwen3_models.py`);
   - DeepSeek-V3 / Kimi K2: MLA prefill (`mla.py`), absorbed MLA decode, whole models (`deepseek.py`);
   - MoE: routers, dropless grouped SwiGLU experts over runtime masks and windows, shared experts (`moe.py`);
-    a stack of MoE layers decoding in one kernel, each layer's routing computed inside it (`moe_megakernel.py`);
+    a stack of MoE layers decoding in one kernel, each layer's routing computed inside it (`moe_megakernel.py`),
+    and a whole MoE decode step in one kernel (`moe_decode_megakernel.py`);
   - linear attention: chunked Gated DeltaNet and KDA (`linear_attention.py`, `linear_attention_layer.py`),
     hybrid Qwen3-Next / Kimi Linear models (`hybrid_layers.py`, `hybrid_models.py`);
   - a real model: Gemma 4 E2B's text decoder with its weights, greedy generation against vLLM (`gemma4.py`,
@@ -204,6 +205,8 @@ Each of these was found on hardware; don't undo them without measuring again.
 - Routing inside the kernel (`moe_megakernel.py`, two Qwen3-30B-A3B layers): 1.32x moe.py's per-layer
   decode at 1 token (0.225 vs 0.297 ms), 1.02-1.05x from 4 to 64 (both near 750 GB/s). Each layer's first
   expert blocks wait for the routing (no prefetch can cross it): 680 GB/s at 1 token.
+- A whole MoE decode step in one kernel (two Qwen3-30B-A3B layers, contexts ~1k): 1.16x the per-layer
+  kernels at B1 (0.546 vs 0.633 ms), 1.03x at B8, parity at B32 (both read the chosen experts, ~110 of 128).
 - Tuning is per input signature, not per lengths: a short-context batch with the same cache shape reuses a
   long one's tuning (the attention group size most). Benchmarks give short contexts caches of their own.
 

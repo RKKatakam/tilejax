@@ -293,6 +293,12 @@ class Plan:
         ranges = (*self.parallel, *(phase.range for phase in self.phases))
         return any(r.bounds is not None for r in ranges) or bool(self.computed)
 
+    @property
+    def either(self) -> bool:
+        """May the kernel find its steps either way: from tables the device makes of its runtime masks before
+        it runs, or with a cursor as it runs (its outputs are stored per tile)? Tuning tries both."""
+        return self.runtime and not self.cursor and all(out.phase is None for out in self.outputs)
+
     def eval(self, node: ast.expr, values: Mapping[str, Any] | None = None) -> Any:
         """Evaluate an expression of the function on the prologue's names (and `values`, e.g. loop values)."""
         return evaluate(self.nest, self.env, node, values)

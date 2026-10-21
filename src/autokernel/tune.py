@@ -56,16 +56,20 @@ MIN_GAIN = 0.01  # a schedule must be this much faster to replace the best so fa
 
 @dataclass(frozen=True)
 class Config:
-    """A schedule: the kernel's tunable (None if it has none) and its buffering."""
+    """A schedule: the kernel's tunable (None if it has none), its buffering, and, where its runtime masks
+    allow either (`Plan.either`), whether it finds its steps with a cursor as it runs rather than from
+    tables the device makes before it."""
 
     tunable: Any
     pipeline: Pipeline
+    cursor: bool = False
 
     def __str__(self) -> str:
+        rest = f"{self.pipeline}, steps found as it runs" if self.cursor else str(self.pipeline)
         if self.tunable is None:
-            return str(self.pipeline)
+            return rest
         fields = ", ".join(f"{k}={getattr(self.tunable, k)!r}" for k in choices(self.tunable))
-        return f"{type(self.tunable).__name__}({fields}), {self.pipeline}"
+        return f"{type(self.tunable).__name__}({fields}), {rest}"
 
 
 @dataclass
@@ -166,7 +170,7 @@ def proposals(kernel: Kernel, signature: Signature, trial: Trial) -> list[Config
     config, profile = trial.config, trial.profile
     if profile is None:  # it didn't run: the neighbours that need the least VMEM first, then less buffering
         return _smaller(kernel, signature, config)
-    plan, schedule = kernel.build(signature, config.tunable)
+    plan, schedule = kernel.build(signature, config.tunable, config.cursor)
     here, pipe, loops = _stats(plan, schedule), config.pipeline, _loop_steps(plan)
     exposed = EXPOSED_SHARE * profile.device_s
     buffering = []
@@ -178,18 +182,20 @@ def proposals(kernel: Kernel, signature: Signature, trial: Trial) -> list[Config
         buffering = []  # (a burst's slots follow from its steps)
     if plan.single_step and not schedule.runtime_tiles and profile.bottleneck == "dma":
         buffering += [Pipeline.bursts(g) for g in _bursts(pipe.burst)]
-    moves = [Config(config.tunable, p) for p in buffering if fits(plan, schedule, p)]
+    moves = [Config(config.tunable, p, config.cursor) for p in buffering if fits(plan, schedule, p)]
+    if plan.either:  # the other way of finding the steps (decode kernels gain by a cursor, grouped matmuls lose)
+        moves.insert(0, dataclasses.replace(config, cursor=not config.cursor))
 
     near: list[tuple[_Stats, Config]] = []
     for tunable in neighbours(config.tunable) if config.tunable is not None else ():
         try:
-            plan, schedule = kernel.build(signature, tunable)
+            plan, schedule = kernel.build(signature, tunable, config.cursor)
             pipeline = _keep(plan, schedule, pipe, here)
         except KernelError:
             continue  # breaks a layout rule, doesn't divide a loop, doesn't fit in VMEM, ...
         if _loop_steps(plan) == loops:
             continue  # the same kernel (the code clamps the field to the array, say)
-        near.append((_stats(plan, schedule), Config(tunable, pipeline)))
+        near.append((_stats(plan, schedule), Config(tunable, pipeline, config.cursor)))
     if profile.bottleneck == "dma":  # (fewer bytes; or as many in fewer steps, which never costs more)
         near = [n for n in near if (n[0].dma_bytes, n[0].steps) < (here.dma_bytes, here.steps)]
         near = sorted(near, key=lambda n: (n[0].dma_bytes, n[0].steps))

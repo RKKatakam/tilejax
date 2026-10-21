@@ -135,13 +135,14 @@ class Schedule:
         return _mixed_radix(rep, self.outer) + tuple(int(self.tables[TILE_TABLE % r.var][t]) for r in self.inner)
 
 
-def make_schedule(plan: Plan) -> Schedule:
-    """The steps `plan`'s kernel runs; raises KernelError if a mask leaves nothing to run, or tables too big
-    for SMEM. Tables are made only for what the masks actually skip."""
+def make_schedule(plan: Plan, cursor: bool = False) -> Schedule:
+    """The steps `plan`'s kernel runs (found with a cursor as it runs if its loops' bounds need that, or if
+    asked and its masks allow either way: `Plan.either`); raises KernelError if a mask leaves nothing to
+    run, or tables too big for SMEM. Tables are made only for what the masks actually skip."""
     nest = plan.nest
     phases = [phase.range for phase in plan.phases]
     counts = tuple(r.count for r in phases)
-    if plan.cursor:
+    if plan.cursor or (cursor and plan.either):
         return _cursor(plan, counts)
     tile_masks = [r.mask for r in plan.parallel if r.mask is not None]
     step_masks = [r.mask for r in phases if r.mask is not None]

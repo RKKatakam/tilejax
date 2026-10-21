@@ -190,8 +190,9 @@ class Kernel:
                 raise
             return found
 
-    def build(self, signature: Signature, tunable: Any) -> tuple[Plan, Schedule]:
-        """The plan and schedule for this signature and tunable."""
+    def build(self, signature: Signature, tunable: Any, cursor: bool = False) -> tuple[Plan, Schedule]:
+        """The plan and schedule for this signature and tunable (its steps found with a cursor if `cursor`
+        and its masks allow either way)."""
         key = (signature, tunable)
         if signature not in self._references:  # read the constants once per signature, with the plan
             self._references[signature] = make_reference(self.nest, self.fn)
@@ -199,13 +200,18 @@ class Kernel:
             specs = [jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in signature]
             plan = make_plan(self.nest, self.fn, specs, tunable)
             self._builds[key] = (plan, make_schedule(plan))
-        return self._builds[key]
+        plan, schedule = self._builds[key]
+        if cursor and plan.either:
+            if (*key, True) not in self._builds:
+                self._builds[(*key, True)] = (plan, make_schedule(plan, cursor=True))
+            return self._builds[(*key, True)]
+        return plan, schedule
 
     def lowered(self, signature: Signature, config: Config, trace: bool = False) -> Lowered:
         """The kernel for this signature and schedule (with trace regions, for profiling)."""
         key = (signature, config, trace)
         if key not in self._lowered:
-            plan, schedule = self.build(signature, config.tunable)
+            plan, schedule = self.build(signature, config.tunable, config.cursor)
             source, entry_name = codegen.generate(plan, schedule, config.pipeline, trace=trace)
             entry = _load(source, f"<autokernel {self.nest.name} #{next(_generated)}>", entry_name)
             self._lowered[key] = Lowered(plan, schedule, config, source, trace, entry)

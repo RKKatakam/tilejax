@@ -131,6 +131,7 @@ Fake weights and inputs, small models that fit a 16 GB v5e; bf16; ms per call, w
 | KDA decode step (Kimi Linear), paged states updated in place | [kda_decode.py](examples/kda_decode.py) | vLLM TorchTPU's fused `decode_kda` | **1.00–1.44×**, bit-identical (up to 695 GB/s) |
 | Whole decode step in one kernel (cross-layer prefetch) | [decode_megakernel.py](examples/decode_megakernel.py) | XLA / per-layer kernels | **1.04–2.23×** / **1.06–1.55×** (up to 90% of HBM bandwidth) |
 | MoE layers decoding in one kernel, the routing inside it | [moe_megakernel.py](examples/moe_megakernel.py) | moe.py's layer per layer (XLA routing + `moe_decode`) | **1.02–1.32×** (680–750 GB/s) |
+| A whole MoE decode step in one kernel | [moe_decode_megakernel.py](examples/moe_decode_megakernel.py) | kernels per layer, XLA routing between them | **1.00–1.16×** |
 
 **Whole models**, tokens to logits (prefill) and one token per sequence per step over a KV cache
 (decode), built only from autokernel kernels plus plain-JAX glue (embedding lookups, routing sorts, cache
@@ -225,6 +226,21 @@ top-8), ms per call under `jax.jit`:
 
 From 4 tokens both read the chosen experts near the HBM limit, and one kernel saves the routing's XLA ops,
 a launch and a pipeline fill per layer. A token reads only 8 experts a layer, so those dominate at 1 token.
+
+**A whole MoE decode step in one kernel** (`examples/moe_decode_megakernel.py`): decode_megakernel.py's
+step with that MoE layer in place of the dense FFN, every layer and the LM head (the attention's masked
+steps found by the in-kernel cursor, which skips the blocks a mask skips as it moves). Two Qwen3-30B-A3B
+layers (32 query heads, 4 kv heads, 128 experts of 768, top-8, vocab 32k), contexts ~1k, ms per decode step
+(`benchmarks/moe_decode_megakernel.py`):
+
+| batch | one kernel | kernels per layer (QKV, attention, W_o, XLA routing, `moe_decode`) | speedup |
+| --- | --- | --- | --- |
+| 1 | **0.546** | 0.633 | 1.16× |
+| 8 | **1.704** | 1.747 | 1.03× |
+| 32 | 3.458 | 3.443 | 1.00× |
+
+(Its logits can differ from the per-layer step's where a token's router scores are near a tie: the one
+kernel keeps the residual in f32 between layers, the per-layer kernels round it to bf16.)
 
 ### MoE layers at full width: autokernel vs `ragged_dot` and megablox
 

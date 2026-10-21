@@ -33,6 +33,8 @@ from moe_decode_megakernel import (
 )
 from timing import require_tpu
 
+import autokernel
+
 SHAPES = [  # layers, d_model, heads, kv_heads, experts, ffn, vocab : batch, mean context (Qwen3-30B-A3B's layers)
     "2,2048,32,4,128,768,32768:1,1024",
     "2,2048,32,4,128,768,32768:8,1024",
@@ -59,6 +61,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--shape", action="append")
     parser.add_argument("--steps", type=int, default=16)
+    parser.add_argument("--profile", action="store_true", help="also print the one kernel's profile")
     args = parser.parse_args()
     require_tpu()
     rows = []
@@ -84,6 +87,9 @@ def main() -> None:
             f"  one kernel                {t_mega:8.3f} ms   tuned {moe_decode_megakernel.tuning(*specs).config}",
             flush=True,
         )
+        if args.profile:  # (the timed steps donated `caches`: fresh ones)
+            fresh = kernel_inputs(tokens, *random_caches(config, lengths, s_max), lengths, params)
+            print(autokernel.profile(moe_decode_megakernel, *fresh), flush=True)
         del caches
         layers = layer_weights(params)
 
