@@ -6,6 +6,7 @@ WORK IN PROGRESS: inputs, the float64 reference and the plain-JAX path.
 
 from __future__ import annotations
 
+import functools
 from typing import Any
 
 import jax
@@ -87,6 +88,15 @@ def l2_normalize(x, scale=1.0):
     return x * jax.lax.rsqrt(jnp.sum(x * x, axis=-1, keepdims=True) + L2_EPS) * scale
 
 
+def decays(g, dt_bias, a_log, lower_bound):
+    """The decays exp(gate) per key channel (TH, d_k): gate = -exp(A_log) softplus(g + dt_bias), or with a
+    lower bound, lower_bound * sigmoid(exp(A_log) (g + dt_bias)) (vLLM's two forms)."""
+    x = g + dt_bias
+    if lower_bound is None:
+        return jnp.exp(-jnp.exp(a_log) * jax.nn.softplus(x))
+    return jnp.exp(lower_bound * jax.nn.sigmoid(jnp.exp(a_log) * x))
+
+
 def columns(x):
     """Rows x (TH, d) as columns (TH, d, 1): the transpose a select and a lane sum make (exact)."""
     th, d = x.shape
@@ -95,64 +105,90 @@ def columns(x):
 
 
 def delta_rule(q, k, v, a, beta, s):
-    """One token of KDA for TH heads, f32: rows q, k (normalized, q scaled), v, the decays a (TH, d), betas
-    (TH, 1), states s (TH, d_k, d_v). With S' = Diag(a) S, u = beta (v - S'^T k), S'' = S' + k u^T and
-    o = S''^T q = S^T (a q) + (k . q) u, one matmul reads S for both S^T (a k) and S^T (a q)."""
-    both = jnp.concatenate([(a * k)[:, None, :], (a * q)[:, None, :]], axis=1)  # (TH, 2, d_k)
-    read = both @ s  # (TH, 2, d_v): f32 operands, full precision (`@` in kernel code)
-    u = beta * (v - read[:, 0, :])
-    out = read[:, 1, :] + jnp.sum(k * q, axis=-1, keepdims=True) * u
-    return out, columns(a) * s + columns(k) * u[:, None, :]
+    """One token of KDA for TH heads, f32, in vLLM's order: rows q, k (normalized, q scaled), v, the decays a
+    (TH, d_k), betas (TH, 1), states s (TH, d_k, d_v):
+
+        S' = Diag(a) S;  u = beta (v - S'^T k);  S'' = S' + k u^T;  o = S''^T q
+
+    The two matrix-vector products are MXU matmuls with S' and S'' as the weights, at the MXU's default
+    precision for f32 (as vLLM's kernel), so the results are the same."""
+    batched = (((2,), (1,)), ((0,), (0,)))
+    decayed = s * columns(a)
+    read = jax.lax.dot_general(k[:, None, :], decayed, batched, preferred_element_type=jnp.float32)
+    u = beta[:, :, None] * (v[:, None, :] - read)  # (TH, 1, d_v)
+    new = decayed + columns(k) * u
+    out = jax.lax.dot_general(q[:, None, :], new, batched, preferred_element_type=jnp.float32)
+    return out[:, 0, :], new
 
 
-@autokernel.kernel
-def kda_decode_step(
-    mixed_qkv,
-    g,
-    beta,
-    conv_state,
-    conv_weight,
-    state,
-    a_log,
-    dt_bias,
-    state_indices,
-    has_initial_state,
-    tiles=KdaTiles(),
-):
-    """The step as one loop nest, a tile per (sequence, block of heads): mixed_qkv (B, 3, H, d_k), g
-    (B, H, d_k), beta (B, H, 1), the pools conv_state (slots, CONV - 1, 3, H, d_k) and state
-    (slots, H, d_k, d_v), conv_weight (CONV, 3, H, d_k), a_log (H, 1), dt_bias (H, d_k) f32, int32
-    state_indices and has_initial_state (B,). The pools are updated in place: each sequence's slot is read
-    and written back where the index array says, and nothing else is touched."""
-    B, _, H, K = mixed_qkv.shape
-    TH = min(tiles.heads, H)
-    scale = K**-0.5
-    dtype, conv_dtype = mixed_qkv.dtype, conv_state.dtype
-    out = jnp.zeros((B, H, K), dtype)
-    new_conv = conv_state
-    new_state = state
-    for b in range(B):
-        for h in range(0, H, TH):
-            valid = state_indices[b] > 0  # slot 0 is the null block (padding): write it back as found
-            carry = valid & (has_initial_state[b] != 0)  # else the sequence starts from zero states
-            stored_conv = conv_state[state_indices[b], :, :, h : h + TH, :]
-            prev = jnp.where(carry, stored_conv.astype(jnp.float32), 0.0)
-            x = mixed_qkv[b, :, h : h + TH, :].astype(jnp.float32)
-            conv = short_conv(x, prev, conv_weight[:, :, h : h + TH, :].astype(jnp.float32))
-            conv = conv.astype(dtype).astype(jnp.float32)  # (rounded as vLLM's kernel rounds it)
-            q = l2_normalize(conv[0], scale)
-            k = l2_normalize(conv[1])
-            f = jax.nn.softplus(g[b, h : h + TH, :].astype(jnp.float32) + dt_bias[h : h + TH, :])
-            a = jnp.exp(-jnp.exp(a_log[h : h + TH, :]) * f)
-            stored = state[state_indices[b], h : h + TH, :, :]
-            o, s = delta_rule(
-                q, k, conv[2], a, beta[b, h : h + TH, :].astype(jnp.float32), jnp.where(carry, stored, 0.0)
-            )
-            tail = jnp.concatenate([prev[1:], x[None]]).astype(conv_dtype)
-            out = out.at[b, h : h + TH, :].set(jnp.where(valid, o, 0.0).astype(dtype))
-            new_conv = new_conv.at[state_indices[b], :, :, h : h + TH, :].set(jnp.where(valid, tail, stored_conv))
-            new_state = new_state.at[state_indices[b], h : h + TH, :, :].set(jnp.where(valid, s, stored))
-    return out, new_conv, new_state
+def make_kda_decode_step(lower_bound: float | None = None, state_transposed: bool = False) -> autokernel.Kernel:
+    """The step as one loop nest, a tile per (sequence, block of heads), for vLLM's options: the gate's lower
+    bound (None: the softplus form), and pools whose slots hold each head's state as (d_v, d_k)."""
+
+    @autokernel.kernel
+    def kda_decode_step(
+        mixed_qkv,
+        g,
+        beta,
+        conv_state,
+        conv_weight,
+        state,
+        a_log,
+        dt_bias,
+        state_indices,
+        has_initial_state,
+        tiles=KdaTiles(),
+    ):
+        """mixed_qkv (B, 3, H, d_k), g (B, H, d_k), beta (B, H, 1), the pools conv_state
+        (slots, CONV - 1, 3, H, d_k) and state (slots, H, d_k, d_v), conv_weight (CONV, 3, H, d_k), a_log
+        (H, 1), dt_bias (H, d_k) f32, int32 state_indices and has_initial_state (B,). The pools are updated in
+        place: each sequence's slot is read and written back where the index array says, nothing else."""
+        B, _, H, K = mixed_qkv.shape
+        TH = min(tiles.heads, H)
+        scale = K**-0.5
+        dtype, conv_dtype = mixed_qkv.dtype, conv_state.dtype
+        out = jnp.zeros((B, H, K), dtype)
+        new_conv = conv_state
+        new_state = state
+        for b in range(B):
+            for h in range(0, H, TH):
+                valid = state_indices[b] > 0  # slot 0 is the null block (padding): write it back as found
+                carry = valid & (has_initial_state[b] != 0)  # else the sequence starts from zero states
+                stored_conv = conv_state[state_indices[b], :, :, h : h + TH, :]
+                prev = jnp.where(carry, stored_conv.astype(jnp.float32), 0.0)
+                x = mixed_qkv[b, :, h : h + TH, :].astype(jnp.float32)
+                conv = short_conv(x, prev, conv_weight[:, :, h : h + TH, :].astype(jnp.float32))
+                conv = conv.astype(dtype).astype(jnp.float32)  # (rounded as vLLM's kernel rounds it)
+                q = l2_normalize(conv[0], scale)
+                k = l2_normalize(conv[1])
+                a = decays(
+                    g[b, h : h + TH, :].astype(jnp.float32), dt_bias[h : h + TH, :], a_log[h : h + TH, :], lower_bound
+                )
+                stored = state[state_indices[b], h : h + TH, :, :]
+                s = jnp.swapaxes(stored, 1, 2) if state_transposed else stored
+                o, s = delta_rule(
+                    q, k, conv[2], a, beta[b, h : h + TH, :].astype(jnp.float32), jnp.where(carry, s, 0.0)
+                )
+                s = jnp.swapaxes(s, 1, 2) if state_transposed else s
+                tail = jnp.concatenate([prev[1:], x[None]]).astype(conv_dtype)
+                out = out.at[b, h : h + TH, :].set(jnp.where(valid, o, 0.0).astype(dtype))
+                new_conv = new_conv.at[state_indices[b], :, :, h : h + TH, :].set(jnp.where(valid, tail, stored_conv))
+                new_state = new_state.at[state_indices[b], h : h + TH, :, :].set(jnp.where(valid, s, stored))
+        return out, new_conv, new_state
+
+    return kda_decode_step
+
+
+kda_decode_step = make_kda_decode_step()
+_STEPS = {(None, False): kda_decode_step}
+
+
+def step_kernel(lower_bound: float | None = None, state_transposed: bool = False) -> autokernel.Kernel:
+    """The kernel for these options (made once)."""
+    key = (lower_bound, state_transposed)
+    if key not in _STEPS:
+        _STEPS[key] = make_kda_decode_step(lower_bound, state_transposed)
+    return _STEPS[key]
 
 
 def step_args(mixed_qkv, g, beta, conv_state, conv_weight, state, a_log, dt_bias, state_indices, has_initial_state):
@@ -172,15 +208,29 @@ def step_args(mixed_qkv, g, beta, conv_state, conv_weight, state, a_log, dt_bias
     )
 
 
-@jax.jit
-def kda_decode(mixed_qkv, g, beta, conv_state, conv_weight, state, a_log, dt_bias, state_indices, has_initial_state):
-    """vLLM decode_kda's ABI (its defaults: the rank-5 conv state, the state as (d_k, d_v)): mixed_qkv
-    (B, 3 * H * d_k), g (B, H, d_k) raw, beta (B, H) activated, the pools, conv_weight (CONV, 3, H, d_k),
-    a_log (H,), dt_bias (H, d_k), state_indices (B,) (0: a null entry), has_initial_state (B,). Returns
-    (out (B, H, d_v), conv_state, state); donate the pools to update them in place. (Tune it on real
-    inputs first, `kda_decode_step.tuning(*step_args(...))`: under jax.jit it would tune on random ones.)"""
+@functools.partial(jax.jit, static_argnames=("lower_bound", "state_transposed"))
+def kda_decode(
+    mixed_qkv,
+    g,
+    beta,
+    conv_state,
+    conv_weight,
+    state,
+    a_log,
+    dt_bias,
+    state_indices,
+    has_initial_state,
+    *,
+    lower_bound=None,
+    state_transposed=False,
+):
+    """vLLM decode_kda's ABI (with the rank-5 conv state): mixed_qkv (B, 3 * H * d_k), g (B, H, d_k) raw,
+    beta (B, H) activated, the pools, conv_weight (CONV, 3, H, d_k), a_log (H,), dt_bias (H, d_k),
+    state_indices (B,) (0: a null entry), has_initial_state (B,). Returns (out (B, H, d_v), conv_state,
+    state); donate the pools to update them in place. (Tune it on real inputs first,
+    `step_kernel(...).tuning(*step_args(...))`: under jax.jit it would tune on random ones.)"""
     args = (mixed_qkv, g, beta, conv_state, conv_weight, state, a_log, dt_bias, state_indices, has_initial_state)
-    return kda_decode_step(*step_args(*args))
+    return step_kernel(lower_bound, state_transposed)(*step_args(*args))
 
 
 # --------------------------------------------------------------------------- float64 reference
@@ -196,12 +246,15 @@ def _conv(window: np.ndarray, conv_weight: jax.Array) -> jax.Array:
     return jax.nn.silu(pre).astype(jnp.bfloat16)
 
 
-def reference(inputs: dict[str, Any], seqs: range | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def reference(
+    inputs: dict[str, Any], seqs: Any = None, lower_bound: float | None = None, state_transposed: bool = False
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """The step in float64 NumPy for sequences `seqs` (default all): (out (n, H, d_v), the new conv states
-    (n, CONV - 1, 3, H, d_k), the new states (n, H, d_k, d_v)), per sequence (a null slot's: zeros, and its
-    slot's contents unchanged). The convolution is computed as the kernels compute it (f32, rounded to bf16
-    after the SiLU): in f64 a value near a bf16 rounding boundary would round the other way, which changes
-    the state by ~1e-4 (one bf16 step of a key)."""
+    (n, CONV - 1, 3, H, d_k), the new states (n, H, d_k, d_v), or (n, H, d_v, d_k) as the pool keeps them if
+    `state_transposed`), per sequence (a null slot's: zeros, and its slot's contents unchanged). The
+    convolution is computed as the kernels compute it (f32, rounded to bf16 after the SiLU): in f64 a value
+    near a bf16 rounding boundary would round the other way, which changes the state by ~1e-4 (one bf16 step
+    of a key)."""
     f = lambda x: np.asarray(x, np.float64)  # noqa: E731
     idx = np.asarray(inputs["state_indices"])
     has = np.asarray(inputs["has_initial_state"])
@@ -214,6 +267,8 @@ def reference(inputs: dict[str, Any], seqs: range | None = None) -> tuple[np.nda
     for b in seqs:
         slot, carry = int(idx[b]), bool(has[b]) and idx[b] > 0
         stored_conv, stored = f(inputs["conv_state"][slot]), f(inputs["state"][slot])
+        if state_transposed:
+            stored = np.swapaxes(stored, 1, 2)
         prev = stored_conv if carry else np.zeros_like(stored_conv)
         x = f(inputs["mixed_qkv"][b]).reshape(3, *w.shape[2:])
         window = np.concatenate([prev, x[None]])
@@ -221,12 +276,18 @@ def reference(inputs: dict[str, Any], seqs: range | None = None) -> tuple[np.nda
         q, k, v = conv
         q = q / np.sqrt(np.sum(q * q, -1, keepdims=True) + L2_EPS) * scale
         k = k / np.sqrt(np.sum(k * k, -1, keepdims=True) + L2_EPS)
-        decay = np.exp(-a * np.logaddexp(0.0, f(inputs["g"][b]) + dt))
+        gate = f(inputs["g"][b]) + dt
+        if lower_bound is None:
+            decay = np.exp(-a * np.logaddexp(0.0, gate))
+        else:
+            decay = np.exp(lower_bound / (1 + np.exp(-a * gate)))
         beta = f(inputs["beta"][b])
         s = (stored if carry else np.zeros_like(stored)) * decay[:, :, None]
         u = beta[:, None] * (v - np.einsum("hk,hkv->hv", k, s))
         s = s + k[:, :, None] * u[:, None, :]
         out = np.einsum("hk,hkv->hv", q, s)
+        if state_transposed:
+            s, stored = np.swapaxes(s, 1, 2), np.swapaxes(stored, 1, 2)
         if slot > 0:
             outs.append(out), convs.append(window[1:]), states.append(s)
         else:

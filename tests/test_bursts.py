@@ -78,6 +78,15 @@ def test_bursts_with_skipped_tiles():
     np.testing.assert_allclose(f64(out), want, rtol=1e-6)
 
 
+def test_bursts_of_a_kernel_that_fetches_everything_once():
+    kernel = make_kernel(ROWS, Rows=Rows)
+    x = rand((256, 128))
+    for t, steps in ((Rows(tm=128), 2), (Rows(tm=256), 1)):
+        lowered, out = run(kernel, Config(t, Pipeline.bursts(2)), x, trace=True)
+        assert lowered.steps == steps
+        np.testing.assert_allclose(f64(out), 2 * f64(x), rtol=1e-6)
+
+
 def test_bursts_need_single_step_tiles():
     kernel = make_kernel(
         """
@@ -107,7 +116,7 @@ def test_burst_pipelines_are_checked():
 
 @autokernel.tunable
 class Rows:
-    tm: int = autokernel.choice(64, 128, default=64)
+    tm: int = autokernel.choice(64, 128, 256, default=64)
 
 
 ROWS = """
@@ -149,3 +158,25 @@ def test_neighbours_whose_tiles_take_steps_drop_the_bursts():
     stepped = next(c for c in configs if c.tunable == Tiles(tm=128, tk=128))
     assert stepped.pipeline == Pipeline(3, 2)
     assert next(c for c in configs if c.tunable == Tiles(tm=64, tk=256)).pipeline == Pipeline.bursts(2)
+
+
+@autokernel.tunable
+class BigRows:
+    tm: int = autokernel.choice(1024, 4096, default=1024)
+
+
+def test_neighbours_keep_the_longest_bursts_that_fit():
+    kernel = make_kernel(
+        """
+        def f(x, t=BigRows()):
+            out = jnp.zeros((16384, 512))
+            for i in range(0, 16384, t.tm):
+                out = out.at[i : i + t.tm, :].set(x[i : i + t.tm, :] * 2)
+            return out
+        """,
+        BigRows=BigRows,
+    )
+    sig = kernel.signature(spec(16384, 512))
+    start = Config(BigRows(), Pipeline.bursts(16))  # 2 MiB tiles: 48 slots, 96 MiB
+    configs = proposals(kernel, sig, autokernel.Trial(start, profile(start, seconds=10e-6)))
+    assert configs == [Config(BigRows(tm=4096), Pipeline.bursts(4))]  # 8 MiB tiles: 16 or 8 steps don't fit

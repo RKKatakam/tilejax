@@ -18,7 +18,9 @@ reduction loop whose mask skips all of a tile's blocks) fetches nothing and runs
 
 With a pipeline of bursts (single-step tiles only, pipeline.py), steps 2 and 4 move to the bursts' ends: a
 burst's first step waits for the previous burst's output copies, then starts fetching the next burst's
-inputs; its last step waits for those, then starts copying its own outputs out.
+inputs; its last step waits for those, then starts copying its own outputs out. (The first burst's steps
+wait for their own inputs, and the last burst's copy their outputs out as they go: nothing reads or
+writes alongside them.)
 
 Index arrays (inputs read element by element) are SMEM inputs. When masks read them, the entry function
 first finds the steps that run on the device (`<name>_steps`, plain JAX), and the kernel loops over those.
@@ -694,8 +696,6 @@ class _Generator:
             w(f"# The first burst's inputs ({first} step(s)).")
             for step in range(first):
                 w(*[f"{self.copy_fns[op.name]}({sch.blocks_at(step)}, 0, {step}).start()" for op in streamed])
-            for step in range(first):
-                w(*[f"{self.copy_fns[op.name]}({sch.blocks_at(step)}, 0, {step}).wait()" for op in streamed])
             return
         ahead = min(self.pipeline.input_buffers - 1, sch.steps)
         if not ((streamed or iterated) and ahead):
@@ -860,8 +860,10 @@ class _Generator:
 
             per_tile = [op for op in plan.operands if op.kind is Kind.TILE]
             slots = {Kind.STREAM: _int_expr(s, "%", depth), Kind.TILE: _int_expr(tile, "%", TILE_SLOTS)}
-            waits = per_tile or iterated or (streamed and not self.burst)  # (bursts wait at their ends)
-            with self._region(w, WAIT) if waits else nullcontext():  # (none empty)
+            with self._region(w, WAIT) if per_tile or streamed or iterated else nullcontext():  # (none empty)
+                if self.burst and streamed:  # the first burst's steps wait for their inputs (later ones: at its end)
+                    with self._when(w, f"{s} < {self.burst}", "_first_burst"):
+                        w(*[f"{self.copy_fns[op.name]}({at}, 0, {slots[Kind.STREAM]}).wait()" for op in streamed])
                 if per_tile:
                     with self._when(w, tile_first, "_tile_inputs"):
                         self._tile_inputs(w, per_tile, slots[Kind.TILE])
@@ -903,6 +905,10 @@ class _Generator:
             with self._region(w, COMPUTE):
                 self._tile_code(w, tile_first)
             if self.burst:
+                last = (sch.steps - 1) // self.burst * self.burst  # the last burst's first step
+                with self._when(w, f"{s} >= {last}", "_last_burst"):  # (no reads left: its outputs go now)
+                    slot = _int_expr(tile, "%", self.burst)
+                    w(*[f"{self.copy_fns[out.name]}({at}, {slot}).start()" for out in plan.outputs])
                 self._burst_end(w, streamed)
 
     def _burst_start(self, w: _Writer, streamed: list[Operand]) -> None:
@@ -913,29 +919,26 @@ class _Generator:
             with self._region(w, OUT_WAIT), self._when(w, f"{s} > 0", "_outputs_out"):
                 for out in self.plan.outputs:
                     w(*[f"{self.copy_fns[out.name]}({zero}, {j}).wait()" for j in range(g)])
-            for j in range(g):
+            for j in range(g if streamed else 0):
                 ahead = f"{s} + {g + j}"
                 with self._when(w, f"{ahead} < {steps}", f"_fetch{j}"):
                     slot = _int_expr(ahead, "%", 2 * g)
                     w(*[f"{self.copy_fns[op.name]}({self.n_blocks}({ahead}), 0, {slot}).start()" for op in streamed])
 
     def _burst_end(self, w: _Writer, streamed: list[Operand]) -> None:
-        """At a burst's last step: wait for the next burst's inputs, then start copying this burst's outputs
-        out (its steps stored them in their slots)."""
+        """At the last step of a burst before the last: wait for the next burst's inputs, then start copying
+        this burst's outputs out (its steps stored them in their slots)."""
         s, g, steps = self.n_s, self.burst, self.schedule.steps
-        with self._when(w, f"({_int_expr(s, '%', g)} == {g - 1}) | ({s} == {steps - 1})", "_end_burst"):
-            with self._region(w, WAIT):
-                for j in range(g):
+        with self._when(w, f"({_int_expr(s, '%', g)} == {g - 1}) & ({s} + 1 < {steps})", "_end_burst"):
+            with self._region(w, WAIT) if streamed else nullcontext():
+                for j in range(g if streamed else 0):
                     after = f"{s} + {j + 1}"
                     with self._when(w, f"{after} < {steps}", f"_wait{j}"):
                         slot = _int_expr(after, "%", 2 * g)
                         w(*[f"{self.copy_fns[op.name]}({self.n_blocks}({after}), 0, {slot}).wait()" for op in streamed])
-            start = self.local("burst_start")
-            w(f"{start} = {s} - {_int_expr(s, '%', g)}")
             for j in range(g):
-                with self._when(w, f"{start} + {j} <= {s}", f"_out{j}"):
-                    at = f"{self.n_blocks}({start} + {j})"
-                    w(*[f"{self.copy_fns[out.name]}({at}, {j}).start()" for out in self.plan.outputs])
+                at = f"{self.n_blocks}({s} - {g - 1 - j})" if j < g - 1 else self.n_at
+                w(*[f"{self.copy_fns[out.name]}({at}, {j}).start()" for out in self.plan.outputs])
 
     def _tile_inputs(self, w: _Writer, per_tile: list[Operand], slot: str) -> None:
         """At a tile's first step: start the next tile's per-tile inputs, and wait for this tile's. A window the

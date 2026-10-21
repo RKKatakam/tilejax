@@ -26,12 +26,15 @@ DONATE = (ARGS.index("conv_state"), ARGS.index("state"))
 SCHEDULES = [
     (16, Pipeline(3, 2)),
     (32, Pipeline(3, 2)),
+    (16, Pipeline.bursts(2)),
     (16, Pipeline.bursts(4)),
     (16, Pipeline.bursts(8)),
     (16, Pipeline.bursts(16)),
+    (32, Pipeline.bursts(1)),
     (32, Pipeline.bursts(2)),
     (32, Pipeline.bursts(4)),
     (32, Pipeline.bursts(8)),
+    (32, Pipeline.bursts(16)),
 ]
 
 

@@ -17,6 +17,7 @@ inputs, write its output) over the device time.
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import sys
 import tempfile
@@ -31,9 +32,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.experimental.pallas import tpu as pltpu
-from kda_decode import ARGS, args_of, make_inputs, reference, xla_decode
+from kda_decode import ARGS, args_of, kda_decode, make_inputs, reference, step_args, step_kernel, xla_decode
 from vllm_torchtpu.kernels.kimi_k3.decode_kda import decode_kda
 
+import autokernel
 from autokernel import profiling
 
 BATCHES = [1, 8, 32, 64, 128, 256]
@@ -41,17 +43,11 @@ HBM_GBS = 819.0
 DONATE = (ARGS.index("conv_state"), ARGS.index("state"))
 
 
-def methods() -> dict:
-    found = {"vllm": decode_kda, "xla": xla_decode}
-    try:
-        from kda_decode import kda_decode
-    except ImportError:
-        return found
-    found["autokernel"] = kda_decode
-    from kda_decode import KdaTiles, kda_decode_step, step_args
-
-    for heads in (16, 32):  # a fixed tunable (not tuned)
-        found[f"autokernel{heads}"] = lambda *a, t=KdaTiles(heads=heads): kda_decode_step(*step_args(*a), t)
+def methods(options: dict) -> dict:
+    """The step's implementations, for vLLM's options (the plain-JAX one only has the defaults)."""
+    found = {"vllm": functools.partial(decode_kda, **options), "autokernel": functools.partial(kda_decode, **options)}
+    if not options:
+        found["xla"] = xla_decode
     return found
 
 
@@ -130,6 +126,7 @@ def check(name: str, result, inputs: dict, want, theirs) -> dict:
             "conv_vs_vllm": float(jnp.max(jnp.abs(conv.astype(jnp.float32) - theirs[1].astype(jnp.float32)))),
             "state_vs_vllm": float(jnp.max(jnp.abs(state - theirs[2]))),
         }
+        row["identical"] = all(bool(jnp.array_equal(a, b)) for a, b in zip(result, theirs, strict=True))
     print(f"  {name:10} " + "  ".join(f"{k} {v:.3g}" for k, v in row.items()), flush=True)
     return row
 
@@ -139,30 +136,34 @@ def main() -> None:
     parser.add_argument("--batch", default=",".join(map(str, BATCHES)))
     parser.add_argument("--methods", default="vllm,autokernel,xla")
     parser.add_argument("--json", default=str(HERE / "results.jsonl"))
+    parser.add_argument("--transposed", action="store_true", help="pools of (d_v, d_k) states, as vLLM's")
+    parser.add_argument("--lower-bound", type=float, default=None, help="the gate's lower bound (sigmoid form)")
     opts = parser.parse_args()
+    options = {}
+    if opts.transposed:
+        options["state_transposed"] = True
+    if opts.lower_bound is not None:
+        options["lower_bound"] = opts.lower_bound
     if jax.default_backend() != "tpu":  # (a smoke test: their kernel in the interpreter)
         interpreting = pltpu.force_tpu_interpret_mode()
         interpreting.__enter__()
         pltpu.get_tpu_info = lambda: types.SimpleNamespace(vmem_capacity_bytes=128 << 20)  # (their vmem limit)
-    available = methods()
+    available = methods(options)
     names = [m for m in opts.methods.split(",") if m in available]
-    print(f"jax {jax.__version__} on {jax.devices()[0].device_kind}; methods {names}", flush=True)
+    print(f"jax {jax.__version__} on {jax.devices()[0].device_kind}; methods {names}; options {options}", flush=True)
+    kernel = step_kernel(**options)
     for batch in map(int, opts.batch.split(",")):
         inputs = make_inputs(batch)
         nbytes = step_bytes(inputs)
         seqs = np.unique(np.linspace(0, batch - 1, min(batch, 16)).astype(int))
-        want = (seqs, reference(inputs, seqs))
+        want = (seqs, reference(inputs, seqs, **options))
         print(f"batch {batch}: {nbytes / 1e6:.1f} MB per step, pool of {inputs['state'].shape[0]} slots", flush=True)
         theirs = None
         rows = []
         for name in names:
             fn = available[name]
             if name == "autokernel":  # tune on these inputs (under jax.jit it would tune on random ones)
-                from kda_decode import kda_decode_step, step_args
-
-                print(
-                    "  " + str(kda_decode_step.tuning(*step_args(*args_of(inputs)))).replace("\n", "\n  "), flush=True
-                )
+                print("  " + str(kernel.tuning(*step_args(*args_of(inputs)))).replace("\n", "\n  "), flush=True)
             first = jax.jit(fn)(*args_of(inputs))  # undonated: the inputs stay for the other methods
             jax.block_until_ready(first)
             row = {"batch": batch, "method": name, "bytes": nbytes}
@@ -177,13 +178,9 @@ def main() -> None:
             device = device_time(step, args) if jax.default_backend() == "tpu" else wall
             del args
             if name == "autokernel" and jax.default_backend() == "tpu":  # where its time goes: trace regions
-                from kda_decode import kda_decode_step, step_args
-
-                import autokernel
-
-                report = autokernel.profile(kda_decode_step, *step_args(*args_of(inputs)))
+                report = autokernel.profile(kernel, *step_args(*args_of(inputs)))
                 print("  " + str(report).replace("\n", "\n  "), flush=True)
-            row |= {"wall_us": wall * 1e6, "device_us": device * 1e6, "gbs": nbytes / device / 1e9}
+            row |= {"options": options, "wall_us": wall * 1e6, "device_us": device * 1e6, "gbs": nbytes / device / 1e9}
             rows.append(row)
             print(
                 f"  {name:10} wall {wall * 1e6:9.1f} us  device {device * 1e6:9.1f} us  "

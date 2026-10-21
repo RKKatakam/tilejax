@@ -184,10 +184,7 @@ def proposals(kernel: Kernel, signature: Signature, trial: Trial) -> list[Config
     for tunable in neighbours(config.tunable) if config.tunable is not None else ():
         try:
             plan, schedule = kernel.build(signature, tunable)
-            # Keep the buffering if it fits with the new tiles (and they still take one step for bursts), else
-            # the most that does.
-            keep = fits(plan, schedule, pipe) and (plan.single_step or not pipe.burst)
-            pipeline = pipe if keep else default_pipeline(plan, schedule)
+            pipeline = _keep(plan, schedule, pipe)
         except KernelError:
             continue  # breaks a layout rule, doesn't divide a loop, doesn't fit in VMEM, ...
         if _loop_steps(plan) == loops:
@@ -200,6 +197,17 @@ def proposals(kernel: Kernel, signature: Signature, trial: Trial) -> list[Config
     else:
         near = sorted(near, key=lambda n: n[0].steps)
     return moves + [c for _, c in near]
+
+
+def _keep(plan: Plan, schedule: Schedule, pipe: Pipeline) -> Pipeline:
+    """The buffering for new tiles: `pipe` if it fits with them, else the most that does (for bursts, the
+    longest that fits; none if the tiles take more than one step)."""
+    if fits(plan, schedule, pipe) and (plan.single_step or not pipe.burst):
+        return pipe
+    burst = pipe.burst // 2 if plan.single_step else 0
+    while burst and not fits(plan, schedule, Pipeline.bursts(burst)):
+        burst //= 2
+    return Pipeline.bursts(burst) if burst else default_pipeline(plan, schedule)
 
 
 def _bursts(burst: int) -> list[int]:

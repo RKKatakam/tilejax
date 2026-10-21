@@ -22,6 +22,7 @@ from kda_decode import (
     make_inputs,
     reference,
     step_args,
+    step_kernel,
     xla_decode,
 )
 
@@ -29,11 +30,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "benchmarks" / "vs_vllm_kd
 from vllm_torchtpu.kernels.kimi_k3.decode_kda import decode_kda
 
 
-def vllm(inputs, monkeypatch):
+def vllm(inputs, monkeypatch, **options):
     """vLLM's kernel on these inputs, in the interpreter (it sizes its VMEM limit from the TPU it runs on)."""
     monkeypatch.setattr(pltpu, "get_tpu_info", lambda: types.SimpleNamespace(vmem_capacity_bytes=128 << 20))
     with pltpu.force_tpu_interpret_mode():
-        return jax.block_until_ready(decode_kda(*args_of(inputs)))
+        return jax.block_until_ready(decode_kda(*args_of(inputs), **options))
 
 
 def inputs_with_padding(batch=4, heads=HEADS, seed=0):
@@ -44,10 +45,10 @@ def inputs_with_padding(batch=4, heads=HEADS, seed=0):
     return inputs
 
 
-def check_against_reference(inputs, result):
+def check_against_reference(inputs, result, **options):
     idx = np.asarray(inputs["state_indices"])
     out, conv, state = (f64(r) for r in result)
-    want_out, want_conv, want_state = reference(inputs)
+    want_out, want_conv, want_state = reference(inputs, **options)
     np.testing.assert_allclose(out, want_out, rtol=8e-3, atol=1e-3 * np.abs(want_out).max())  # bf16: one ulp
     np.testing.assert_array_equal(conv[idx], want_conv)  # the conv states are copies: exact
     np.testing.assert_allclose(state[idx], want_state, rtol=0, atol=1e-6)
@@ -57,17 +58,22 @@ def check_against_reference(inputs, result):
     np.testing.assert_array_equal(conv[others], f64(inputs["conv_state"])[others])
 
 
-def test_kda_decode_matches_float64_and_vllms_kernel(monkeypatch):
+@pytest.mark.parametrize(
+    "options", [{}, {"state_transposed": True}, {"lower_bound": -5.0}, {"lower_bound": -5.0, "state_transposed": True}]
+)
+def test_kda_decode_matches_float64_and_vllms_kernel(monkeypatch, options):
     inputs = inputs_with_padding()
-    ours = jax.block_until_ready(kda_decode(*args_of(inputs)))
-    check_against_reference(inputs, ours)
-    theirs = vllm(inputs, monkeypatch)
-    check_against_reference(inputs, theirs)
-    out, conv, state = ours
-    np.testing.assert_allclose(f64(out), f64(theirs[0]), rtol=8e-3, atol=1e-3 * float(jnp.abs(theirs[0]).max()))
-    np.testing.assert_array_equal(f64(conv), f64(theirs[1]))
-    np.testing.assert_allclose(f64(state), f64(theirs[2]), rtol=0, atol=1e-6)
-    assert float(jnp.abs(out[1]).max()) == 0.0  # the padded entry's output: zeros
+    ours = jax.block_until_ready(kda_decode(*args_of(inputs), **options))
+    check_against_reference(inputs, ours, **options)
+    theirs = vllm(inputs, monkeypatch, **options)
+    check_against_reference(inputs, theirs, **options)
+    assert float(jnp.abs(ours[0][1]).max()) == 0.0  # the padded entry's output: zeros
+    for mine, vllms in zip(ours, theirs, strict=True):
+        np.testing.assert_allclose(f64(mine), f64(vllms), rtol=8e-3 if mine.dtype == jnp.bfloat16 else 1e-6, atol=1e-7)
+    # With vLLM's tiles (all heads at once) the same arithmetic in the same order gives the same bits.
+    whole = step_kernel(**options)(*step_args(*args_of(inputs)), KdaTiles(heads=HEADS))
+    for mine, vllms in zip(whole, theirs, strict=True):
+        np.testing.assert_array_equal(np.asarray(mine), np.asarray(vllms))
 
 
 def test_kda_decode_in_the_interpreter_checking_races():
