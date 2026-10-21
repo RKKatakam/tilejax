@@ -34,7 +34,8 @@ kernel for a **TPU v5e**, and tunes its schedule on the hardware. The scope is d
     `gemma4_kernels.py`, `gemma4_megakernel.py`);
   - decoding: GQA (contiguous, paged) and MLA attention over KV caches with per-sequence lengths
     (`decode.py`, `kv_cache.py`, `decode_model.py`), a whole decode step as one kernel with cross-layer
-    prefetch (`decode_megakernel.py`), a stack of layers in one kernel (`layer_stack.py`).
+    prefetch (`decode_megakernel.py`), a stack of layers in one kernel (`layer_stack.py`), KDA's decode step
+    over paged state pools updated in place, bit for bit vLLM TorchTPU's fused kernel (`kda_decode.py`).
   A feature earns its place by making one of them better or by a new example that needs it.
 
 ## The pipeline
@@ -86,7 +87,11 @@ phase and tile boundaries) → at a tile's first step, start the next tile's per
 this tile's → wait for this phase's inputs → at a tile's last step, wait for the output slot → the code
 before the phases (tile's first step) / the phase's body / the code after it (phase's last step; after the
 last phase: stores + output DMA starts). Masked-out tiles are filled from a constant VMEM tile, a share per
-tile, at most 4 in flight. Trace regions wrap the waits, the output wait and the tile code.
+tile, at most 4 in flight (an output updated in place isn't filled: it keeps the input's values). Trace
+regions wrap the waits, the output wait and the tile code. In bursts (`Pipeline.bursts(g)`, single-step
+kernels only), a burst's first step waits for the previous burst's output copies and starts the next
+burst's fetches; its last step waits for them and starts its own output copies (the first burst's steps
+wait for their own inputs, the last burst's copy their outputs out as they go).
 
 A tile's reduction loops are its phases (`plan.Phase`); a reduction loop of one iteration is inlined into
 the code around it by plan.py (its variable bound by a synthetic assignment), so it takes no step and the
@@ -157,6 +162,25 @@ Each of these was found on hardware; don't undo them without measuring again.
   kernel-vs-reference checks only hold in the interpreter (mark such tests `cpu`). Plain `f32 @ f32` in
   XLA on a TPU is one bf16 pass: compare kernels against float64 NumPy, not against `x @ y`.
 
+- HBM turns around between reads and writes: streaming a pool through VMEM and back in 1 MiB copies moved
+  640-650 GB/s whatever the pipeline depth, copy size or split (reads alone 731, writes alone 639; XLA's
+  elementwise pass 673); alternating bursts of reads and of writes, 590 (1 MiB) / 665 (4) / 677 (8) / 682
+  (16 MiB) GB/s (`benchmarks/vs_vllm_kda/probe_*.py`). Hence `Pipeline.bursts` for single-step kernels;
+  the first burst waits per step and the last writes per step (+2-4% at 64-256 bursts' worth of steps).
+- An input updated in place and called undonated is copied by XLA first; KDA decode's 16-head overlapped
+  schedule ran 3-5% faster on that fresh copy than in place (batch 8-128; 32-head tiles and bursts didn't
+  care): tuning times such kernels in place (`profiling.measure` donates them).
+- `@` is the MXU's full-precision f32 matmul only in tile code: in a helper function it is plain JAX's,
+  which for f32 on Mosaic (as in XLA) is one bf16 pass. vLLM's KDA decode relies on that pass;
+  `kda_decode.py` matches it bit for bit by doing the same (explicit `jax.lax.dot_general`).
+- KDA decode against vLLM TorchTPU's `decode_kda` (Kimi Linear: 32 heads of 128, pools of 2B+1 slots,
+  donated), device time: B1 10.7 -> 8.5 us, B8 55.0 -> 55.2, B32 215.5 -> 206.5, B256 1706 -> 1615 (658 ->
+  695 GB/s); transposed pools B1 12.4 -> 8.6, B256 1711 -> 1618. Bit-identical outputs and states on a
+  v5e. vLLM swaps transposed states (4.2 us of compute per sequence, more than its reads take, so bursts
+  lost); reading them as transposed MXU weights (`dot_general` contracting their last dim) gives the same
+  bits at ~2 us. The plain-JAX step's states are ~3e-3 off float64 on a v5e (not from matmul precision:
+  the same under `jax.default_matmul_precision("highest")`).
+
 ## Commands
 
 ```bash
@@ -168,7 +192,8 @@ uv run python examples/matmul.py        # prints the generated source
 
 Tests: `test_parse.py` (every syntax rule), `test_plan.py`, `test_schedule.py`, `test_codegen.py` (every
 emission path runs in the interpreter with the race detector and cross-lowers to Mosaic for a v5e),
-`test_index_arrays.py` (SMEM index arrays, runtime masks and windows), `test_repeat_loops.py`, `test_step_outputs.py` (outputs stored per step), `test_api.py`, `test_profiling.py` (synthetic traces), `test_tunable.py`, `test_tune.py` (the search and
+`test_index_arrays.py` (SMEM index arrays, runtime masks and windows), `test_in_place.py` (outputs updated in place,
+stores at index-array windows), `test_bursts.py` (copies in bursts), `test_repeat_loops.py`, `test_step_outputs.py` (outputs stored per step), `test_api.py`, `test_profiling.py` (synthetic traces), `test_tunable.py`, `test_tune.py` (the search and
 proposals with synthetic profiles; tuning end to end with `tune._can_time` and `profiling.measure` faked,
 kernels really running in the interpreter), `test_examples.py`, `test_tpu.py` (`tpu` marker: real hardware
 only). `helpers.make_kernel(source, **globals)` builds a kernel from a source string, which

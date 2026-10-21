@@ -128,6 +128,7 @@ Fake weights and inputs, small models that fit a 16 GB v5e; bf16; ms per call, w
 | Absorbed MLA decode attention | [decode.py](examples/decode.py) | XLA | **1.3–23×** (0.65× at B32 H16) |
 | Decode step, dense GQA model | [decode_model.py](examples/decode_model.py) | plain JAX + the best JAX decode kernel | **1.17–1.45×** |
 | A stack of FFN layers in one kernel (repeat loop) | [layer_stack.py](examples/layer_stack.py) | XLA / a kernel per layer | **1.02–1.22×** / 1.01–1.07× (744 GB/s) |
+| KDA decode step (Kimi Linear), paged states updated in place | [kda_decode.py](examples/kda_decode.py) | vLLM TorchTPU's fused `decode_kda` | **1.00–1.44×**, bit-identical (up to 695 GB/s) |
 | Whole decode step in one kernel (cross-layer prefetch) | [decode_megakernel.py](examples/decode_megakernel.py) | XLA / per-layer kernels | **1.03–1.45×** / 1.07× (up to 90% of HBM bandwidth) |
 
 **Whole models**, tokens to logits (prefill) and one token per sequence per step over a KV cache
@@ -261,6 +262,87 @@ attention takes a step per sequence, so from batch 8 up the per-layer kernels ar
 6.70 ms at B8, 7.44 against 8.09 at B32.
 
 **Tuning** changed these by under 1% at every batch, so the table is at the default tiles.
+
+## KDA decode against vLLM TorchTPU's kernel
+
+[kda_decode.py](examples/kda_decode.py) is Kimi Linear's KDA (Kimi Delta Attention) decode step as one
+loop nest: one token per sequence, the recurrent and short-convolution states in paged pools updated in
+place. It computes the same function as vLLM TorchTPU's fused `decode_kda` kernel (vllm-torchtpu v0.29.0,
+vendored unmodified in [benchmarks/vs_vllm_kda](benchmarks/vs_vllm_kda)), with the same inputs and outputs:
+
+- the state pools gathered by `state_indices`, with slot 0 a null block (zeros out, the slot untouched);
+- `has_initial_state` (a sequence's first step starts from zero states);
+- the 4-tap conv + SiLU, L2-normalized q and k, the per-channel decay, and the delta rule;
+- vLLM's options: transposed (d_v, d_k) state pools and the gate's lower bound.
+
+**Correctness.** The arithmetic is vLLM's, in its order, and the outputs, conv states and states are
+**bit for bit the same** on a v5e, for every batch, both layouts and both tile sizes
+(`test_kda_decode.py`, `benchmarks/vs_vllm_kda/run.py`). Against float64 NumPy, both kernels' states differ by
+~4e-5 (the median head; the MXU rounds f32 operands to bf16, as XLA's default does).
+
+**Workload.** Kimi Linear 48B's KDA layers (32 heads of 128, a 4-tap conv; bf16 activations, f32 state):
+
+- a pool of 2 × batch + 1 slots, each sequence in a random real slot;
+- a tenth of the sequences on their first step;
+- both pools donated, as a decode loop runs the step.
+
+**Measurement.**
+
+- Device time: the time per call the profiler shows ops on the TPU (the kernel and the ABI's small
+  reshapes, which both pay).
+- Wall time: the median over 5 repeats of the mean of 20 back-to-back calls (batch 1-8 are host-bound).
+- GB/s: the bytes a step must move (each sequence's state and conv slots read and written, its inputs and
+  output) over the device time. A v5e has 819 GB/s.
+
+Device µs per step, the [raw log](benchmarks/results/kda_decode_vs_vllm_v5e.txt); reproduce with
+`benchmarks/vs_vllm_kda/run.py [--transposed]`:
+
+| Batch | vLLM | autokernel | speedup | GB/s vLLM / autokernel | wall µs vLLM / autokernel | plain JAX (XLA) |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 10.7 | **8.5** | 1.26× | 420 / 528 | 48.7 / 48.5 | 18.0 |
+| 8 | 55.0 | 55.2 | 1.00× | 640 / 638 | 66.7 / 66.4 | 189.0 |
+| 32 | 215.5 | **206.5** | 1.04× | 651 / 680 | 231.7 / 221.5 | 717.0 |
+| 64 | 429.3 | **408.4** | 1.05× | 654 / 687 | 447.5 / 424.3 | 2232.6 |
+| 128 | 856.2 | **811.6** | 1.05× | 655 / 691 | 876.2 / 830.3 | 4462.7 |
+| 256 | 1706.4 | **1615.3** | 1.06× | 658 / 695 | 1729.4 / 1635.8 | 8915.7 |
+
+With vLLM's own (d_v, d_k) state layout (`--transposed`):
+
+| Batch | vLLM | autokernel | speedup | GB/s vLLM / autokernel |
+| --- | --- | --- | --- | --- |
+| 1 | 12.4 | **8.6** | 1.44× | 363 / 520 |
+| 8 | 58.6 | **54.8** | 1.07× | 601 / 642 |
+| 32 | 218.7 | **205.8** | 1.06× | 642 / 682 |
+| 64 | 432.7 | **408.5** | 1.06× | 649 / 687 |
+| 128 | 858.9 | **810.9** | 1.06× | 653 / 692 |
+| 256 | 1711.2 | **1617.8** | 1.06× | 656 / 694 |
+
+**What limits each.** Per sequence the step moves 4 MiB of f32 state (read and written), and computes for
+~2 µs, under the copies. So both kernels are bound by HBM:
+
+- **vLLM's grid pipeline** reads the next sequence's slots while it writes the last one's. Interleaved
+  reads and writes are what a v5e's HBM is slowest at: a pure VMEM round trip of 1 MiB copies moves
+  640-650 GB/s however it is pipelined. vLLM's kernel runs at 80% of 819 GB/s.
+- **autokernel's kernel** moves its copies in bursts of 8 sequences, picked by the tuner from the profile
+  (`Pipeline.bursts`, above): the next burst's slots are read while this burst computes, then this burst's
+  are written. It runs at 84-85%; alternating 8-16 MiB bursts of a pure round trip reach 677-683 GB/s.
+- **Batch 1** has nothing to pipeline across. The tuned 16-head tiles overlap one half's copies with the
+  other's compute.
+- **Batch 8** is too short for bursts to pay for their fill and drain: parity.
+- **Transposed pools.** vLLM's kernel swaps every state into (d_k, d_v) and back, which doubles its compute.
+  autokernel reads the transposed states as transposed MXU weights instead: the same products, summed in
+  the same order.
+
+The plain-JAX step (gather, conv, `delta_step`, scatter: hybrid_models.py's Kimi-Linear decode path) runs at
+15-31% of the bandwidth, 2-5× slower, and its states differ from float64 by ~3e-3 on a v5e.
+
+**What autokernel needed:**
+
+- *Outputs updated in place* (`new_state = state`: input_output_aliases);
+- *stores at windows an index array chooses* (`new_state.at[state_indices[b], h : h + TH, :, :]`);
+- *copies in bursts*, a pipeline choice for single-step kernels;
+- kernels updating inputs in place are now also timed in place when tuning (donated): undonated, XLA copies
+  the pool first, and 16-head tiles ran up to 5% faster on the fresh copy than they do in place.
 
 ## Writing kernels
 

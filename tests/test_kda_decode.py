@@ -58,6 +58,7 @@ def check_against_reference(inputs, result, **options):
     np.testing.assert_array_equal(conv[others], f64(inputs["conv_state"])[others])
 
 
+@pytest.mark.cpu  # (tolerances of the interpreter's exact f32: a v5e's MXU rounds f32 operands to bf16)
 @pytest.mark.parametrize(
     "options", [{}, {"state_transposed": True}, {"lower_bound": -5.0}, {"lower_bound": -5.0, "state_transposed": True}]
 )
@@ -80,6 +81,7 @@ def test_kda_decode_matches_float64_and_vllms_kernel(monkeypatch, options):
             np.testing.assert_array_equal(np.asarray(mine), np.asarray(vllms))
 
 
+@pytest.mark.cpu
 def test_kda_decode_in_the_interpreter_checking_races():
     inputs = inputs_with_padding(batch=3)
     args = step_args(*args_of(inputs))
@@ -89,6 +91,7 @@ def test_kda_decode_in_the_interpreter_checking_races():
     kda_decode_step.verify(*args)
 
 
+@pytest.mark.cpu
 def test_kda_decode_as_a_donated_decode_loop():
     inputs = inputs_with_padding(batch=2, heads=16)
     step = jax.jit(kda_decode, donate_argnums=(3, 5))
