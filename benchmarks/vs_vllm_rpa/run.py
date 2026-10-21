@@ -41,15 +41,22 @@ def ragged(batch: int, mean: int, seed: int) -> list[int]:
 
 
 def workloads() -> dict[str, tuple[list[int], list[int]]]:
-    """name -> (q_lens, kv_lens)."""
+    """name -> (q_lens, kv_lens). Decode: ragged cache lengths around a mean (half to 1.5x), or every
+    sequence at the longest; prefill: whole prompts; chunked: a chunk of new tokens after a cached
+    context; mixed: decodes and chunks in one batch (decodes first, as vLLM orders them)."""
     found = {}
-    for batch in (8, 32, 128):
-        for mean in (1024, 4096):
-            found[f"decode{batch}_{mean // 1024}k"] = ([1] * batch, ragged(batch, mean, batch + mean))
-    decodes = ragged(32, 2048, 7)
-    found["mixed32+2x512"] = ([1] * 32 + [512, 512], [*decodes, 1024 + 512, 3072 + 512])
-    found["prefill4x1024"] = ([1024] * 4, [1024] * 4)
-    found["prefill1x4096"] = ([4096], [4096])
+    for batch in (1, 8, 32, 128):
+        for mean in (512, 1024, 2048, 4096):
+            found[f"decode{batch}_{mean}"] = ([1] * batch, ragged(batch, mean, batch + mean))
+        if batch <= 32:
+            found[f"decode{batch}_8192x"] = ([1] * batch, [8192] * batch)
+    for n, length in ((1, 512), (1, 1024), (1, 2048), (1, 4096), (1, 8192), (4, 1024), (8, 512), (16, 256)):
+        found[f"prefill{n}x{length}"] = ([length] * n, [length] * n)
+    for chunk, context in ((256, 4096), (512, 4096), (512, 8192), (1024, 8192)):
+        found[f"chunk{chunk}@{context}"] = ([chunk], [context])
+    found["mixed32+2x512"] = ([1] * 32 + [512, 512], [*ragged(32, 2048, 7), 1024 + 512, 3072 + 512])
+    found["mixed64+1x1024"] = ([1] * 64 + [1024], [*ragged(64, 2048, 8), 4096])
+    found["mixed128+4x256"] = ([1] * 128 + [256] * 4, [*ragged(128, 1024, 9), 256, 1024, 2048, 4096])
     return found
 
 
@@ -57,8 +64,24 @@ def vllm(*args):
     return rpa.ragged_paged_attention(*args, sm_scale=SCALE)
 
 
+def vllm_prefill(chunk: int):
+    """RPA v3 with its PREFILL case: sequences [d0, d1) take `chunk` new tokens each, a static query length.
+    (vLLM TorchTPU's runner never uses it: it passes distribution [d, d, S] and no chunk_prefill_size, so
+    every sequence with new tokens beyond one runs the MIXED case, `vllm` here.)"""
+    return lambda *args: rpa.ragged_paged_attention(*args, sm_scale=SCALE, chunk_prefill_size=chunk)
+
+
+def prefill_case(q_lens: list[int], inputs: dict) -> tuple[int, dict] | None:
+    """(chunk, the inputs with distribution [d, S, S]) if every non-decode sequence has `chunk` new tokens."""
+    d = sum(1 for q in q_lens if q == 1)
+    rest = set(q_lens[d:])
+    if len(rest) != 1:
+        return None
+    return rest.pop(), {**inputs, "distribution": jnp.asarray([d, len(q_lens), len(q_lens)], jnp.int32)}
+
+
 def methods() -> dict:
-    found = {"vllm": vllm}
+    found = {"vllm": vllm, "vllm-prefill": None}  # (vllm-prefill: per workload)
     try:
         from ragged_paged_attention import autokernel_rpa
     except ImportError:
@@ -111,7 +134,7 @@ def timed(fn, inputs: dict, runs: int = 10) -> tuple[float, float]:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--workloads", default="")
-    parser.add_argument("--methods", default="vllm,autokernel")
+    parser.add_argument("--methods", default="vllm,vllm-prefill,autokernel")
     parser.add_argument("--check", action="store_true", help="compare with float64 NumPy (slow for big batches)")
     opts = parser.parse_args()
     on_tpu = jax.default_backend() == "tpu"
@@ -125,29 +148,46 @@ def main() -> None:
     if opts.workloads:
         chosen = {k: chosen[k] for k in opts.workloads.split(",")}
     print(f"jax {jax.__version__} on {jax.devices()[0].device_kind}; methods {names}", flush=True)
+    results: dict[str, dict[str, float]] = {}
     for name, (q_lens, kv_lens) in chosen.items():
         inputs = make_inputs(q_lens, kv_lens, max_tokens=-(-sum(q_lens) // 16) * 16)
         nbytes = cache_bytes(q_lens, kv_lens)
         print(f"{name}: {len(q_lens)} sequences, {sum(q_lens)} tokens, {nbytes / 1e6:.1f} MB of cache", flush=True)
-        want = reference(inputs, SCALE) if opts.check else None
+        scores = max(q * k for q, k in zip(q_lens, kv_lens, strict=True)) * 32 * 8  # (float64 bytes)
+        want = reference(inputs, SCALE) if opts.check and nbytes < 1e9 and scores < 4e9 else None
         for method in names:
-            fn = available[method]
+            fn, inputs_m = available[method], inputs
+            if method == "vllm-prefill":
+                case = prefill_case(q_lens, inputs)
+                if case is None:
+                    continue  # (no prefill sequences, or of different lengths)
+                fn, inputs_m = vllm_prefill(case[0]), case[1]
             if method == "autokernel" and on_tpu:
                 from ragged_paged_attention import tune
 
                 print("  " + str(tune(inputs, SCALE)).replace("\n", "\n  "), flush=True)
             if want is not None:
-                out, cache = jax.jit(fn)(*[jnp.copy(a) for a in args_of(inputs)])
+                out, cache = jax.jit(fn)(*[jnp.copy(a) for a in args_of(inputs_m)])
                 t = int(np.asarray(inputs["cu_q_lens"])[len(q_lens)])
                 err = float(np.abs(np.asarray(out[:t], np.float64) - want[0]).max())
                 cerr = float(np.abs(np.asarray(cache, np.float64) - want[1]).max())
-                print(f"  {method:10} out vs f64 {err:.3g}  cache vs f64 {cerr:.3g}", flush=True)
-            wall, device = timed(fn, inputs) if on_tpu else (float("nan"), float("nan"))
+                print(f"  {method:12} out vs f64 {err:.3g}  cache vs f64 {cerr:.3g}", flush=True)
+            wall, device = timed(fn, inputs_m) if on_tpu else (float("nan"), float("nan"))
+            results.setdefault(name, {})[method] = device
             print(
-                f"  {method:10} wall {wall * 1e6:9.1f} us  device {device * 1e6:9.1f} us  "
+                f"  {method:12} wall {wall * 1e6:9.1f} us  device {device * 1e6:9.1f} us  "
                 f"{nbytes / device / 1e9:6.1f} GB/s",
                 flush=True,
             )
+
+    if "autokernel" in names and len(names) > 1:
+        others = [m for m in names if m != "autokernel"]
+        print("\ndevice us; speedup = the other's time / autokernel's")
+        print(f"{'workload':18} " + " ".join(f"{m:>14}" for m in [*others, "autokernel"]))
+        for name, times in results.items():
+            ours = times["autokernel"]
+            cells = [f"{times[m] * 1e6:8.1f} {times[m] / ours:4.2f}x" if m in times else f"{'-':>14}" for m in others]
+            print(f"{name:18} " + " ".join(cells) + f" {ours * 1e6:14.1f}", flush=True)
 
 
 if __name__ == "__main__":

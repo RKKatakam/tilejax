@@ -35,7 +35,8 @@ kernel for a **TPU v5e**, and tunes its schedule on the hardware. The scope is d
   - decoding: GQA (contiguous, paged) and MLA attention over KV caches with per-sequence lengths
     (`decode.py`, `kv_cache.py`, `decode_model.py`), a whole decode step as one kernel with cross-layer
     prefetch (`decode_megakernel.py`), a stack of layers in one kernel (`layer_stack.py`), KDA's decode step
-    over paged state pools updated in place, bit for bit vLLM TorchTPU's fused kernel (`kda_decode.py`).
+    over paged state pools updated in place, bit for bit vLLM TorchTPU's fused kernel (`kda_decode.py`), ragged
+    paged attention over a batch of decodes, prefills and chunks, with RPA v3's ABI (`ragged_paged_attention.py`).
   A feature earns its place by making one of them better or by a new example that needs it.
 
 ## The pipeline
@@ -180,6 +181,14 @@ Each of these was found on hardware; don't undo them without measuring again.
   lost); reading them as transposed MXU weights (`dot_general` contracting their last dim) gives the same
   bits at ~2 us. The plain-JAX step's states are ~3e-3 off float64 on a v5e (not from matmul precision:
   the same under `jax.default_matmul_precision("highest")`).
+
+- Ragged paged attention against vLLM TorchTPU's RPA v3, as its runner calls it (MIXED for every prefill;
+  its PREFILL case is ~11 µs slower), device µs per layer step: decode 1.36-1.79x at 512-position contexts,
+  0.94-1.02x at 2k-8k (both read 710-750 GB/s); prefill 1.16-1.50x, chunks 1.13-1.16x, mixed 1.04-1.10x.
+  The prefill lead is RPA's q/output layout copies (~270 µs at 4096 tokens): its prefill kernel alone beats
+  ours on short prompts (469 vs 618 µs at 4 × 1024). XLA's scatter of new tokens into the cache relaid the
+  whole cache out twice (1 ms each at 75k positions): `rpa_write` writes them instead. TPU gathers and
+  scatters of int tables cost ~7 ns an entry, which is why runtime ranges step with a cursor, not tables.
 
 ## Commands
 

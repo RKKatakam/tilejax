@@ -344,6 +344,113 @@ The plain-JAX step (gather, conv, `delta_step`, scatter: hybrid_models.py's Kimi
 - kernels updating inputs in place are now also timed in place when tuning (donated): undonated, XLA copies
   the pool first, and 16-head tiles ran up to 5% faster on the fresh copy than they do in place.
 
+## Ragged paged attention against vLLM TorchTPU's RPA v3
+
+[ragged_paged_attention.py](examples/ragged_paged_attention.py) is vLLM's attention over a paged KV cache for a
+whole batch of sequences at once, with decodes, prefills and prefill chunks mixed. It has the same inputs and
+outputs as vLLM TorchTPU's `ragged_paged_attention` (RPA v3, vllm-torchtpu v0.29.0, vendored unmodified in
+[benchmarks/vs_vllm_rpa](benchmarks/vs_vllm_rpa)):
+
+- q (T, H, D), k and v (T, Hkv, D): every sequence's new tokens, concatenated;
+- a cache of pages (pages, page_size, Hkv, 2, D), each head's key and value side by side;
+- kv_lens, page_indices, cu_q_lens and distribution;
+- the step writes the new tokens' keys and values into the cache, in place, and attends causally.
+
+It is three loop nests, each a plain-JAX function of tiles:
+
+- `rpa_write`: the new keys and values into their pages, a tile per run of a sequence's tokens in one page;
+- `rpa_decode`: a tile per decoding sequence, a step per page of its cache;
+- `rpa_prefill`: a tile per 256 queries of a sequence, a step per 4 pages up to its last query.
+
+**Correctness.** The updated caches are exact for both kernels. Against float64 NumPy, autokernel's outputs
+are 1.7-8.6x closer than RPA's on every workload checked (e.g. decode 128 × 1k: 0.0010 vs 0.0046; prefill
+4 × 1024: 0.0097 vs 0.021). autokernel accumulates in f32; RPA accumulates in bf16.
+
+**Which vLLM.** vLLM TorchTPU's runner passes `distribution = [decodes, decodes, sequences]` and no
+`chunk_prefill_size` (tpu-inference: `runner/persistent_batch_manager.py`, `runner/tpu_runner.py`). So in
+serving, every sequence with more than one new token runs RPA's MIXED kernel: that is `vllm` below. RPA's
+PREFILL case (a static query length) is measured too, as `vllm-prefill`, wherever every prefill has the same
+length. It is ~11 µs slower than MIXED on every workload, because it launches the PREFILL kernel and then
+an empty MIXED one.
+
+**Workload and measurement.**
+
+- Model: Llama 3 8B's attention: 32 query heads, 8 kv heads of 128, bf16, pages of 128 positions,
+  sequences of up to 8192.
+- Decode cache lengths: ragged, half to 1.5x the mean; "8k" means every sequence is at 8192.
+- Each method is jitted with the cache donated and fed back, and with fresh q, k and v donated, as a model
+  step runs it. autokernel is tuned on each workload first.
+- Device time: the ops the profiler shows on the TPU per step: the kernels and all their XLA glue.
+
+Device µs per step on a TPU v5e. The [raw log](benchmarks/results/rpa_vs_vllm_v5e.txt) has each method's
+largest ops and the float64 checks. Reproduce with `benchmarks/vs_vllm_rpa/run.py [--check]`, and plot with
+`uv run --with matplotlib python benchmarks/vs_vllm_rpa/plot.py`:
+
+![autokernel's speedup over vLLM's RPA v3 per workload](benchmarks/results/rpa_vs_vllm_v5e.png)
+
+Decode, one new token per sequence (batch × mean context):
+
+| Batch | 512 | 1k | 2k | 4k | all at 8k |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 15.0 → **11.0** (1.36×) | 17.7 → **13.8** (1.28×) | 17.4 → **13.8** (1.26×) | 25.6 → **22.1** (1.16×) | 55.2 → **51.2** (1.08×) |
+| 8 | 55.8 → **37.7** (1.48×) | 64.1 → 64.7 (0.99×) | 98.6 → 104.6 (0.94×) | 167.7 → 173.2 (0.97×) | 365.6 → 369.9 (0.99×) |
+| 32 | 203.3 → **116.9** (1.74×) | 217.6 → **202.2** (1.08×) | 362.4 → 380.6 (0.95×) | 811.8 → **799.7** (1.02×) | 1431.2 → 1441.1 (0.99×) |
+| 128 | 799.7 → **446.4** (1.79×) | 860.8 → **799.0** (1.08×) | 1513.4 → 1581.2 (0.96×) | 3121.7 → **3047.4** (1.02×) | |
+
+(vLLM → autokernel. Batch 128 at 8k would be an 8.6 GB cache, with its copy.)
+
+Prefill, chunked prefill and mixed batches:
+
+| Workload | vLLM (MIXED) | vLLM (PREFILL) | autokernel | speedup |
+| --- | --- | --- | --- | --- |
+| 1 prompt of 512 | 93.7 | 104.8 | **74.3** | 1.26× |
+| 1 prompt of 1024 | 208.8 | 220.2 | **166.6** | 1.25× |
+| 1 prompt of 2048 | 533.5 | 544.5 | **437.2** | 1.22× |
+| 1 prompt of 4096 | 1580.5 | 1591.3 | **1333.5** | 1.19× |
+| 1 prompt of 8192 | 5265.8 | 5276.9 | **4551.5** | 1.16× |
+| 4 prompts of 1024 | 784.9 | 795.9 | **641.8** | 1.22× |
+| 8 prompts of 512 | 650.6 | 661.4 | **525.1** | 1.24× |
+| 16 prompts of 256 | 649.8 | 660.6 | **434.4** | 1.50× |
+| 256 tokens after 4k | 168.6 | 169.6 | **148.7** | 1.13× |
+| 512 tokens after 4k | 328.5 | 339.8 | **283.5** | 1.16× |
+| 512 tokens after 8k | 593.8 | 605.1 | **520.6** | 1.14× |
+| 1024 tokens after 8k | 1137.3 | 1148.6 | **997.2** | 1.14× |
+| 32 decodes + 2 chunks of 512 | 806.7 | 817.4 | **768.5** | 1.05× |
+| 64 decodes + 1 chunk of 1024 | 1307.4 | 1318.6 | **1259.8** | 1.04× |
+| 128 decodes + 4 chunks of 256 | 1231.6 | 1242.2 | **1123.6** | 1.10× |
+
+(The speedup is over vLLM's faster case, MIXED.)
+
+**Where the time goes.**
+
+- **Short-context decode** (1.3-1.8×): RPA's decode kernel spends a fixed cost per sequence. autokernel's
+  finds each sequence's pages as it runs (a cursor over runtime loop bounds), with no step tables.
+- **Long-context decode** (0.94-1.02×): both read the cache at 710-750 GB/s of the v5e's 819. autokernel loses
+  4-6% at a mean of 2k contexts: its write kernel takes a step per sequence, which RPA fuses into its
+  attention kernel.
+- **Prefill**: most of autokernel's lead is glue. RPA's `prepare_inputs` and `prepare_outputs` reshuffle q's
+  heads and the output's on the way in and out. That is ~270 µs of XLA copies at 4096 tokens, which vLLM pays
+  in serving too. The kernels alone are closer, and RPA's prefill kernel is faster on short prompts:
+
+| Kernel only, µs | 1 × 512 | 1 × 2048 | 1 × 4096 | 1 × 8192 | 4 × 1024 | 16 × 256 | 512 after 8k |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| RPA (attention + KV write) | **48.3** | **372.2** | **1264.8** | 4641.4 | **469.3** | **334.5** | 548.3 |
+| autokernel `rpa_prefill` + `rpa_write` | 69.8 | 432.6 | 1329.6 | **4547.7** | 618.5 | 418.6 | **516.1** |
+
+Its compute is the softmax over (8 heads, 1024 query rows, 512 keys) per step. Probes of the tile code
+(`probe_prefill_variants.py`) found the mask and the score scaling free. Masking only the diagonal steps
+(`lax.cond`) and going head by head were 1.5-2× slower.
+
+**What autokernel needed:**
+
+- *runtime loop bounds* (`for p in range((kv_lens[s] + ps - 1) // ps)`), stepped by a cursor as the kernel
+  runs;
+- *a runtime count of tiles* (`for k in range(n_tiles[0])`);
+- *ragged row windows* (`q[autokernel.rows(start, stop, 256), :, :]`): copies of as many rows as are valid;
+- *windows gathered through index-array slices* (several pages per step);
+- *a 16-bit tile's pairs of rows as 32-bit words* (`autokernel.pairs`, `autokernel.unpairs`): RPA's cache
+  holds each key and value in one word, split with shifts.
+
 ## Writing kernels
 
 ```python
