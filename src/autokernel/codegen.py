@@ -61,7 +61,7 @@ from . import mxu, v5e
 from .errors import KernelError
 from .parse import Nest
 from .pipeline import TILE_SLOTS, Pipeline
-from .plan import Kind, Operand, Output, Plan, Range, Tile, Window
+from .plan import Kind, Operand, Output, Plan, Range, Tile
 from .schedule import CODE_SHIFT, FILL_TABLE, STEP_CODE, STEP_COUNT, STEP_TILE, TILE_TABLE, Schedule
 from .tilecode import as_store, assigned, element_reads, flatten, reads
 from .tunable import choices, is_tunable
@@ -411,7 +411,7 @@ class _Generator:
             w(f"{run} = np.ones({shape}, bool)")
         rep = plan.repeats[plan.phases[p].repeat].range if iterations else None  # type: ignore[index]
         iteration = f"np.arange({rep.count})[:, None, None]" if rep else "0"
-        w(f"{keep}, {code} = {_PHASE_STEPS}({run}, {p}, {len(plan.phases)}, {iteration}, {sch.iterations})")
+        w(f"{keep}, {code} = {_PHASE_STEPS}({run}, {p}, {sch.phase_radix}, {iteration}, {sch.iterations})")
         return keep, code
 
     def _uses_mxu(self, kernel: str) -> bool:
@@ -547,6 +547,7 @@ class _Generator:
             self._cursor_fns(w)
             return
         phases = len(sch.phase_counts)
+        radix = sch.phase_radix
         with w.block(f"def {self.n_step}({s}):"):
             what = "its phase (reduction loop), " + ("its repeat loop's iteration, " if self.repeated else "")
             w(f'"""Step s: its tile, {what}the loop\'s block, and whether that is the phase\'s first and last')
@@ -592,7 +593,7 @@ class _Generator:
                     block = _int_expr(packed, "//", sch.iterations)
                 empty = f", ({code} & 4) != 0" if sch.empty else ""
                 w(
-                    f"return {tile}, {_int_expr(block, '%', phases)}, {iteration}{_int_expr(block, '//', phases)}, "
+                    f"return {tile}, {_int_expr(block, '%', radix)}, {iteration}{_int_expr(block, '//', radix)}, "
                     f"({code} & 2) != 0, ({code} & 1) != 0{empty}"
                 )
 
@@ -719,14 +720,14 @@ class _Generator:
         """The index of `tile`'s window into its HBM array, given each loop's block expression (of a gathered
         window, its `element`-th element's)."""
         dims = []
-        for window, dim in zip(tile.windows, self._array_shape(tile.array), strict=True):
+        for k, (window, dim) in enumerate(zip(tile.windows, self._array_shape(tile.array), strict=True)):
             r = self._range(window.loop) if window.loop else None
             if window.index is not None and window.size is not None:  # gathered: one element of the slice
                 dims.append(self._runtime_index(_element(window.index, element or 0), block_of, dim))
             elif window.index is not None:
                 dims.append(self._runtime_index(window.index, block_of, dim))
             elif window.rows is not None:
-                start, count = self._rows(window, block_of, dim)
+                start, count = self._rows(tile, k, block_of, dim)
                 dims.append(f"pl.ds({start}, {count})")
             elif r is None:
                 if window.size is None:
@@ -748,24 +749,33 @@ class _Generator:
                 dims.append(start if window.size is None else f"pl.ds({start}, {window.size})")
         return ", ".join(dims)
 
-    def _rows(self, window: Window, block_of: dict[str, str], dim: int) -> tuple[str, str]:
-        """A ragged window's first row and how many rows it copies (those before its stop, inside the dim)."""
+    def _rows(self, tile: Tile, k: int, block_of: dict[str, str], dim: int) -> tuple[str, str]:
+        """A ragged window's (dim `k` of `tile`'s) first row and how many rows it copies: those before its
+        stop, inside the dim; along a tiled dim (one of the last two), rounded up to whole tiles, which is
+        all a TPU copies there (an input's rows past the stop are unspecified)."""
+        window = tile.windows[k]
         start, stop = (self._render(b, block_of) for b in window.rows)  # type: ignore[union-attr]
         first = f"jnp.clip({start}, 0, {dim})"
-        return first, f"jnp.clip(jnp.minimum({stop}, {dim}) - {first}, 0, {window.size})"
+        count = f"jnp.clip(jnp.minimum({stop}, {dim}) - {first}, 0, {window.size})"
+        last = len(tile.windows) - 1
+        t = v5e.LANES if k == last else v5e.sublanes(tile.dtype) if k == last - 1 else 1
+        if t > 1 and dim % t == 0:  # (Mosaic must see the start and size are whole tiles)
+            count = f"pl.multiple_of(jnp.minimum(({count} + {t - 1}) // {t} * {t}, {dim} - {first}), {t})"
+            first = f"pl.multiple_of({first}, {t})"
+        return first, count
 
     def _slot_index(self, tile: Tile, element: int | None, block_of: dict[str, str]) -> str:
         """The part of a VMEM slot a copy of `tile`'s window fills ("": all of it): a gathered element's row,
         or a ragged window's first rows."""
         dims, part = [], False
-        for window, dim in zip(tile.windows, self._array_shape(tile.array), strict=True):
+        for k, (window, dim) in enumerate(zip(tile.windows, self._array_shape(tile.array), strict=True)):
             if window.size is None:
                 continue
             if window.index is not None:
                 dims.append(str(element))
                 part = True
             elif window.rows is not None:
-                dims.append(f"pl.ds(0, {self._rows(window, block_of, dim)[1]})")
+                dims.append(f"pl.ds(0, {self._rows(tile, k, block_of, dim)[1]})")
                 part = True
             else:
                 dims.append(":")
@@ -830,13 +840,13 @@ class _Generator:
     def _window_starts(self, tile: Tile, block_of: dict[str, str]) -> list[str]:
         """Where `tile`'s window starts in each dim a loop (or index array) moves, given the loops' blocks."""
         starts = []
-        for window, dim in zip(tile.windows, self._array_shape(tile.array), strict=True):
+        for k, (window, dim) in enumerate(zip(tile.windows, self._array_shape(tile.array), strict=True)):
             if window.index is not None and window.size is not None:
                 starts.append(self._runtime_index(_element(window.index, 0), block_of, dim))
             elif window.index is not None:
                 starts.append(self._runtime_index(window.index, block_of, dim))
             elif window.rows is not None:
-                starts += list(self._rows(window, block_of, dim))
+                starts += list(self._rows(tile, k, block_of, dim))
             elif window.loop is not None and self._range(window.loop).count > 1:
                 starts.append(_scaled(block_of[window.loop], self._range(window.loop)))
         return starts
@@ -977,15 +987,36 @@ class _Generator:
         return _int_expr(f"{tile} * {count} + {rb}", "%", self.pipeline.input_buffers)
 
     def _fetch_iterated(
-        self, w: _Writer, ops: list[Operand], tile: str, ph: str, rb: str, first: str, empty: str
+        self,
+        w: _Writer,
+        ops: list[Operand],
+        tile: str,
+        ph: str,
+        rb: str,
+        first: str,
+        empty: str,
+        slots: dict[str, str] | None = None,
     ) -> None:
-        """Start the copies of the operands fetched once per iteration for a step that is its phase's first."""
+        """Start the copies of the operands fetched once per iteration for a step that is its phase's first
+        (into `slots`, by operand, if given: names the step computed once)."""
         for (phase, in_body), group in self._by_iteration(ops).items():
             cond = self._iteration_first(phase, in_body, ph, first, empty)
             with self._when(w, cond, f"_iteration_inputs{phase}" + ("_body" if in_body else "")):
                 for op in group:
-                    slot = self._iteration_slot(op, tile, rb)
+                    slot = slots[op.name] if slots else self._iteration_slot(op, tile, rb)
                     w(f"{self.copy_fns[op.name]}({self.n_blocks}({tile}), {rb}, {slot}).start()")
+
+    def _iteration_slots(self, w: _Writer, ops: list[Operand], tile: str, rb: str, base: str) -> dict[str, str]:
+        """Emit each once-per-iteration operand's slot (one name per distinct slot expression); by operand."""
+        names: dict[str, str] = {}
+        slots: dict[str, str] = {}
+        for op in ops:
+            expr = self._iteration_slot(op, tile, rb)
+            if expr not in names:
+                names[expr] = self.local(base)
+                w(f"{names[expr]} = {expr}")
+            slots[op.name] = names[expr]
+        return slots
 
     @staticmethod
     def _by_iteration(ops: list[Operand]) -> dict[tuple[int, bool], list[Operand]]:
@@ -1098,8 +1129,15 @@ class _Generator:
                         first_ = ahead_first if iterated else "_"
                         targets = self._targets(ahead_tile, ahead_ph, ahead_rb, ahead_kb, first_, "_", ahead_empty)
                         w(f"{targets} = {self.n_step}({'1' if self.cursor else f'{s} + {depth - 1}'})")
-                    self._fetch_iterated(w, iterated, ahead_tile, ahead_ph, ahead_rb, ahead_first, ahead_empty)
+                    ahead_slots = self._iteration_slots(w, iterated, ahead_tile, ahead_rb, "ahead_iteration_slot")
+                    self._fetch_iterated(
+                        w, iterated, ahead_tile, ahead_ph, ahead_rb, ahead_first, ahead_empty, ahead_slots
+                    )
                     ahead_slot = _int_expr(f"{s} + {depth - 1}", "%", depth)
+                    if streamed and depth & (depth - 1):  # (one division per step, not one per copy)
+                        name = self.local("ahead_slot")
+                        w(f"{name} = {ahead_slot}")
+                        ahead_slot = name
                     for phase, ops in self._by_phase(streamed).items():
                         with self._when(w, self._runs(ahead_ph, phase, ahead_empty), f"_fetch_phase{phase}"):
                             for op in ops:
@@ -1111,6 +1149,11 @@ class _Generator:
 
             per_tile = [op for op in plan.operands if op.kind is Kind.TILE]
             slots = {Kind.STREAM: _int_expr(s, "%", depth), Kind.TILE: _int_expr(tile, "%", TILE_SLOTS)}
+            if streamed and depth & (depth - 1) and not self.burst:  # (computed once per step)
+                name = self.local("slot")
+                w(f"{name} = {slots[Kind.STREAM]}")
+                slots[Kind.STREAM] = name
+            iteration_slots = self._iteration_slots(w, iterated, tile, self.n_rb, "iteration_slot")
             with self._region(w, WAIT) if per_tile or streamed or iterated else nullcontext():  # (none empty)
                 if self.burst and streamed:  # the first burst's steps wait for their inputs (later ones: at its end)
                     with self._when(w, f"{s} < {self.burst}", "_first_burst"):
@@ -1126,14 +1169,13 @@ class _Generator:
                     cond = self._iteration_first(phase, in_body, ph, first, empty)
                     with self._when(w, cond, f"_wait_iteration{phase}" + ("_body" if in_body else "")):
                         for op in ops:
-                            slot = self._iteration_slot(op, tile, self.n_rb)
-                            w(f"{self.copy_fns[op.name]}({at}, {self.n_rb}, {slot}).wait()")
+                            w(f"{self.copy_fns[op.name]}({at}, {self.n_rb}, {iteration_slots[op.name]}).wait()")
             for op in plan.operands:
                 buf = self.bufs[op.name]
                 if op in self.shared:
                     slot = f"{self.tile_slots}[{self.shared.index(op)}]"
                 elif op.kind is Kind.ITERATION:
-                    slot = self._iteration_slot(op, tile, self.n_rb)
+                    slot = iteration_slots[op.name]
                 else:
                     slot = slots.get(op.kind)
                 view = buf if op.kind is Kind.ONCE else f"{buf}.at[{slot}]"

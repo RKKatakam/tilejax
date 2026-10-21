@@ -287,9 +287,12 @@ def decode_megakernel(
             for j in range(0, B * S, bk):  # phase 2: attention, bk cached positions of sequence j // S per step
                 if j % S >= lengths[j // S]:  # past the sequence's cache: decided on the device
                     continue
-                s = q_bd[j // S] @ k_cache[layer, j : j + bk, :].T
+                # Only the block's rows before the sequence's length are copied (the rest of the slot is stale).
+                kt = k_cache[layer, autokernel.rows(j, j - j % S + lengths[j // S], bk), :]
+                s = q_bd[j // S] @ kt.T
                 ok = j % S + jax.lax.broadcasted_iota(jnp.int32, s.shape, 1) < lengths[j // S]
-                vt = v_cache[layer, j : j + bk, :]
+                valid = j % S + jax.lax.broadcasted_iota(jnp.int32, (bk, 1), 0) < lengths[j // S]
+                vt = jnp.where(valid, v_cache[layer, autokernel.rows(j, j - j % S + lengths[j // S], bk), :], 0)
                 m_j, l_j, acc_j = online_softmax(s, vt, ok, row_max[j // S], row_sum[j // S], acc[j // S])
                 row_max = row_max.at[j // S].set(m_j)
                 row_sum = row_sum.at[j // S].set(l_j)

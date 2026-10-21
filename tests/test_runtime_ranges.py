@@ -167,6 +167,30 @@ def test_ragged_stores_of_static_tiles_drain_at_their_own_sizes():
     assert "out_copy((2,), 0).wait()" in src  # the last tiles' own copies
 
 
+def test_ragged_reads_along_tiled_dims_copy_whole_tiles():
+    kernel = make_kernel(
+        """
+        def f(x, y, n):
+            out = jnp.zeros((8, 256))
+            for i in range(0, 8, 8):
+                a = x[autokernel.rows(n[0], n[1], 8), :]  # (20, 256): sublanes, 20 isn't whole tiles: as is
+                b = y[0:8, autokernel.rows(n[2], n[3], 256)]  # (8, 512): lanes, rounded up to 128
+                rows = jax.lax.broadcasted_iota(jnp.int32, (8, 256), 0)
+                cols = jax.lax.broadcasted_iota(jnp.int32, (8, 256), 1)
+                ok = (rows < n[1] - n[0]) & (cols < n[3] - n[2])  # (past the stops: unspecified)
+                out = out.at[i : i + 8, :].set(jnp.where(ok, a + b, 0.0))
+            return out
+        """,
+        autokernel=autokernel,
+    )
+    x, y, n = rand((20, 256)), rand((8, 512)), i32(4, 9, 128, 300)
+    out, src = check(kernel, x, y, n)
+    want = np.zeros((8, 256))
+    want[:5, :172] = f64(x[4:9, :172]) + f64(y[:5, 128:300])
+    np.testing.assert_allclose(f64(out), want, rtol=1e-6)
+    assert "+ 127) // 128 * 128" in src and "+ 7) // 8 * 8" not in src
+
+
 GATHER = """
 def f(pages, table, w):
     B = table.shape[0] // 4
@@ -418,6 +442,11 @@ def test_pairs_errors(code, message):
         (
             "out = x\n    for i in range(0, 8, 8):\n        out = out.at[n[0 : 0 + 8], 0:128].set(x[i : i + 8, 0:128])",
             "an output tile isn't gathered through an index array",
+        ),
+        (
+            "out = x\n    for i in range(0, 8, 8):\n"
+            "        out = out.at[autokernel.rows(n[0], n[1], 8), 0:128].set(x[i : i + 8, 0:128])",
+            "ragged rows of an output go in a dim before the last two",
         ),
         (
             "out = x\n    for i in range(0, 8, 8):\n        out = out.at[i : i + 8, :].set(x[nothing(i), 0:128])",

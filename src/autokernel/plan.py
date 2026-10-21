@@ -941,6 +941,12 @@ class _Planner:
                 f"allocate it as an input updated in place (`{name} = x`), whose values the rest keeps",
                 scatter,
             )
+        if any(w.rows is not None for w in tile.windows[-2:]):  # (a TPU copies whole (8, 128) tiles there)
+            raise self.error(
+                f"{tile.text}: ragged rows of an output go in a dim before the last two (along those a TPU copies "
+                "whole tiles, which would store past the stop)",
+                store.node,
+            )
         r = self.nest.stored_in[name]
         placing = [*parallel, *([self.ranges[self.nest.reductions[r].var]] if r is not None else [])]
         for r in placing:

@@ -4,7 +4,9 @@ Ragged batches (sequences of many lengths, their tokens concatenated) read and s
 row the kernel learns as it runs, up to a bound: `q[rows(start, stop, n), :, :]` reads rows start.. (n of
 them), and `out = out.at[rows(start, stop, n), :, :].set(v)` stores v's first stop - start rows there,
 nothing past `stop`. In the kernel both are copies of stop - start rows (fewer than n: the rest of the tile
-keeps what its VMEM slot held).
+keeps what its VMEM slot held), but along one of an array's last two dims (tiled: (8, 128) for 32 bits) a
+read starts at a whole tile (`start` must be a multiple of 8 rows for 32 bits, 16 for 16, 128 lanes) and
+copies whole tiles, up to the next tile boundary past `stop`; stores can't be ragged there.
 """
 
 from __future__ import annotations

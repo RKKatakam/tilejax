@@ -205,3 +205,17 @@ def test_phases_decode_arithmetically():
     assert not sch.step_tables and sch.phase_counts == (3, 3) and sch.phase_steps == (6, 6)
     want = [(tile, phase, k) for tile in range(2) for phase in range(2) for k in range(3)]
     assert [sch.step_at(s) for s in range(sch.steps)] == want
+
+
+def test_step_codes_take_power_of_two_radices_while_they_fit():
+    from types import SimpleNamespace
+
+    from autokernel.schedule import _radices
+
+    def plan(count: int, phases: int, iterations: int) -> SimpleNamespace:
+        phase = SimpleNamespace(range=SimpleNamespace(count=count))
+        repeat = SimpleNamespace(range=SimpleNamespace(count=iterations))
+        return SimpleNamespace(phases=[phase] * phases, repeats=[repeat])
+
+    assert _radices(plan(100, 3, 5)) == (4, 8)  # decoded with shifts and masks
+    assert _radices(plan(2**26, 3, 5)) == (3, 5)  # 2**26 * 4 * 8 << 3 overflows int32: exact radices

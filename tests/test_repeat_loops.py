@@ -136,7 +136,9 @@ def test_phases_around_and_in_a_repeat_loop_with_masks(limits):
     np.testing.assert_allclose(f64(out), _layered(x, w, np.asarray(limits)), rtol=1e-4, atol=1e-3)
     lowered = kernel.lower(x, w, limits)
     plan, sch = lowered.plan, lowered.schedule
-    assert [p.range.var for p in plan.phases] == ["k", "f", "g", "c"] and sch.runtime and sch.iterations == 3
+    assert (
+        [p.range.var for p in plan.phases] == ["k", "f", "g", "c"] and sch.runtime and sch.iterations == 4
+    )  # (3 iterations: a radix of 4)
     assert [(r.first, r.last) for r in plan.repeats] == [(1, 3)] and plan.phases[1].repeat == 0
     # The masks don't read `i`: the tables hold one tile's steps, repeated.
     assert (
