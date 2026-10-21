@@ -124,12 +124,12 @@ Fake weights and inputs, small models that fit a 16 GB v5e; bf16; ms per call, w
 | Gated DeltaNet layer (projections, conv, gates, norm) | [linear_attention_layer.py](examples/linear_attention_layer.py) | plain JAX | **1.32–1.97×** |
 | MoE experts, prefill (128 / 64 experts) | [moe.py](examples/moe.py) | megablox at its best tiling, `ragged_dot` | **1.29–1.45×** |
 | MoE, decode batches | [moe.py](examples/moe.py) | megablox, `ragged_dot` | parity (bandwidth bound, ~700 GB/s) |
-| GQA decode attention over a KV cache (ragged lengths) | [decode.py](examples/decode.py) | paged / ragged-paged attention, XLA | **0.97–1.40×** (up to 711 GB/s) |
-| Absorbed MLA decode attention | [decode.py](examples/decode.py) | XLA | **1.3–23×** (0.65× at B32 H16) |
-| Decode step, dense GQA model | [decode_model.py](examples/decode_model.py) | plain JAX + the best JAX decode kernel | **1.17–1.45×** |
+| GQA decode attention over a KV cache (ragged lengths) | [decode.py](examples/decode.py) | paged / ragged-paged attention, XLA | **1.11–1.50×** (up to 727 GB/s) |
+| Absorbed MLA decode attention | [decode.py](examples/decode.py) | XLA | **1.2–23×** (0.68× at B32 H16) |
+| Decode step, dense GQA model | [decode_model.py](examples/decode_model.py) | plain JAX + the best JAX decode kernel | **1.18–1.47×** |
 | A stack of FFN layers in one kernel (repeat loop) | [layer_stack.py](examples/layer_stack.py) | XLA / a kernel per layer | **1.02–1.22×** / 1.01–1.07× (744 GB/s) |
 | KDA decode step (Kimi Linear), paged states updated in place | [kda_decode.py](examples/kda_decode.py) | vLLM TorchTPU's fused `decode_kda` | **1.00–1.44×**, bit-identical (up to 695 GB/s) |
-| Whole decode step in one kernel (cross-layer prefetch) | [decode_megakernel.py](examples/decode_megakernel.py) | XLA / per-layer kernels | **1.04–2.23×** / **1.06–1.55×** (up to 90% of HBM bandwidth) |
+| Whole decode step in one kernel (cross-layer prefetch) | [decode_megakernel.py](examples/decode_megakernel.py) | XLA / per-layer kernels | **1.03–1.53×** / **1.04–1.38×** (up to 91% of HBM bandwidth) |
 | MoE layers decoding in one kernel, the routing inside it | [moe_megakernel.py](examples/moe_megakernel.py) | moe.py's layer per layer (XLA routing + `moe_decode`) | **1.02–1.32×** (680–750 GB/s) |
 | A whole MoE decode step in one kernel | [moe_decode_megakernel.py](examples/moe_decode_megakernel.py) | kernels per layer, XLA routing between them | **1.00–1.16×** |
 
@@ -179,13 +179,13 @@ Each is now in the compiler, measured on a v5e (raw logs: [decode](benchmarks/re
 
 | Model (layers, d, H/Hkv, ffn, vocab) | B | mean context | before | after | per-layer kernels | XLA |
 | --- | --- | --- | --- | --- | --- | --- |
-| 16, 2048, 16/8, 6144, 32k | 1 | 1024 | 2.493 | **2.486** | 2.655 | 2.574 |
-| 16, 2048, 16/8, 6144, 32k | 8 | 512 | 2.802 | **2.701** | 3.002 | 3.189 |
-| 16, 2048, 16/8, 6144, 32k | 8 | 2048 | 3.718 | **3.617** | 3.988 | 5.396 |
-| 8, 2048, 16/8, 6144, 32k | 8 | 4096 | 2.581 | **2.531** | 2.678 | 3.816 |
-| 8, 2048, 16/8, 6144, 32k | 32 | 1024 | 3.085 | **2.891** | 3.334 | 4.197 |
-| 8, 2048, 16/8, 6144, 32k | 64 | 512 | 3.330 | **2.972** | 3.826 | 4.283 |
-| 8, 2048, 16/8, 6144, 32k | 64 | 32 | | **1.923** | 2.978 | 4.285 |
+| 16, 2048, 16/8, 6144, 32k | 1 | 1024 | 2.493 | **2.485** | 2.635 | 2.565 |
+| 16, 2048, 16/8, 6144, 32k | 8 | 512 | 2.802 | **2.701** | 2.854 | 3.181 |
+| 16, 2048, 16/8, 6144, 32k | 8 | 2048 | 3.718 | **3.576** | 3.769 | 5.364 |
+| 8, 2048, 16/8, 6144, 32k | 8 | 4096 | 2.581 | **2.488** | 2.584 | 3.817 |
+| 8, 2048, 16/8, 6144, 32k | 32 | 1024 | 3.085 | **2.848** | 3.008 | 4.207 |
+| 8, 2048, 16/8, 6144, 32k | 64 | 512 | 3.330 | **2.917** | 3.215 | 4.287 |
+| 8, 2048, 16/8, 6144, 32k | 64 | 32 | | **1.616** | 2.236 | 2.170 |
 
 - **Only the valid cache rows are copied.** The profile showed every shape copy-bound, and at batch 64 a
   fifth of the attention's copies were rows past each sequence's length, a 256-row block per step. The
@@ -206,7 +206,10 @@ Each is now in the compiler, measured on a v5e (raw logs: [decode](benchmarks/re
   can walk them instead, skipping the blocks a mask skips as it moves: decode kernels gain (GQA decode at
   B32 x 1k 0.258 -> 0.209 ms, B64 x 1k 0.485 -> 0.401, the decode megakernel 0.4-2%, `moe_decode` ~1%),
   grouped matmuls whose masks skip most experts lose (`gmm_swiglu`/`gmm_down` 9-60%, 128-row expert groups
-  22%). So it is a schedule choice: tuning tries the other way first.
+  22%). So it is a schedule choice: tuning tries the other way first, timing a call with the ops its entry
+  function runs before the kernel (XLA's tables were free when only the kernel was timed). Tuned, every GQA
+  decode shape and the megakernel from batch 8 at 2k context up find their steps as they run
+  ([decode.py's log](benchmarks/results/decode_v5e.txt)).
 - **Not a win here:** deeper pipelines. The queue is not drained at phase boundaries (the code between
   phases is 44 µs of 3.1 ms at batch 64): 3 -> 4 -> 6 input slots gave 3126 -> 3101 -> 3085 µs. So copies
   are still fetched a fixed number of steps ahead, not a number of bytes.

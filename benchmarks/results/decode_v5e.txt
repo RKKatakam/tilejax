@@ -1,0 +1,120 @@
+# benchmarks/decode.py on a Colab TPU v5e (jax 0.11.2), 2026-10-21, tuned stepping (branch megakernel-gaps).
+$ cd /content/ak && PYTHONPATH=/content/ak/src PYTHONUNBUFFERED=1 python benchmarks/decode.py
+GQA decode B=8 mean context 1024 (S_max 2048, 28 MB of valid K/V)
+  autokernel gqa_decode (contiguous)              0.053 ms     528 GB/s ( 64%) DecodeTiles(block_kv=128), 3 input / 2 output buffers, steps found as it runs
+  autokernel paged_gqa_decode (pages of 128)      0.053 ms     531 GB/s ( 65%) 
+  XLA (dense over S_max, masked)                  0.112 ms     251 GB/s ( 31%) 
+  JAX paged_attention (8 pages/block)             0.101 ms     280 GB/s ( 34%) 
+  JAX ragged_paged_attention (4 pages x 8 queries)    0.079 ms     357 GB/s ( 44%) 
+  speedup over the best baseline 1.49x; max |out - XLA| 0.0010
+GQA decode B=32 mean context 1024 (S_max 2048, 138 MB of valid K/V)
+  autokernel gqa_decode (contiguous)              0.211 ms     654 GB/s ( 80%) DecodeTiles(block_kv=128), 3 input / 2 output buffers, steps found as it runs
+  autokernel paged_gqa_decode (pages of 128)      0.210 ms     657 GB/s ( 80%) 
+  XLA (dense over S_max, masked)                  0.380 ms     363 GB/s ( 44%) 
+  JAX paged_attention (16 pages/block)            0.421 ms     327 GB/s ( 40%) 
+  JAX ragged_paged_attention (4 pages x 8 queries)    0.314 ms     439 GB/s ( 54%) 
+  speedup over the best baseline 1.50x; max |out - XLA| 0.0010
+GQA decode B=64 mean context 1024 (S_max 2048, 271 MB of valid K/V)
+  autokernel gqa_decode (contiguous)              0.405 ms     668 GB/s ( 82%) DecodeTiles(block_kv=128), 3 input / 2 output buffers, steps found as it runs
+  autokernel paged_gqa_decode (pages of 128)      0.406 ms     667 GB/s ( 81%) 
+  XLA (dense over S_max, masked)                  0.744 ms     364 GB/s ( 44%) 
+  JAX paged_attention (16 pages/block)            0.810 ms     334 GB/s ( 41%) 
+  JAX ragged_paged_attention (8 pages x 8 queries)    0.594 ms     456 GB/s ( 56%) 
+  speedup over the best baseline 1.46x; max |out - XLA| 0.0020
+GQA decode B=16 mean context 2048 (S_max 3072, 135 MB of valid K/V)
+  autokernel gqa_decode (contiguous)              0.199 ms     679 GB/s ( 83%) DecodeTiles(block_kv=128), 3 input / 2 output buffers, steps found as it runs
+  autokernel paged_gqa_decode (pages of 128)      0.196 ms     688 GB/s ( 84%) 
+  XLA (dense over S_max, masked)                  0.313 ms     431 GB/s ( 53%) 
+  JAX paged_attention (8 pages/block)             0.342 ms     394 GB/s ( 48%) 
+  JAX ragged_paged_attention (8 pages x 8 queries)    0.250 ms     539 GB/s ( 66%) 
+  speedup over the best baseline 1.28x; max |out - XLA| 0.0010
+GQA decode B=64 mean context 2048 (S_max 3072, 542 MB of valid K/V)
+  autokernel gqa_decode (contiguous)              0.755 ms     718 GB/s ( 88%) DecodeTiles(block_kv=128), 3 input / 2 output buffers, steps found as it runs
+  autokernel paged_gqa_decode (pages of 128)      0.757 ms     716 GB/s ( 87%) 
+  XLA (dense over S_max, masked)                  1.096 ms     495 GB/s ( 60%) 
+  JAX paged_attention (8 pages/block)             1.313 ms     413 GB/s ( 50%) 
+  JAX ragged_paged_attention (8 pages x 8 queries)    0.935 ms     580 GB/s ( 71%) 
+  speedup over the best baseline 1.24x; max |out - XLA| 0.0010
+GQA decode B=32 mean context 4096 (S_max 6144, 551 MB of valid K/V)
+  autokernel gqa_decode (contiguous)              0.758 ms     727 GB/s ( 89%) DecodeTiles(block_kv=128), 3 input / 2 output buffers, steps found as it runs
+  autokernel paged_gqa_decode (pages of 128)      0.758 ms     727 GB/s ( 89%) 
+  XLA (dense over S_max, masked)                  1.096 ms     503 GB/s ( 61%) 
+  JAX paged_attention (16 pages/block)            1.055 ms     523 GB/s ( 64%) 
+  JAX ragged_paged_attention (8 pages x 8 queries)    0.859 ms     642 GB/s ( 78%) 
+  speedup over the best baseline 1.13x; max |out - XLA| 0.0010
+GQA decode B=8 mean context 8192 (S_max 12288, 225 MB of valid K/V)
+  autokernel gqa_decode (contiguous)              0.318 ms     709 GB/s ( 87%) DecodeTiles(block_kv=256), 3 input / 2 output buffers, steps found as it runs
+  autokernel paged_gqa_decode (pages of 128)      0.317 ms     711 GB/s ( 87%) 
+  XLA (dense over S_max, masked)                  0.557 ms     404 GB/s ( 49%) 
+  JAX paged_attention (16 pages/block)            0.423 ms     532 GB/s ( 65%) 
+  JAX ragged_paged_attention (8 pages x 8 queries)    0.353 ms     638 GB/s ( 78%) 
+  speedup over the best baseline 1.11x; max |out - XLA| 0.0005
+MLA decode B=8 mean context 2048 H=16 (S_max 3072, 16 MB of valid cache)
+  autokernel mla_decode                           0.068 ms     232 GB/s ( 28%)    7.0 TFLOP/s
+  XLA (dense over S_max, masked)                  0.085 ms     187 GB/s ( 23%)    5.6 TFLOP/s
+  DecodeTiles(block_kv=512), 3 input / 2 output buffers, steps found as it runs; speedup 1.24x; max |out - XLA| 0.0005
+MLA decode B=32 mean context 2048 H=16 (S_max 3072, 78 MB of valid cache)
+  autokernel mla_decode                           0.144 ms     538 GB/s ( 66%)   16.3 TFLOP/s
+  XLA (dense over S_max, masked)                  0.097 ms     797 GB/s ( 97%)   24.1 TFLOP/s
+  DecodeTiles(block_kv=512), 3 input / 2 output buffers, steps found as it runs; speedup 0.68x; max |out - XLA| 0.0010
+MLA decode B=32 mean context 2048 H=64 (S_max 3072, 78 MB of valid cache)
+  autokernel mla_decode                           0.149 ms     521 GB/s ( 64%)   63.0 TFLOP/s
+  XLA (dense over S_max, masked)                  0.212 ms     365 GB/s ( 45%)   44.1 TFLOP/s
+  DecodeTiles(block_kv=512), 3 input / 2 output buffers, steps found as it runs; speedup 1.43x; max |out - XLA| 0.0010
+MLA decode B=64 mean context 1024 H=128 (S_max 2048, 76 MB of valid cache)
+  autokernel mla_decode                           0.214 ms     357 GB/s ( 44%)   86.2 TFLOP/s
+  XLA (dense over S_max, masked)                  0.593 ms     129 GB/s ( 16%)   31.1 TFLOP/s
+  DecodeTiles(block_kv=512), 3 input / 2 output buffers; speedup 2.77x; max |out - XLA| 0.0010
+MLA decode B=16 mean context 4096 H=128 (S_max 6144, 76 MB of valid cache)
+  autokernel mla_decode                           0.161 ms     471 GB/s ( 58%)  114.0 TFLOP/s
+  XLA (dense over S_max, masked)                  3.749 ms      20 GB/s (  2%)    4.9 TFLOP/s
+  DecodeTiles(block_kv=1024), 3 input / 2 output buffers, steps found as it runs; speedup 23.31x; max |out - XLA| 0.0005
+decode step Config(layers=4, d_model=2048, heads=16, kv_heads=8, ffn=6144, vocab=32768), batch 32, mean context 1024 (S_max 2048): ms per step, tokens/s
+  per step: 537 MB of weights, ~560 MB of valid K/V
+  autokernel (contiguous cache)                   1.615 ms     679 GB/s ( 83%)     19811 tokens/s  max |logits - ours| 0.000
+  autokernel (paged cache)                        1.620 ms     677 GB/s ( 83%)     19755 tokens/s  max |logits - ours| 0.000
+  plain JAX + XLA attention                       2.306 ms     476 GB/s ( 58%)     13875 tokens/s  max |logits - ours| 0.031
+  plain JAX + paged_attention {'pages_per_compute_block': 4}    2.795 ms     392 GB/s ( 48%)     11449 tokens/s  max |logits - ours| 0.032
+  plain JAX + paged_attention {'pages_per_compute_block': 8}    2.324 ms     472 GB/s ( 58%)     13767 tokens/s  max |logits - ours| 0.031
+  plain JAX + ragged_paged_attention              2.276 ms     482 GB/s ( 59%)     14062 tokens/s  max |logits - ours| 0.031
+  speedup over the best plain-JAX step 1.41x
+decode step Config(layers=4, d_model=2048, heads=16, kv_heads=8, ffn=6144, vocab=32768), batch 8, mean context 4096 (S_max 7168): ms per step, tokens/s
+  per step: 537 MB of weights, ~452 MB of valid K/V
+  autokernel (contiguous cache)                   1.394 ms     710 GB/s ( 87%)      5739 tokens/s  max |logits - ours| 0.000
+  autokernel (paged cache)                        1.401 ms     706 GB/s ( 86%)      5708 tokens/s  max |logits - ours| 0.000
+  plain JAX + XLA attention                       2.711 ms     365 GB/s ( 45%)      2951 tokens/s  max |logits - ours| 0.031
+  plain JAX + paged_attention {'pages_per_compute_block': 4}    2.083 ms     475 GB/s ( 58%)      3841 tokens/s  max |logits - ours| 0.031
+  plain JAX + paged_attention {'pages_per_compute_block': 8}    1.649 ms     600 GB/s ( 73%)      4850 tokens/s  max |logits - ours| 0.031
+  plain JAX + ragged_paged_attention              2.111 ms     469 GB/s ( 57%)      3790 tokens/s  max |logits - ours| 0.031
+  speedup over the best plain-JAX step 1.18x
+decode step Config(layers=4, d_model=1024, heads=16, kv_heads=8, ffn=3072, vocab=32768), batch 64, mean context 512 (S_max 1024): ms per step, tokens/s
+  per step: 193 MB of weights, ~559 MB of valid K/V
+  autokernel (contiguous cache)                   1.270 ms     592 GB/s ( 72%)     50395 tokens/s  max |logits - ours| 0.000
+  autokernel (paged cache)                        1.280 ms     588 GB/s ( 72%)     50019 tokens/s  max |logits - ours| 0.000
+  plain JAX + XLA attention                       1.871 ms     402 GB/s ( 49%)     34208 tokens/s  max |logits - ours| 0.031
+  plain JAX + paged_attention {'pages_per_compute_block': 4}    3.026 ms     249 GB/s ( 30%)     21150 tokens/s  max |logits - ours| 0.035
+  plain JAX + paged_attention {'pages_per_compute_block': 8}    2.423 ms     311 GB/s ( 38%)     26417 tokens/s  max |logits - ours| 0.035
+  plain JAX + ragged_paged_attention              1.916 ms     393 GB/s ( 48%)     33397 tokens/s  max |logits - ours| 0.035
+  speedup over the best plain-JAX step 1.47x
+GQA decode attention (H 32, Hkv 8, Dh 128), ms
+B   mean  ours   ours paged  XLA     paged_attn  ragged_paged  speedup  GB/s  max diff
+8   1024   0.053      0.053   0.112       0.101         0.079    1.49x   531    0.0010
+32  1024   0.211      0.210   0.380       0.421         0.314    1.50x   657    0.0010
+64  1024   0.405      0.406   0.744       0.810         0.594    1.46x   668    0.0020
+16  2048   0.199      0.196   0.313       0.342         0.250    1.28x   688    0.0010
+64  2048   0.755      0.757   1.096       1.313         0.935    1.24x   718    0.0010
+32  4096   0.758      0.758   1.096       1.055         0.859    1.13x   727    0.0010
+8   8192   0.318      0.317   0.557       0.423         0.353    1.11x   711    0.0005
+Absorbed MLA decode attention (latent 512 + RoPE 64), ms
+B   mean  H    ours    XLA     speedup  GB/s  max diff
+8   2048  16     0.068   0.085    1.24x   232    0.0005
+32  2048  16     0.144   0.097    0.68x   538    0.0010
+32  2048  64     0.149   0.212    1.43x   521    0.0010
+64  1024  128    0.214   0.593    2.77x   357    0.0010
+16  4096  128    0.161   3.749   23.31x   471    0.0005
+Decode step, ms per step (best plain JAX baseline vs autokernel)
+model (layers,d,H,Hkv,ffn,vocab)  B   mean  plain JAX  autokernel  speedup  tokens/s  GB/s
+4,2048,16,8,6144,32768            32  1024      2.276       1.615    1.41x     19811   679
+4,2048,16,8,6144,32768            8   4096      1.649       1.394    1.18x      5739   710
+4,1024,16,8,3072,32768            64  512       1.871       1.270    1.47x     50395   592
+[exit 0]

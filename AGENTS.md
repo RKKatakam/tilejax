@@ -214,6 +214,10 @@ Each of these was found on hardware; don't undo them without measuring again.
   gathers): GQA decode B32 x 1k 0.258 -> 0.209 ms with the cursor, B64 x 1k 0.485 -> 0.401, the decode
   megakernel 0.4-2% faster; but gmm_swiglu/gmm_down 9-60% slower (their masks skip most experts, a scalar
   loop per skipped block) and expert_ffn_blocks with 128-row groups 22%. Tuning tries both (`Config.cursor`).
+  It only picked the cursor once a profile's device time counted the ops the entry function runs before the
+  kernel (`profiling.measure` times the call under `jax.jit`): timing the kernel alone made XLA's tables
+  free. Tuned: GQA decode 1.11-1.50x the best JAX kernel (B32 x 1k 0.211 ms), the decode megakernel
+  1.04-1.38x per-layer kernels (B64 x 32 1.616 vs 2.236 ms).
 - Tuning is per input signature, not per lengths: a short-context batch with the same cache shape reuses a
   long one's tuning (the attention group size most). Benchmarks give short contexts caches of their own.
 
