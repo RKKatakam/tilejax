@@ -145,6 +145,15 @@ def test_importing_autokernel_turns_trace_regions_on(monkeypatch):
 
 
 @pytest.mark.cpu
+def test_a_calls_device_time_counts_the_ops_before_its_kernel(fake_tpu):
+    x, y = rand((256, 256)), rand((256, 256), 1)
+    events = trace(calls=1)  # the kernel 53 us, then another op of 50 us (the call's step tables, say)
+    fake_tpu.append(events)
+    p = autokernel.profile(matmul, x, y, MatmulTiles(tm=128, tn=128, tk=128), runs=1)
+    assert p.device_s == pytest.approx(103 * US)
+
+
+@pytest.mark.cpu
 def test_kernels_updating_inputs_in_place_are_timed_in_place(fake_tpu):
     kernel = make_kernel(
         """
