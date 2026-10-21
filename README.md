@@ -201,6 +201,12 @@ Each is now in the compiler, measured on a v5e (raw logs: [decode](benchmarks/re
   phase's inputs are waited for, and its slots bound, in the phase's own branch, streamed inputs after the
   code before the phase (it runs while they arrive): neutral on these kernels (within 0.2%), and what
   routing inside a kernel needs.
+- **Steps found as the kernel runs.** A kernel with runtime masks walked SMEM step tables that XLA made just
+  before it (an argsort over every step that could run). Its cursor (the one routing inside a kernel needs)
+  can walk them instead, skipping the blocks a mask skips as it moves: decode kernels gain (GQA decode at
+  B32 x 1k 0.258 -> 0.209 ms, B64 x 1k 0.485 -> 0.401, the decode megakernel 0.4-2%, `moe_decode` ~1%),
+  grouped matmuls whose masks skip most experts lose (`gmm_swiglu`/`gmm_down` 9-60%, 128-row expert groups
+  22%). So it is a schedule choice: tuning tries the other way first.
 - **Not a win here:** deeper pipelines. The queue is not drained at phase boundaries (the code between
   phases is 44 µs of 3.1 ms at batch 64): 3 -> 4 -> 6 input slots gave 3126 -> 3101 -> 3085 µs. So copies
   are still fetched a fixed number of steps ahead, not a number of bytes.
@@ -625,8 +631,10 @@ def f(x, y, tiles=Tiles()):                   # the input arrays; optionally las
 - **Runtime ranges**: a reduction loop's bounds may read index arrays (`for p in range(0, lengths[b], 128)`,
   `range(n[0])`), as may the bounds of a kernel's one parallel loop (`for k in range(n_tiles[0])`: tiles
   counted as the kernel runs; its outputs are inputs updated in place). Such a kernel finds its steps as
-  it runs, with a cursor in SMEM, no tables: a loop with no blocks takes one empty step, and its loops
-  can't be masked (put the condition in the bounds). Repeat loops may hold runtime ranges.
+  it runs, with a cursor in SMEM, no tables: a loop with no blocks takes one empty step, a loop with
+  runtime bounds can't be masked (put the condition in the bounds), and the cursor skips the blocks other
+  loops' masks skip as it moves. Repeat loops may hold runtime ranges. A kernel whose runtime masks allow
+  either finds its steps from tables or with the cursor, whichever tuning measures faster.
 - **Computed index arrays**: a value the tile code computes (int32, one or two dims) may place later loops'
   windows and bound them, `w_gate[layer, chosen[c // F], :, c % F : c % F + be]` with `for c in range(0,
   n[0] * F, be)`: routing inside a kernel. It is computed in code after a reduction loop (the kernel learns

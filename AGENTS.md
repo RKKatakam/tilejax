@@ -47,7 +47,7 @@ kernel for a **TPU v5e**, and tunes its schedule on the hardware. The scope is d
 fn --parse.py--> Nest --plan.py--> Plan --schedule.py--> Schedule --codegen.py--> source --exec--> kernel
                 (syntax)       (shapes, tunable,      (step tables)           (+ Pipeline)
                                  types)
-tune.py: for each candidate Config (tunable, Pipeline): build -> run -> compare with the reference ->
+tune.py: for each candidate Config (tunable, Pipeline, cursor): build -> run -> compare with the reference ->
          profile (trace regions) -> proposals from the bottleneck -> ... -> the fastest Config
 ```
 
@@ -55,8 +55,8 @@ tune.py: for each candidate Config (tunable, Pipeline): build -> run -> compare 
 | --- | --- | --- |
 | `parse.py` | the language's syntax; every syntactic error | evaluate anything |
 | `plan.py` | run the prologue; loop ranges; tile windows; operand kinds; carried values; type trace | order steps |
-| `schedule.py` | step order; evaluate masks into tables (or describe the steps runtime masks choose from); `step_at`/`blocks_at` | know about buffers |
-| `pipeline.py` | `Pipeline` (slots per copy); VMEM accounting; default buffering | measure |
+| `schedule.py` | step order; evaluate masks into tables (or describe the steps runtime masks choose from, or a cursor's: steps found as the kernel runs); `step_at`/`blocks_at` | know about buffers |
+| `pipeline.py` | `Pipeline` (slots per copy); rings shared by same-shaped windows of different phases (`rings`); VMEM accounting; default buffering | measure |
 | `codegen.py` | emit the source from Plan + Schedule + Pipeline | make semantic decisions |
 | `mxu.py` | the meaning of `@`, shared by kernel, type trace and reference | |
 | `reference.py` | the function as plain JAX (`@` rewritten to `mxu`) | |
@@ -85,11 +85,14 @@ tune.py: for each candidate Config (tunable, Pipeline): build -> run -> compare 
 ### How a step runs (codegen.py)
 
 Decode the step into (tile, phase, block, first/last of the phase, empty) (arithmetic, or SMEM tables when
-masked; with runtime masks, tables the entry function made on the device) → start the fetch of the step `input_buffers - 1` ahead (its phase's operands: prefetch crosses
-phase and tile boundaries) → at a tile's first step, start the next tile's per-tile inputs and wait for
-this tile's → wait for this phase's inputs → at a tile's last step, wait for the output slot → the code
-before the phases (tile's first step) / the phase's body / the code after it (phase's last step; after the
-last phase: stores + output DMA starts). Masked-out tiles are filled from a constant VMEM tile, a share per
+masked; with runtime masks, tables the entry function made on the device; or a cursor in SMEM, moved a
+step at a time, for runtime ranges, computed index arrays, or where tuning chose it) → start the fetch of
+the step `input_buffers - 1` ahead (its phase's operands: prefetch crosses phase and tile boundaries; with
+a cursor, only once the computed index arrays it reads are made, catching up right after) → at a tile's
+first step, start the next tile's per-tile inputs and wait for this tile's → at a tile's last step, wait
+for the output slot → the code before the phases (tile's first step) → in the phase's branch: its
+once-per-iteration inputs (first step), the code before the phase, then its streamed inputs, the body, the
+code after it (phase's last step; after the last phase: stores + output DMA starts). Masked-out tiles are filled from a constant VMEM tile, a share per
 tile, at most 4 in flight (an output updated in place isn't filled: it keeps the input's values). Trace
 regions wrap the waits, the output wait and the tile code. In bursts (`Pipeline.bursts(g)`, single-step
 kernels only), a burst's first step waits for the previous burst's output copies and starts the next
@@ -207,6 +210,10 @@ Each of these was found on hardware; don't undo them without measuring again.
   expert blocks wait for the routing (no prefetch can cross it): 680 GB/s at 1 token.
 - A whole MoE decode step in one kernel (two Qwen3-30B-A3B layers, contexts ~1k): 1.16x the per-layer
   kernels at B1 (0.546 vs 0.633 ms), 1.03x at B8, parity at B32 (both read the chosen experts, ~110 of 128).
+- Finding steps with a cursor as the kernel runs vs from step tables XLA makes before it (an argsort, then
+  gathers): GQA decode B32 x 1k 0.258 -> 0.209 ms with the cursor, B64 x 1k 0.485 -> 0.401, the decode
+  megakernel 0.4-2% faster; but gmm_swiglu/gmm_down 9-60% slower (their masks skip most experts, a scalar
+  loop per skipped block) and expert_ffn_blocks with 128-row groups 22%. Tuning tries both (`Config.cursor`).
 - Tuning is per input signature, not per lengths: a short-context batch with the same cache shape reuses a
   long one's tuning (the attention group size most). Benchmarks give short contexts caches of their own.
 
