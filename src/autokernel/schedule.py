@@ -23,6 +23,11 @@ iteration too.
 Masks that read index arrays (runtime masks, `if j >= lengths[b]: continue`) can only be evaluated when the
 kernel runs: then the step tables are made on the device, just before the kernel, from every step that
 could run (`runtime`); the schedule describes those steps, and its step count is the most there can be.
+
+A reduction loop whose bounds read index arrays (a runtime range, `for p in range(pages[b])`) takes no
+tables at all (`cursor`): the kernel counts its steps when it starts and walks them with a cursor, a step
+after another (on a TPU, building step tables with XLA's gathers and scatters took longer than the
+kernel's own scalar work). Each tile takes each phase's blocks, or one empty step if it has none.
 """
 
 from __future__ import annotations
@@ -73,6 +78,7 @@ class Schedule:
     runtime: bool = False
     tile_values: dict[str, np.ndarray] = field(default_factory=dict)
     static_runs: dict[int, np.ndarray] = field(default_factory=dict)
+    cursor: bool = False  # runtime ranges: steps found as the kernel runs (`steps`: a tile's phases once each)
 
     @property
     def steps_per_tile(self) -> int:
@@ -131,6 +137,8 @@ def make_schedule(plan: Plan) -> Schedule:
     nest = plan.nest
     phases = [phase.range for phase in plan.phases]
     counts = tuple(r.count for r in phases)
+    if plan.cursor:
+        return _cursor(plan, counts)
     tile_masks = [r.mask for r in plan.parallel if r.mask is not None]
     step_masks = [r.mask for r in phases if r.mask is not None]
     if not tile_masks and not step_masks and not plan.repeats:
@@ -268,6 +276,43 @@ def _runtime(
         tile_values=tile_values,
         static_runs=static_runs,
         iterations=iterations,
+    )
+
+
+def _cursor(plan: Plan, counts: tuple[int, ...]) -> Schedule:
+    """A schedule of runtime ranges: the tiles that run (through tables if tile masks skip some), each taking
+    its phases' steps as the kernel finds them."""
+    tile_masks = [r.mask for r in plan.parallel if r.mask is not None]
+    read = set().union(*(reads(m) for m in tile_masks))
+    split = next((i for i, r in enumerate(plan.parallel) if r.var in read), len(plan.parallel))
+    outer, inner = plan.parallel[:split], plan.parallel[split:]
+    active, skipped = [], []
+    for blocks in itertools.product(*(range(r.count) for r in inner)):
+        values = _values(inner, blocks)
+        (skipped if any(_holds(plan, mask, values) for mask in tile_masks) else active).append(blocks)
+    if not active:
+        raise plan.nest.error("the masks skip every output tile", plan.nest.parallel[0].node)
+    tables = _tile_tables(inner, active, skipped)
+    _check_smem(plan, tables, 4 * 6)  # (and the cursors)
+    repeats = math.prod(r.count for r in outer)
+    tiles = repeats * len(active)
+    _check_tiles(plan, tiles, repeats * len(skipped))
+    return Schedule(
+        tiles=tiles,
+        total_tiles=math.prod(r.count for r in plan.parallel),
+        steps=tiles * len(counts),
+        phase_counts=counts,
+        phase_steps=tuple(tiles for _ in counts),
+        step_tables=False,
+        outer=outer,
+        inner=inner,
+        pattern_tiles=len(active),
+        pattern_steps=len(active) * len(counts),
+        pattern_fills=len(skipped),
+        tile_tables=bool(skipped),
+        tables=tables,
+        empty=True,
+        cursor=True,
     )
 
 

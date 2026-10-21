@@ -121,8 +121,11 @@ class Nest:
 
     @property
     def runtime_masks(self) -> bool:
-        """Do masks read elements of index arrays? Then they are evaluated when the kernel runs."""
-        return any(loop.mask is not None and element_reads(loop.mask, self.params) for loop in self.reductions)
+        """Do masks or loop bounds read elements of index arrays? Then they are evaluated when the kernel
+        runs (and the function itself only runs eagerly)."""
+        return any(loop.mask is not None and element_reads(loop.mask, self.params) for loop in self.reductions) or any(
+            element_reads(bound, self.params) for loop in self.reductions for bound in loop.bounds
+        )
 
     def store(self, stmt: ast.stmt) -> Store | None:
         """The output store `stmt` is, if it is one."""

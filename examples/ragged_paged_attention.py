@@ -37,7 +37,7 @@ def write_new_tokens(kv_cache, keys, values, kv_lens, page_indices, cu_q_lens, d
     S, ps = kv_lens.shape[0], kv_cache.shape[1]
     pps = page_indices.shape[0] // S
     t = jnp.arange(T, dtype=jnp.int32)
-    seq = jnp.clip(jnp.searchsorted(cu_q_lens, t, side="right").astype(jnp.int32) - 1, 0, S - 1)
+    seq = jnp.minimum(jnp.sum(cu_q_lens[None, 1:] <= t[:, None], axis=1, dtype=jnp.int32), S - 1)  # (no search loop)
     real = t < cu_q_lens[distribution[2]]
     pos = kv_lens[seq] - (cu_q_lens[seq + 1] - cu_q_lens[seq]) + (t - cu_q_lens[seq])
     page = jnp.where(real, page_indices[seq * pps + pos // ps], kv_cache.shape[0])  # (out of bounds: dropped)
@@ -97,9 +97,7 @@ def make_decode(sm_scale: float) -> autokernel.Kernel:
             row_max = jnp.full((H, LANES), MASK_VALUE, jnp.float32)
             row_sum = jnp.zeros((H, LANES), jnp.float32)
             acc = jnp.zeros((H, D), jnp.float32)
-            for p in range(pps):
-                if s >= distribution[0] or p * ps >= kv_lens[s]:
-                    continue
+            for p in range((kv_lens[s] + ps - 1) // ps if s < distribution[0] else 0):  # its pages, read as it runs
                 k, v = keys_values(autokernel.pairs(kv_cache[page_indices[s * pps + p], :, :, :, :]))
                 scores = (qs @ k.T) * sm_scale  # every query head against every kv head's keys: (H, ps * Hkv)
                 ok = own_heads(H, Hkv, ps, p * ps, kv_lens[s])

@@ -22,6 +22,11 @@ inputs; its last step waits for those, then starts copying its own outputs out. 
 wait for their own inputs, and the last burst's copy their outputs out as they go: nothing reads or
 writes alongside them.)
 
+With runtime ranges (a reduction loop's bounds read index arrays) there are no step tables: two cursors in
+SMEM hold this step's (tile, phase, block) and the step whose inputs are fetched next, each moved on a step
+at a time (`advance`, from the tile's bounds), and the step loop runs until the cursor has passed the last
+tile.
+
 Index arrays (inputs read element by element) are SMEM inputs. When masks read them, the entry function
 first finds the steps that run on the device (`<name>_steps`, plain JAX), and the kernel loops over those.
 
@@ -234,6 +239,8 @@ class _Generator:
         self.n_s, self.n_tile, self.n_kb, self.n_first, self.n_last = n("s"), n("tile"), n("kb"), n("first"), n("last")
         self.n_ph, self.n_empty, self.n_steps, self.n_rb = n("ph"), n("empty"), n("n_steps"), n("rb")
         self.repeated = bool(plan.repeats)  # steps decode to a repeat loop's iteration (`rb`) too
+        self.cursor = schedule.cursor
+        self.n_cursor, self.n_counts, self.n_advance = n("cursor"), n("counts"), n("advance")
         self.n_at, self.n_rep, self.n_code, self.n_c, self.n_slot = n("at"), n("rep"), n("code"), n("c"), n("slot")
 
     # ------------------------------------------------------------------ the module
@@ -333,16 +340,13 @@ class _Generator:
                     w(f"{name} = {joined}.swapaxes(0, 1).reshape({tiles}, -1)")
                 parts.append((keep, code))
                 p = rep.last
-            keep, code, at, tile = n("keep"), n("code"), n("at"), n("tile")
+            keep, code, order, tile = n("keep"), n("code"), n("order"), n("tile")
             w(f"{keep} = jnp.concatenate([{', '.join(k for k, _ in parts)}], axis=1).reshape(-1)")
             w(f"{code} = jnp.concatenate([{', '.join(c for _, c in parts)}], axis=1).reshape(-1)")
-            w(f"{at} = jnp.where({keep}, jnp.cumsum({keep}, dtype=jnp.int32) - 1, {sch.pattern_steps})")
-            w(f"{tile} = np.repeat(np.arange({tiles}, dtype=np.int32), {sch.pattern_steps // tiles})")
-            with w.block("return ("):
-                w(f"jnp.zeros({sch.pattern_steps}, jnp.int32).at[{at}].set({tile}, mode='drop'),")
-                w(f"jnp.zeros({sch.pattern_steps}, jnp.int32).at[{at}].set({code}, mode='drop'),")
-                w(f"jnp.sum({keep}, dtype=jnp.int32).reshape(1),")
-            w(")")
+            w(f"{tile} = jnp.repeat(jnp.arange({tiles}, dtype=jnp.int32), {sch.pattern_steps // tiles})")
+            # (A stable sort brings the steps that run to the front, in order: a TPU scatters far slower.)
+            w(f"{order} = jnp.argsort(jnp.logical_not({keep}), stable=True)")
+            w(f"return {tile}[{order}], {code}[{order}], jnp.sum({keep}, dtype=jnp.int32).reshape(1)")
 
     def _phase_runs(self, w: _Writer, n: _Namer, p: int, iterations: tuple[int, ...]) -> tuple[str, str]:
         """Emit which of phase p's blocks run for each tile (each iteration of its repeat loop first, if
@@ -445,6 +449,10 @@ class _Generator:
         if self.shared:
             names = ", ".join(op.name for op in self.shared)
             lines.append(f"pltpu.SMEM(({len(self.shared)},), jnp.int32),  # {self.tile_slots}: the slots of {names}")
+        if self.cursor:
+            lines.append(
+                f"pltpu.SMEM((2, 3), jnp.int32),  # {self.n_cursor}: (tile, phase, block) now and fetched next"
+            )
         return lines
 
     # ------------------------------------------------------------------ the kernel
@@ -466,6 +474,7 @@ class _Generator:
         for out in self.fill_bufs:
             params += [self.fill_bufs[out], self.fill_sems[out]]
         params += [self.tile_slots] if self.shared else []
+        params += [self.n_cursor] if self.cursor else []
         if self.words:
             params.append(f"*, {self.n_interpret}")
         with w.block(f"def {self.kernel_name}({', '.join(params)}):"):
@@ -488,6 +497,9 @@ class _Generator:
         sch, s, tile, ph, kb = self.schedule, self.n_s, self.n_tile, self.n_ph, self.n_kb
         if self.single:
             return  # a step is a tile
+        if self.cursor:
+            self._cursor_fns(w)
+            return
         phases = len(sch.phase_counts)
         with w.block(f"def {self.n_step}({s}):"):
             what = "its phase (reduction loop), " + ("its repeat loop's iteration, " if self.repeated else "")
@@ -538,6 +550,71 @@ class _Generator:
                     f"({code} & 2) != 0, ({code} & 1) != 0{empty}"
                 )
 
+    def _cursor_fns(self, w: _Writer) -> None:
+        """`counts(tile)`, `step(row)` and `advance(row)`: the steps of runtime ranges, found as the kernel runs."""
+        plan, tile, ph, kb, cursor = self.plan, self.n_tile, self.n_ph, self.n_kb, self.n_cursor
+        phases = len(plan.phases)
+        block_of = {r.var: self.blk[r.var] for r in plan.parallel}
+        with w.block(f"def {self.n_counts}({tile}):"):
+            w('"""The tile-th tile\'s blocks of each reduction loop, from its bounds (0: it takes one empty step)."""')
+            self._unpack(w, f"{self.n_blocks}({tile})")
+            counts = []
+            for phase in plan.phases:
+                r = phase.range
+                if r.bounds is None:
+                    counts.append(str(r.count))
+                    continue
+                start, stop = (self._render(b, block_of) for b in r.bounds)
+                counts.append(f"jnp.maximum(jax.lax.div(({stop}) - ({start}) + {r.step - 1}, {r.step}), 0)")
+            w(f"return ({_tuple(counts)})")
+
+        n = self.local("n")
+
+        def count(w: _Writer) -> None:
+            w(f"{n} = {self.n_counts}({tile})[0]")
+            for p in range(1, phases):
+                w(f"{n} = jnp.where({ph} == {p}, {self.n_counts}({tile})[{p}], {n})")
+
+        with w.block(f"def {self.n_step}(row):"):
+            w('"""The step cursor `row` is at (0: this step, 1: the step fetched next): its tile, phase and block,')
+            w('whether it is the phase\'s first and last step, and empty."""')
+            w(f"{tile}, {ph}, {kb} = {cursor}[row, 0], {cursor}[row, 1], {cursor}[row, 2]")
+            count(w)
+            w(f"return {tile}, {ph}, {kb}, {kb} == 0, {kb} >= {n} - 1, {n} == 0")
+        with w.block(f"def {self.n_advance}(row):"):
+            w('"""Move cursor `row` to the next step: the next block, else the next phase, else the next tile."""')
+            w(f"{tile}, {ph}, {kb} = {cursor}[row, 0], {cursor}[row, 1], {cursor}[row, 2]")
+            count(w)
+            w(f"more = {kb} + 1 < {n}")
+            w(f"{cursor}[row, 2] = jnp.where(more, {kb} + 1, 0)")
+            if phases > 1:
+                w(f"later = {ph} + 1 < {phases}")
+                w(f"{cursor}[row, 1] = jnp.where(more, {ph}, jnp.where(later, {ph} + 1, 0))")
+                w(f"{cursor}[row, 0] = jnp.where(more | later, {tile}, {tile} + 1)")
+            else:
+                w(f"{cursor}[row, 0] = jnp.where(more, {tile}, {tile} + 1)")
+
+    def _render(self, expr: ast.expr, block_of: dict[str, str]) -> str:
+        """`expr` (of loop variables, index arrays' elements and constants) as kernel source: loop values from
+        their blocks (`block_of`), elements read from SMEM, Python's `and`/`or`/`if` as jnp's."""
+        gen = self
+
+        class Values(ast.NodeTransformer):
+            def visit_Name(self, node: ast.Name) -> ast.expr:
+                if node.id in block_of:
+                    return _parse_expr(f"({gen._val(gen._range(node.id), block_of[node.id], block_of)})")
+                return ast.Name(gen.smem[node.id], ast.Load()) if node.id in gen.smem else node
+
+        return ast.unparse(_Vectorize().visit(Values().visit(copy.deepcopy(expr))))
+
+    def _val(self, r: Range, block: str, block_of: dict[str, str]) -> str:
+        """The loop's value at a block index (a runtime range's from its start, read now)."""
+        if r.bounds is None:
+            return _scaled(block, r)
+        start = self._render(r.bounds[0], block_of)
+        term = block if r.step == 1 else f"{block} * {r.step}"
+        return term if start == "0" else f"{start} + {term}"
+
     def _radix(self, w: _Writer, index: str, ranges: tuple[Range, ...]) -> list[str]:
         """Emit the blocks of `ranges` at row-major position `index`; their names."""
         names = []
@@ -587,6 +664,14 @@ class _Generator:
                     dims.append(":")
                 else:
                     dims.append(f"pl.ds({window.offset}, {window.size})")
+            elif r.bounds is not None:  # a runtime range moves it: clamped to the dim, as JAX clamps
+                start = self._val(r, block_of[r.var], block_of)
+                last = dim - (window.size or 1)
+                dims.append(
+                    f"jnp.clip({start}, 0, {last})"
+                    if window.size is None
+                    else f"pl.ds(jnp.clip({start}, 0, {last}), {window.size})"
+                )
             else:
                 start = _scaled(block_of[r.var], r)
                 dims.append(start if window.size is None else f"pl.ds({start}, {window.size})")
@@ -595,15 +680,7 @@ class _Generator:
     def _runtime_index(self, element: ast.Subscript, block_of: dict[str, str], dim: int) -> str:
         """An index read from an index array when the kernel runs, at the loops' values for these blocks,
         clamped to the dim (as JAX clamps indices)."""
-        gen = self
-
-        class Values(ast.NodeTransformer):
-            def visit_Name(self, node: ast.Name) -> ast.expr:
-                if node.id in block_of:
-                    return _parse_expr(f"({_scaled(block_of[node.id], gen._range(node.id))})")
-                return ast.Name(gen.smem[node.id], ast.Load()) if node.id in gen.smem else node
-
-        return f"jnp.clip({ast.unparse(Values().visit(copy.deepcopy(element)))}, 0, {dim - 1})"
+        return f"jnp.clip({self._render(element, block_of)}, 0, {dim - 1})"
 
     def _array_shape(self, array: str) -> tuple[int, ...]:
         if array in self.nest.params:
@@ -722,6 +799,9 @@ class _Generator:
             for step in range(first):
                 w(*[f"{self.copy_fns[op.name]}({sch.blocks_at(step)}, 0, {step}).start()" for op in streamed])
             return
+        if self.cursor:
+            self._cursor_setup(w, streamed)
+            return
         ahead = min(self.pipeline.input_buffers - 1, sch.steps)
         if not ((streamed or iterated) and ahead):
             return
@@ -750,6 +830,26 @@ class _Generator:
             for op in streamed:
                 if op.phase in (None, phase):
                     w(f"{self.copy_fns[op.name]}({at}, {self._rb(rb)}{kb}, {step}).start()")
+
+    def _cursor_setup(self, w: _Writer, streamed: list[Operand]) -> None:
+        """Both cursors at the first step; the first `input_buffers - 1` steps' inputs started, the second
+        cursor moved past them."""
+        cursor, tiles = self.n_cursor, self.schedule.tiles
+        w("# The cursors: this step, and the next step whose inputs are fetched.")
+        w(*[f"{cursor}[{row}, {i}] = 0" for row in (0, 1) for i in range(3)])
+        if not streamed:
+            return
+        names = ("first_tile", "first_ph", "first_kb", "first_first", "first_empty")
+        tile, ph, kb, first, empty = (self.local(name) for name in names)
+        w(f"# The first {self.pipeline.input_buffers - 1} step(s)' inputs.")
+        for step in range(self.pipeline.input_buffers - 1):
+            with self._when(w, f"{cursor}[1, 0] < {tiles}", f"_first_inputs{step}"):
+                w(f"{self._targets(tile, ph, '_', kb, first, '_', empty)} = {self.n_step}(1)")
+                for phase, ops in self._by_phase(streamed).items():
+                    with self._when(w, self._runs(ph, phase, empty), f"_first_phase{phase}"):
+                        for op in ops:
+                            w(f"{self.copy_fns[op.name]}({self.n_blocks}({tile}), {kb}, {step}).start()")
+                w(f"{self.n_advance}(1)")
 
     def _iteration_slot(self, op: Operand, tile: str, rb: str) -> str:
         """The slot of an operand fetched once per repeat loop iteration: its iterations, counted over tiles,
@@ -817,7 +917,8 @@ class _Generator:
 
     def _may_be_empty(self, phase: int | None) -> bool:
         """Can a step of `phase` be empty? Only a masked phase's, in a schedule that has empty steps."""
-        return self.schedule.empty and phase is not None and self.plan.phases[phase].range.mask is not None
+        r = self.plan.phases[phase].range if phase is not None else None
+        return self.schedule.empty and r is not None and (r.mask is not None or r.bounds is not None)
 
     def _targets(self, tile: str, ph: str, rb: str, kb: str, first: str, last: str, empty: str) -> str:
         """The names to unpack a decoded step into (the iteration and emptiness only where steps have them)."""
@@ -850,12 +951,15 @@ class _Generator:
             tile_first = self._ends(0, ph, first, last=False)
             tile_last = self._ends(phases - 1, ph, last, last=True)
         w("")
-        w(f"@pl.loop(0, {steps})")
-        with w.block(f"def {self.local('_steps')}({s}):"):
+        body = self.local("_steps")
+        if not self.cursor:
+            w(f"@pl.loop(0, {steps})")
+        with w.block(f"def {body}({s}):"):
             if self.single:
                 w(f"{tile}, {kb} = {s}, 0")
             else:
-                w(f"{self._targets(tile, ph, self.n_rb, kb, first, last, empty)} = {self.n_step}({s})")
+                at_step = "0" if self.cursor else s
+                w(f"{self._targets(tile, ph, self.n_rb, kb, first, last, empty)} = {self.n_step}({at_step})")
             w(f"{at} = {self.n_blocks}({tile})")
 
             streamed = [op for op in plan.operands if op.kind is Kind.STREAM]
@@ -864,7 +968,8 @@ class _Generator:
             if self.burst:
                 self._burst_start(w, streamed)
             elif streamed or iterated:
-                with self._when(w, f"{s} + {depth - 1} < {steps}", "_fetch_ahead"):
+                ahead_ok = f"{self.n_cursor}[1, 0] < {sch.tiles}" if self.cursor else f"{s} + {depth - 1} < {steps}"
+                with self._when(w, ahead_ok, "_fetch_ahead"):
                     ahead_tile, ahead_ph = self.local("ahead_tile"), self.local("ahead_ph")
                     ahead_kb, ahead_empty = self.local("ahead_kb"), self.local("ahead_empty")
                     ahead_rb, ahead_first = self.local("ahead_rb"), self.local("ahead_first")
@@ -873,7 +978,7 @@ class _Generator:
                     else:
                         first_ = ahead_first if iterated else "_"
                         targets = self._targets(ahead_tile, ahead_ph, ahead_rb, ahead_kb, first_, "_", ahead_empty)
-                        w(f"{targets} = {self.n_step}({s} + {depth - 1})")
+                        w(f"{targets} = {self.n_step}({'1' if self.cursor else f'{s} + {depth - 1}'})")
                     self._fetch_iterated(w, iterated, ahead_tile, ahead_ph, ahead_rb, ahead_first, ahead_empty)
                     ahead_slot = _int_expr(f"{s} + {depth - 1}", "%", depth)
                     for phase, ops in self._by_phase(streamed).items():
@@ -882,6 +987,8 @@ class _Generator:
                                 blocks = f"{self.n_blocks}({ahead_tile})"
                                 rb = self._rb(ahead_rb)
                                 w(f"{self.copy_fns[op.name]}({blocks}, {rb}{ahead_kb}, {ahead_slot}).start()")
+                    if self.cursor:
+                        w(f"{self.n_advance}(1)")
 
             per_tile = [op for op in plan.operands if op.kind is Kind.TILE]
             slots = {Kind.STREAM: _int_expr(s, "%", depth), Kind.TILE: _int_expr(tile, "%", TILE_SLOTS)}
@@ -935,12 +1042,16 @@ class _Generator:
 
             with self._region(w, COMPUTE):
                 self._tile_code(w, tile_first)
+            if self.cursor:
+                w(f"{self.n_advance}(0)", f"return {s} + 1")
             if self.burst:
                 last = (sch.steps - 1) // self.burst * self.burst  # the last burst's first step
                 with self._when(w, f"{s} >= {last}", "_last_burst"):  # (no reads left: its outputs go now)
                     slot = _int_expr(tile, "%", self.burst)
                     w(*[f"{self.copy_fns[out.name]}({at}, {slot}).start()" for out in plan.outputs])
                 self._burst_end(w, streamed)
+        if self.cursor:  # until the cursor has passed the last tile
+            w(f"jax.lax.while_loop(lambda _: {self.n_cursor}[0, 0] < {sch.tiles}, {body}, jnp.int32(0))")
 
     def _burst_start(self, w: _Writer, streamed: list[Operand]) -> None:
         """At a burst's first step: wait until the previous burst's outputs are out, then start fetching the
@@ -1041,7 +1152,8 @@ class _Generator:
         plan = self.plan
         used = self.value_reads
         names = [self.blk[r.var] for r in plan.parallel]
-        if any(r.var in used for r in plan.parallel):
+        runtime = any(phase.range.bounds is not None and phase.range.var in used for phase in plan.phases)
+        if runtime or any(r.var in used for r in plan.parallel):  # (a runtime range starts where its tile says)
             w(f"{_tuple(names)} = {self.n_at}")
         steps = [phase.range for phase in plan.phases]
         for r in plan.repeat_loops:  # a repeat loop of one iteration: its variable is a constant
@@ -1051,7 +1163,7 @@ class _Generator:
             if r.var not in used:
                 continue
             block = self.blk[r.var] if r in plan.parallel else self.n_kb if r in steps else self.n_rb
-            value = _scaled(block, r)
+            value = self._val(r, block, {q.var: self.blk[q.var] for q in plan.parallel})
             if r.count > 1:
                 value = f"{_WEAK}({value})"
             w(f"{r.var} = {value}")

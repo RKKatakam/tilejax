@@ -16,7 +16,8 @@ iteration's are fetched while this one's run.
 
 Inputs read element by element (`lengths[b]`) are index arrays, kept whole in SMEM: their elements are
 values in tile code, conditions in reduction masks (which the kernel then evaluates when it runs: runtime
-masks), and integer indices of tile reads (`w[expert[e], :, :]`: runtime windows) and of stores into an
+masks), bounds of reduction loops (`for p in range(pages[b])`: runtime ranges, whose steps the kernel finds
+as it runs), and integer indices of tile reads (`w[expert[e], :, :]`: runtime windows) and of stores into an
 output updated in place.
 
 An output allocated as an input (`new = pool`) is that input updated in place: the kernel writes the tiles
@@ -68,7 +69,9 @@ __all__ = [
 
 @dataclass(frozen=True)
 class Range:
-    """A loop's iterations: `start + block * step` for block in `range(count)`."""
+    """A loop's iterations: `start + block * step` for block in `range(count)`. A runtime range (its bounds
+    read index arrays, `range(pages[b])`) has `bounds`, its start and stop, read when the kernel runs: its
+    value at block k is start + k * step, and `count` (2) only says that it moves what it indexes."""
 
     var: str
     start: int
@@ -76,6 +79,7 @@ class Range:
     count: int
     mask: ast.expr | None  # `if mask: continue` opening the loop's body
     runtime: bool = False  # does the mask read index arrays (so it is evaluated when the kernel runs)?
+    bounds: tuple[ast.expr, ast.expr] | None = None  # a runtime range's start and stop
 
     def value(self, block: int) -> int:
         return self.start + block * self.step
@@ -259,6 +263,11 @@ class Plan:
         """Do masks read index arrays, so the kernel's steps are found when it runs?"""
         return any(phase.range.runtime for phase in self.phases)
 
+    @property
+    def cursor(self) -> bool:
+        """Does a reduction loop have runtime bounds, so the kernel finds each step as it runs?"""
+        return any(phase.range.bounds is not None for phase in self.phases)
+
     def eval(self, node: ast.expr, values: Mapping[str, Any] | None = None) -> Any:
         """Evaluate an expression of the function on the prologue's names (and `values`, e.g. loop values)."""
         return evaluate(self.nest, self.env, node, values)
@@ -318,6 +327,8 @@ class _Planner:
         operands, reads_ = self._operands(phases, segments, repeats)
         packed = self._packed(reads_)
         stored_by = {name: self._storing_phase(name, phases) for name in self.nest.outputs}
+        if any(phase.range.bounds is not None for phase in phases):
+            self._check_cursor(stored_by)
         output_tiles = {name: self._output_tile(name, *outputs[name], parallel) for name in self.nest.outputs}
         self._check_reads_before_assignment()
         sequence = _Sequence(phases, segments, repeats)
@@ -421,6 +432,8 @@ class _Planner:
     # ------------------------------------------------------------------ loops
 
     def _range(self, loop: Loop) -> Range:
+        if any(element_reads(b, self.indices) for b in loop.bounds):
+            return self._runtime_range(loop)
         bounds = [self.eval(b) for b in loop.bounds]
         if not all(isinstance(b, int | np.integer) for b in bounds):
             raise self.error(f"loop bounds are ints when planning, got {bounds}", loop.node)
@@ -438,6 +451,20 @@ class _Planner:
             raise self.error(f"`{loop.var}` loops over {r}: it must start at a multiple of its step", loop.node)
         runtime = loop.mask is not None and bool(element_reads(loop.mask, self.indices))
         return Range(loop.var, r.start, r.step, len(r), loop.mask, runtime)
+
+    def _runtime_range(self, loop: Loop) -> Range:
+        """A reduction loop whose bounds read index arrays: its start and stop are read when the kernel runs
+        (its step is an int when planning)."""
+        if loop not in self.nest.reductions:
+            raise self.error("only reduction loops' bounds may read index arrays", loop.node)
+        if loop.mask is not None:
+            raise self.error("a loop with runtime bounds can't be masked: put the condition in its bounds", loop.mask)
+        start, stop, step = (ast.Constant(0), loop.bounds[0], 1) if len(loop.bounds) == 1 else (*loop.bounds[:2], None)
+        if step is None:
+            step = self.eval(loop.bounds[2]) if len(loop.bounds) == 3 else 1
+        if not isinstance(step, int | np.integer) or step <= 0:
+            raise self.error(f"a loop with runtime bounds steps by a positive int, not {step!r}", loop.node)
+        return Range(loop.var, 0, int(step), 2, None, bounds=(start, stop))  # type: ignore[arg-type]
 
     # ------------------------------------------------------------------ tiles
 
@@ -487,6 +514,8 @@ class _Planner:
             raise self.error(f"{text}: a slice takes at least one element", node)
         first = window.offset
         last = window.offset + (window.size or 1)
+        if window.loop and self.ranges[window.loop].bounds is not None:
+            return window  # moved by a runtime range: clamped to the dim when the kernel runs
         if window.loop:
             r = self.ranges[window.loop]
             first += r.start
@@ -683,6 +712,7 @@ class _Planner:
         indexed by loop variables and constants."""
         nest, params = self.nest, set(self.nest.params)
         trees: list[ast.AST] = [*nest.tile, *(loop.mask for loop in nest.reductions if loop.mask is not None)]
+        trees += [bound for loop in nest.reductions for bound in loop.bounds]
         elements = [n for tree in trees for n in element_reads(tree, params)]
         found = []
         for p, name in enumerate(nest.params):
@@ -727,11 +757,14 @@ class _Planner:
         evaluating each index at every value of the loops it reads (index arrays are in SMEM, unchecked)."""
         nest = self.nest
         trees: list[ast.AST] = [*nest.tile, *(loop.mask for loop in nest.reductions if loop.mask is not None)]
+        trees += [bound for loop in nest.reductions for bound in loop.bounds]
         for node in (n for tree in trees for n in element_reads(tree, self.indices)):
             index = self.indices[node.value.id]  # type: ignore[attr-defined]
             dims = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
             for expr, dim in zip(dims, index.shape, strict=True):
                 loops = [self.ranges[v] for v in sorted(reads(expr) & self.ranges.keys())]
+                if any(r.bounds is not None for r in loops):
+                    continue  # a runtime range's values are known when the kernel runs: it clamps them
                 for values in itertools.product(*(range(r.count) for r in loops)):
                     at = {r.var: r.value(b) for r, b in zip(loops, values, strict=True)}
                     value = evaluate(nest, self.env, expr, at)
@@ -742,6 +775,17 @@ class _Planner:
                             + (f" at {where}" if where else ""),
                             node,
                         )
+
+    def _check_cursor(self, stored_by: dict[str, int | None]) -> None:
+        """A kernel with runtime ranges finds its steps as it runs, from the bounds alone: its reduction loops
+        have no masks, there are no repeat loops, and outputs are stored per tile."""
+        node = next(loop.node for loop in self.nest.reductions if self.ranges[loop.var].bounds is not None)
+        if any(r.mask is not None for r in self.ranges.values() if r.var in {lp.var for lp in self.nest.reductions}):
+            raise self.error("a kernel with runtime loop bounds can't mask its reduction loops", node)
+        if self.nest.repeats:
+            raise self.error("a kernel with runtime loop bounds can't have repeat loops", node)
+        if any(phase is not None for phase in stored_by.values()):
+            raise self.error("a kernel with runtime loop bounds stores its outputs per tile", node)
 
     def _storing_phase(self, name: str, phases: tuple[Phase, ...]) -> int | None:
         """The phase whose steps store a tile of output `name` each, if a reduction loop's body stores it."""
@@ -832,6 +876,7 @@ class _Planner:
         nest = self.nest
         own = assigned(nest.tile) | {r.var for r in nest.loops} | set(nest.params) | set(nest.outputs)
         masks = [r.mask for r in self.ranges.values() if r.runtime]  # evaluated in the generated source
+        masks += [b for r in self.ranges.values() if r.bounds for b in r.bounds]  # (and runtime bounds)
         names = set().union(*(reads(stmt) for stmt in flatten(nest.tile)), *(reads(m) for m in masks)) - own
         # (`autokernel.pairs` becomes a read of the VMEM buffer: the kernel needs neither it nor autokernel.)
         names = {n for n in names if n in self.env and not _is_autokernel(self.env[n])}
