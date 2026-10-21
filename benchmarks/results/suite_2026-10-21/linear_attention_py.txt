@@ -1,0 +1,178 @@
+# TPU v5e (Colab), 2026-10-21, commit 080fc71: python benchmarks/linear_attention.py  [interrupted]
+gated_delta_rule: B=1 H=16 S=2048 head dim 128: ms
+  recurrence, lax.scan over tokens       5.219
+  chunked, plain JAX                     0.445
+  autokernel fused, tuned                0.162   (kernel 0.152)
+    chose DeltaTiles(heads=8, block=256), 3 input / 2 output buffers
+       DeltaTiles(heads=4, block=256), 3 input / 2 output buffers                    168.2 us  compute
+     * DeltaTiles(heads=8, block=256), 3 input / 2 output buffers                    151.9 us  compute
+       DeltaTiles(heads=16, block=256), 3 input / 2 output buffers                   157.8 us  compute
+       DeltaTiles(heads=8, block=512), 3 input / 2 output buffers                    154.2 us  compute
+       DeltaTiles(heads=8, block=128), 3 input / 2 output buffers                    159.3 us  compute
+  autokernel split, tuned                0.223   (chunks 0.130 + scan 0.074, other 0.020)
+    chose ChunkTiles(chunks=16), 3 input / 2 output buffers
+       ChunkTiles(chunks=8), 3 input / 2 output buffers                              137.2 us  compute
+     * ChunkTiles(chunks=16), 3 input / 2 output buffers                             129.8 us  compute
+    chose DeltaTiles(heads=16, block=256), 3 input / 2 output buffers
+       DeltaTiles(heads=8, block=256), 3 input / 2 output buffers                     76.6 us  dma
+       DeltaTiles(heads=8, block=256), 4 input / 2 output buffers                     76.6 us  dma
+     * DeltaTiles(heads=16, block=256), 3 input / 2 output buffers                    73.7 us  dma
+       DeltaTiles(heads=16, block=256), 4 input / 2 output buffers                    73.8 us  dma
+       DeltaTiles(heads=16, block=512), 3 input / 2 output buffers                    76.2 us  dma
+  fused: speedup 2.74x over chunked JAX, 32.2x over the recurrence; max |autokernel - chunked JAX| 0.0002 (outputs up to 0.094)
+  split: speedup 1.99x over chunked JAX, 23.4x over the recurrence; max |autokernel - chunked JAX| 0.0000 (outputs up to 0.094)
+gated_delta_rule: B=1 H=16 S=4096 head dim 128: ms
+  recurrence, lax.scan over tokens      11.078
+  chunked, plain JAX                     1.041
+  autokernel fused, tuned                0.313   (kernel 0.300)
+    chose DeltaTiles(heads=8, block=256), 3 input / 2 output buffers
+       DeltaTiles(heads=4, block=256), 3 input / 2 output buffers                    334.1 us  compute
+     * DeltaTiles(heads=8, block=256), 3 input / 2 output buffers                    300.2 us  compute
+       DeltaTiles(heads=16, block=256), 3 input / 2 output buffers                   309.4 us  compute
+       DeltaTiles(heads=8, block=512), 3 input / 2 output buffers                    301.6 us  compute
+       DeltaTiles(heads=8, block=128), 3 input / 2 output buffers                    316.6 us  compute
+  autokernel split, tuned                0.420   (chunks 0.253 + scan 0.144, other 0.024)
+    chose ChunkTiles(chunks=16), 3 input / 2 output buffers
+       ChunkTiles(chunks=8), 3 input / 2 output buffers                              270.6 us  compute
+     * ChunkTiles(chunks=16), 3 input / 2 output buffers                             252.8 us  compute
+    chose DeltaTiles(heads=16, block=256), 3 input / 2 output buffers
+       DeltaTiles(heads=8, block=256), 3 input / 2 output buffers                    151.0 us  dma
+       DeltaTiles(heads=8, block=256), 4 input / 2 output buffers                    150.9 us  dma
+     * DeltaTiles(heads=16, block=256), 3 input / 2 output buffers                   143.8 us  dma
+       DeltaTiles(heads=16, block=256), 4 input / 2 output buffers                   143.8 us  dma
+       DeltaTiles(heads=16, block=512), 3 input / 2 output buffers                   146.1 us  dma
+  fused: speedup 3.32x over chunked JAX, 35.4x over the recurrence; max |autokernel - chunked JAX| 0.0002 (outputs up to 0.097)
+  split: speedup 2.48x over chunked JAX, 26.4x over the recurrence; max |autokernel - chunked JAX| 0.0000 (outputs up to 0.097)
+gated_delta_rule: B=1 H=16 S=8192 head dim 128: ms
+  recurrence, lax.scan over tokens      26.805
+  chunked, plain JAX                     3.904
+  autokernel fused, tuned                0.609   (kernel 0.597)
+    chose DeltaTiles(heads=8, block=256), 3 input / 2 output buffers
+       DeltaTiles(heads=4, block=256), 3 input / 2 output buffers                    665.9 us  compute
+     * DeltaTiles(heads=8, block=256), 3 input / 2 output buffers                    596.5 us  compute
+       DeltaTiles(heads=16, block=256), 3 input / 2 output buffers                   612.3 us  compute
+       DeltaTiles(heads=8, block=512), 3 input / 2 output buffers                    596.5 us  compute
+       DeltaTiles(heads=8, block=128), 3 input / 2 output buffers                    630.7 us  compute
+  autokernel split, tuned                0.808   (chunks 0.499 + scan 0.284, other 0.025)
+    chose ChunkTiles(chunks=16), 3 input / 2 output buffers
+       ChunkTiles(chunks=8), 3 input / 2 output buffers                              537.7 us  compute
+     * ChunkTiles(chunks=16), 3 input / 2 output buffers                             498.7 us  compute
+    chose DeltaTiles(heads=16, block=256), 3 input / 2 output buffers
+       DeltaTiles(heads=8, block=256), 3 input / 2 output buffers                    299.3 us  dma
+       DeltaTiles(heads=8, block=256), 4 input / 2 output buffers                    299.1 us  dma
+     * DeltaTiles(heads=16, block=256), 3 input / 2 output buffers                   284.0 us  dma
+       DeltaTiles(heads=16, block=256), 4 input / 2 output buffers                   283.9 us  dma
+       DeltaTiles(heads=16, block=512), 3 input / 2 output buffers                   285.7 us  dma
+  fused: speedup 6.41x over chunked JAX, 44.0x over the recurrence; max |autokernel - chunked JAX| 0.0002 (outputs up to 0.116)
+  split: speedup 4.83x over chunked JAX, 33.2x over the recurrence; max |autokernel - chunked JAX| 0.0000 (outputs up to 0.116)
+gated_delta_rule: B=2 H=32 S=2048 head dim 128: ms
+  recurrence, lax.scan over tokens      22.014
+  chunked, plain JAX                     3.509
+  autokernel fused, tuned                0.613   (kernel 0.601)
+    chose DeltaTiles(heads=8, block=256), 3 input / 2 output buffers
+       DeltaTiles(heads=4, block=256), 3 input / 2 output buffers                    677.0 us  compute
+     * DeltaTiles(heads=8, block=256), 3 input / 2 output buffers                    601.3 us  compute
+       DeltaTiles(heads=16, block=256), 3 input / 2 output buffers                   618.6 us  compute
+       DeltaTiles(heads=8, block=512), 3 input / 2 output buffers                    601.1 us  compute
+       DeltaTiles(heads=8, block=128), 3 input / 2 output buffers                    635.8 us  compute
+  autokernel split, tuned                0.825   (chunks 0.500 + scan 0.287, other 0.039)
+    chose ChunkTiles(chunks=16), 3 input / 2 output buffers
+       ChunkTiles(chunks=8), 3 input / 2 output buffers                              540.7 us  compute
+     * ChunkTiles(chunks=16), 3 input / 2 output buffers                             499.8 us  compute
+    chose DeltaTiles(heads=16, block=256), 3 input / 2 output buffers
+       DeltaTiles(heads=8, block=256), 3 input / 2 output buffers                    295.3 us  dma
+       DeltaTiles(heads=8, block=256), 4 input / 2 output buffers                    295.2 us  dma
+     * DeltaTiles(heads=16, block=256), 3 input / 2 output buffers                   286.6 us  dma
+       DeltaTiles(heads=16, block=256), 4 input / 2 output buffers                   286.6 us  dma
+       DeltaTiles(heads=16, block=512), 3 input / 2 output buffers                   287.5 us  dma
+  fused: speedup 5.73x over chunked JAX, 35.9x over the recurrence; max |autokernel - chunked JAX| 0.0002 (outputs up to 0.103)
+  split: speedup 4.25x over chunked JAX, 26.7x over the recurrence; max |autokernel - chunked JAX| 0.0000 (outputs up to 0.103)
+gated_delta_rule: B=4 H=16 S=2048 head dim 128: ms
+  recurrence, lax.scan over tokens      19.531
+  chunked, plain JAX                     3.488
+  autokernel fused, tuned                0.610   (kernel 0.599)
+    chose DeltaTiles(heads=8, block=256), 3 input / 2 output buffers
+       DeltaTiles(heads=4, block=256), 3 input / 2 output buffers                    670.2 us  compute
+     * DeltaTiles(heads=8, block=256), 3 input / 2 output buffers                    599.0 us  compute
+       DeltaTiles(heads=16, block=256), 3 input / 2 output buffers                   613.7 us  compute
+       DeltaTiles(heads=8, block=512), 3 input / 2 output buffers                    597.8 us  compute
+       DeltaTiles(heads=8, block=128), 3 input / 2 output buffers                    635.1 us  compute
+  autokernel split, tuned                0.827   (chunks 0.500 + scan 0.284, other 0.043)
+    chose ChunkTiles(chunks=16), 3 input / 2 output buffers
+       ChunkTiles(chunks=8), 3 input / 2 output buffers                              540.8 us  compute
+     * ChunkTiles(chunks=16), 3 input / 2 output buffers                             500.0 us  compute
+    chose DeltaTiles(heads=16, block=256), 3 input / 2 output buffers
+       DeltaTiles(heads=8, block=256), 3 input / 2 output buffers                    296.9 us  dma
+       DeltaTiles(heads=8, block=256), 4 input / 2 output buffers                    296.8 us  dma
+     * DeltaTiles(heads=16, block=256), 3 input / 2 output buffers                   283.9 us  dma
+       DeltaTiles(heads=16, block=256), 4 input / 2 output buffers                   283.9 us  dma
+       DeltaTiles(heads=16, block=512), 3 input / 2 output buffers                   285.7 us  dma
+  fused: speedup 5.71x over chunked JAX, 32.0x over the recurrence; max |autokernel - chunked JAX| 0.0002 (outputs up to 0.109)
+  split: speedup 4.22x over chunked JAX, 23.6x over the recurrence; max |autokernel - chunked JAX| 0.0000 (outputs up to 0.109)
+kimi_delta_attention: B=1 H=16 S=2048 head dim 128: ms
+  recurrence, lax.scan over tokens       7.210
+  chunked, plain JAX                     0.708
+  autokernel fused, tuned                0.195   (kernel 0.182)
+    chose DeltaTiles(heads=8, block=256), 3 input / 2 output buffers
+       DeltaTiles(heads=4, block=256), 3 input / 2 output buffers                    187.2 us  compute
+     * DeltaTiles(heads=8, block=256), 3 input / 2 output buffers                    182.1 us  compute
+       DeltaTiles(heads=16, block=256), 3 input / 2 output buffers                   185.4 us  compute
+       DeltaTiles(heads=8, block=512), 3 input / 2 output buffers                    186.7 us  compute
+       DeltaTiles(heads=8, block=128), 3 input / 2 output buffers                    182.7 us  compute
+  autokernel split, tuned                0.247   (chunks 0.160 + scan 0.074, other 0.014)
+    chose ChunkTiles(chunks=16), 3 input / 2 output buffers
+       ChunkTiles(chunks=8), 3 input / 2 output buffers                              162.2 us  compute
+     * ChunkTiles(chunks=16), 3 input / 2 output buffers                             160.1 us  compute
+    chose DeltaTiles(heads=16, block=256), 3 input / 2 output buffers
+       DeltaTiles(heads=8, block=256), 3 input / 2 output buffers                     76.6 us  dma
+       DeltaTiles(heads=8, block=256), 4 input / 2 output buffers                     76.6 us  dma
+     * DeltaTiles(heads=16, block=256), 3 input / 2 output buffers                    73.7 us  dma
+       DeltaTiles(heads=16, block=256), 4 input / 2 output buffers                    73.8 us  dma
+       DeltaTiles(heads=16, block=512), 3 input / 2 output buffers                    76.2 us  dma
+  fused: speedup 3.64x over chunked JAX, 37.0x over the recurrence; max |autokernel - chunked JAX| 0.0002 (outputs up to 0.071)
+  split: speedup 2.86x over chunked JAX, 29.2x over the recurrence; max |autokernel - chunked JAX| 0.0002 (outputs up to 0.071)
+kimi_delta_attention: B=1 H=16 S=4096 head dim 128: ms
+  recurrence, lax.scan over tokens      16.524
+  chunked, plain JAX                     2.320
+  autokernel fused, tuned                0.370   (kernel 0.359)
+    chose DeltaTiles(heads=8, block=256), 3 input / 2 output buffers
+       DeltaTiles(heads=4, block=256), 3 input / 2 output buffers                    371.2 us  compute
+     * DeltaTiles(heads=8, block=256), 3 input / 2 output buffers                    358.9 us  compute
+       DeltaTiles(heads=16, block=256), 3 input / 2 output buffers                   361.8 us  compute
+       DeltaTiles(heads=8, block=512), 3 input / 2 output buffers                    364.2 us  compute
+       DeltaTiles(heads=8, block=128), 3 input / 2 output buffers                    362.0 us  compute
+  autokernel split, tuned                0.474   (chunks 0.312 + scan 0.144, other 0.018)
+    chose ChunkTiles(chunks=16), 3 input / 2 output buffers
+       ChunkTiles(chunks=8), 3 input / 2 output buffers                              320.1 us  compute
+     * ChunkTiles(chunks=16), 3 input / 2 output buffers                             312.4 us  compute
+    chose DeltaTiles(heads=16, block=256), 3 input / 2 output buffers
+       DeltaTiles(heads=8, block=256), 3 input / 2 output buffers                    151.0 us  dma
+       DeltaTiles(heads=8, block=256), 4 input / 2 output buffers                    150.9 us  dma
+     * DeltaTiles(heads=16, block=256), 3 input / 2 output buffers                   143.8 us  dma
+       DeltaTiles(heads=16, block=256), 4 input / 2 output buffers                   143.8 us  dma
+       DeltaTiles(heads=16, block=512), 3 input / 2 output buffers                   146.1 us  dma
+  fused: speedup 6.28x over chunked JAX, 44.7x over the recurrence; max |autokernel - chunked JAX| 0.0002 (outputs up to 0.079)
+  split: speedup 4.90x over chunked JAX, 34.9x over the recurrence; max |autokernel - chunked JAX| 0.0002 (outputs up to 0.079)
+kimi_delta_attention: B=1 H=16 S=8192 head dim 128: ms
+  recurrence, lax.scan over tokens      37.361
+  chunked, plain JAX                     6.839
+  autokernel fused, tuned                0.725   (kernel 0.712)
+    chose DeltaTiles(heads=8, block=256), 3 input / 2 output buffers
+       DeltaTiles(heads=4, block=256), 3 input / 2 output buffers                    739.4 us  compute
+     * DeltaTiles(heads=8, block=256), 3 input / 2 output buffers                    712.5 us  compute
+       DeltaTiles(heads=16, block=256), 3 input / 2 output buffers                   714.3 us  compute
+       DeltaTiles(heads=8, block=512), 3 input / 2 output buffers                    718.5 us  compute
+       DeltaTiles(heads=8, block=128), 3 input / 2 output buffers                    720.9 us  compute
+  autokernel split, tuned                0.921   (chunks 0.617 + scan 0.284, other 0.020)
+    chose ChunkTiles(chunks=16), 3 input / 2 output buffers
+       ChunkTiles(chunks=8), 3 input / 2 output buffers                              635.9 us  compute
+     * ChunkTiles(chunks=16), 3 input / 2 output buffers                             616.9 us  compute
+    chose DeltaTiles(heads=16, block=256), 3 input / 2 output buffers
+       DeltaTiles(heads=8, block=256), 3 input / 2 output buffers                    299.3 us  dma
+       DeltaTiles(heads=8, block=256), 4 input / 2 output buffers                    299.1 us  dma
+     * DeltaTiles(heads=16, block=256), 3 input / 2 output buffers                   284.0 us  dma
+       DeltaTiles(heads=16, block=256), 4 input / 2 output buffers                   283.9 us  dma
+       DeltaTiles(heads=16, block=512), 3 input / 2 output buffers                   285.7 us  dma
+  fused: speedup 9.43x over chunked JAX, 51.5x over the recurrence; max |autokernel - chunked JAX| 0.0005 (outputs up to 0.091)
+  split: speedup 7.42x over chunked JAX, 40.6x over the recurrence; max |autokernel - chunked JAX| 0.0005 (outputs up to 0.091)
+kimi_delta_attention: B=2 H=32 S=2048 head dim 128: ms

@@ -1,0 +1,70 @@
+# TPU v5e (Colab), 2026-10-21, commit 080fc71: python benchmarks/qwen3.py  [complete]
+Config(layers=4, d_model=1024, heads=16, kv_heads=8, head_dim=128, ffn=3072, vocab=32768, rope_theta=1000000.0, qk_norm=True, window=None, gated=False, rotary_fraction=1.0), batch 4, seq 2048: ms (TFLOP/s)
+  plain JAX (separate qkv) + splash mqa (default blocks)    43.109  (  43.0)
+  plain JAX (separate qkv) + splash mqa (1024 x 1024)    18.459  ( 100.5)
+  autokernel, tuned                                           10.937  ( 169.7)
+  speedup 3.94x / 1.69x; max |logits - baseline| 0.0508 (logits up to 6.06)
+  one layer: baseline 3.059 ms (106.7), autokernel 2.015 ms (162.0): 1.52x
+    qkv:       ProjectionTiles(rows=512, block_d=1024), 3 input / 2 output buffers  0.378 ms
+    layer (split): fused LayerTiles(block_q=512, block_kv=512, block_o=512, block_f=512), 4 input / 2 output buffers  1.618 ms
+      split: attention AttentionTiles(block_q=512, block_kv=256, block_o=2048), 3 input / 2 output buffers  0.735 ms
+             ffn       FfnTiles(rows=1024, block_f=512), 3 input / 2 output buffers  0.830 ms
+Config(layers=4, d_model=2048, heads=16, kv_heads=8, head_dim=128, ffn=6144, vocab=32768, rope_theta=1000000.0, qk_norm=True, window=None, gated=False, rotary_fraction=1.0), batch 2, seq 2048: ms (TFLOP/s)
+  plain JAX (fused qkv) + splash mha (default blocks)    24.735  (  94.5)
+  plain JAX (fused qkv) + splash mha (  512 x 512)    16.431  ( 142.2)
+  autokernel, tuned                                           13.627  ( 171.5)
+  speedup 1.82x / 1.21x; max |logits - baseline| 0.0488 (logits up to 5.97)
+  one layer: baseline 3.694 ms (120.9), autokernel 2.672 ms (167.2): 1.38x
+    qkv:       ProjectionTiles(rows=512, block_d=512), 3 input / 2 output buffers  0.452 ms
+    layer (fused): fused LayerTiles(block_q=512, block_kv=512, block_o=512, block_f=512), 3 input / 2 output buffers  2.126 ms
+      split: attention AttentionTiles(block_q=512, block_kv=512, block_o=512), 3 input / 2 output buffers  0.487 ms
+             ffn       FfnTiles(rows=512, block_f=512), 3 input / 2 output buffers  1.642 ms
+Config(layers=2, d_model=2560, heads=32, kv_heads=8, head_dim=128, ffn=9728, vocab=32768, rope_theta=1000000.0, qk_norm=True, window=None, gated=False, rotary_fraction=1.0), batch 2, seq 2048: ms (TFLOP/s)
+  plain JAX (separate qkv) + splash mqa (default blocks)    28.626  (  86.6)
+  plain JAX (separate qkv) + splash mqa (  512 x 512)    18.858  ( 131.4)
+  autokernel, tuned                                           14.066  ( 176.2)
+  speedup 2.04x / 1.34x; max |logits - baseline| 0.0469 (logits up to 6.00)
+  one layer: baseline 7.705 ms (116.2), autokernel 5.108 ms (175.3): 1.51x
+    qkv:       ProjectionTiles(rows=512, block_d=512), 3 input / 2 output buffers  0.821 ms
+    layer (split): fused LayerTiles(block_q=256, block_kv=256, block_o=1024, block_f=512), 3 input / 2 output buffers  4.264 ms
+      split: attention AttentionTiles(block_q=256, block_kv=256, block_o=1024), 3 input / 2 output buffers  0.986 ms
+             ffn       FfnTiles(rows=512, block_f=512), 3 input / 2 output buffers  3.215 ms
+Config(layers=2, d_model=4096, heads=32, kv_heads=8, head_dim=128, ffn=12288, vocab=32768, rope_theta=1000000.0, qk_norm=True, window=None, gated=False, rotary_fraction=1.0), batch 1, seq 4096: ms (TFLOP/s)
+  plain JAX (separate qkv) + splash mha (default blocks)    50.331  (  90.1)
+  plain JAX (separate qkv) + splash mha (1024 x 1024)    30.154  ( 150.4)
+  autokernel, tuned                                           24.759  ( 183.2)
+  speedup 2.03x / 1.22x; max |logits - baseline| 0.0391 (logits up to 5.91)
+  one layer: baseline 12.520 ms (137.2), autokernel 9.377 ms (183.2): 1.34x
+    qkv:       ProjectionTiles(rows=512, block_d=512), 3 input / 2 output buffers  1.212 ms
+    layer (split): fused LayerTiles(block_q=256, block_kv=512, block_o=512, block_f=512), 3 input / 2 output buffers  8.250 ms
+      split: attention AttentionTiles(block_q=256, block_kv=256, block_o=512), 3 input / 2 output buffers  1.658 ms
+             ffn       FfnTiles(rows=512, block_f=512), 3 input / 2 output buffers  6.407 ms
+Config(layers=4, d_model=2048, heads=16, kv_heads=8, head_dim=128, ffn=6144, vocab=32768, rope_theta=1000000.0, qk_norm=True, window=1024, gated=False, rotary_fraction=1.0), batch 1, seq 4096: ms (TFLOP/s)
+  plain JAX (fused qkv) + splash mha (default blocks)    21.069  ( 110.1)
+  plain JAX (fused qkv) + splash mha (  512 x 512)    14.825  ( 156.4)
+  autokernel, tuned                                           13.465  ( 172.3)
+  speedup 1.56x / 1.10x; max |logits - baseline| 0.0508 (logits up to 5.88)
+  one layer: baseline 3.065 ms (144.3), autokernel 2.630 ms (168.2): 1.17x
+    qkv:       ProjectionTiles(rows=512, block_d=512), 3 input / 2 output buffers  0.446 ms
+    layer (split): fused LayerTiles(block_q=512, block_kv=512, block_o=512, block_f=512), 3 input / 2 output buffers  2.133 ms
+      split: attention AttentionTiles(block_q=256, block_kv=256, block_o=2048), 3 input / 2 output buffers  0.457 ms
+             ffn       FfnTiles(rows=512, block_f=512), 3 input / 2 output buffers  1.642 ms
+Config(layers=4, d_model=2048, heads=16, kv_heads=4, head_dim=128, ffn=6144, vocab=32768, rope_theta=1000000.0, qk_norm=True, window=None, gated=True, rotary_fraction=0.25), batch 2, seq 2048: ms (TFLOP/s)
+  plain JAX (separate qkv) + splash mqa (default blocks)    23.588  ( 102.0)
+  plain JAX (separate qkv) + splash mqa (  512 x 512)    15.149  ( 158.8)
+  autokernel, tuned                                           14.087  ( 170.7)
+  speedup 1.67x / 1.08x; max |logits - baseline| 0.0469 (logits up to 5.91)
+  one layer: baseline 3.090 ms (150.1), autokernel 2.775 ms (167.1): 1.11x
+    qkv:       ProjectionTiles(rows=512, block_d=512), 3 input / 2 output buffers  0.582 ms
+    layer (split): fused LayerTiles(block_q=512, block_kv=512, block_o=512, block_f=512), 3 input / 2 output buffers  2.141 ms
+      split: attention AttentionTiles(block_q=512, block_kv=256, block_o=512), 3 input / 2 output buffers  0.489 ms
+             ffn       FfnTiles(rows=512, block_f=512), 3 input / 2 output buffers  1.642 ms
+
+layers d_model heads kv ffn   window gated batch seq   splash default  splash best  autokernel  vs default  vs best  layer: splash  autokernel  speedup  max|diff|
+4      1024    16    8  3072  -      no    4     2048          43.109       18.459      10.937       3.94x    1.69x          3.059       2.015    1.52x     0.0508
+4      2048    16    8  6144  -      no    2     2048          24.735       16.431      13.627       1.82x    1.21x          3.694       2.672    1.38x     0.0488
+2      2560    32    8  9728  -      no    2     2048          28.626       18.858      14.066       2.04x    1.34x          7.705       5.108    1.51x     0.0469
+2      4096    32    8  12288 -      no    1     4096          50.331       30.154      24.759       2.03x    1.22x         12.520       9.377    1.34x     0.0391
+4      2048    16    8  6144  1024   no    1     4096          21.069       14.825      13.465       1.56x    1.10x          3.065       2.630    1.17x     0.0508
+4      2048    16    4  6144  -      yes   2     2048          23.588       15.149      14.087       1.67x    1.08x          3.090       2.775    1.11x     0.0469
+[exit 0]

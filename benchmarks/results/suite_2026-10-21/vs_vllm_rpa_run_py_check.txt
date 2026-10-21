@@ -1,0 +1,519 @@
+# TPU v5e (Colab), 2026-10-21, commit 080fc71: python benchmarks/vs_vllm_rpa/run.py --check  [killed/failed]
+jax 0.11.2 on TPU v5 lite; methods ['vllm', 'vllm-prefill', 'autokernel']
+decode1_512: 1 sequences, 1 tokens, 3.1 MB of cache
+  vllm         out vs f64 0.00276  cache vs f64 0
+/usr/local/lib/python3.13/dist-packages/jax/_src/interpreters/mlir.py:1453: UserWarning: Some donated buffers were not usable: bfloat16[16,8,128], bfloat16[16,8,128].
+See an explanation at https://docs.jax.dev/en/latest/faq.html#buffer-donation.
+    ops: RPAd-p_128-bq_1_1-bkv_4096_4096.1 10.9, %copy.11 1.2, %copy.6 0.6, %pad_maximum_fusion 0.5, %copy.7 0.5
+  vllm         wall     105.5 us  device      15.0 us   205.8 GB/s
+  decode: chose 3 input / 1 output buffers
+   * 3 input / 1 output buffers                                                      5.9 us  dma
+     4 input / 1 output buffers                                                      6.2 us  dma
+  prefill: chose PrefillTiles(pages=4), 3 input / 2 output buffers
+   * PrefillTiles(pages=4), 3 input / 2 output buffers                               0.5 us  None
+     PrefillTiles(pages=8), 2 input / 2 output buffers                               0.5 us  None
+     PrefillTiles(pages=2), 3 input / 2 output buffers                               0.6 us  None
+  autokernel   out vs f64 0.000608  cache vs f64 0
+    ops: rpa_decode.1.q_hbm 6.0, rpa_write.1.kv_cache_hbm 1.1, %gather_fusion 0.7, %gather_fusion.1 0.7, %gather_fusion.2 0.7
+  autokernel   wall     110.1 us  device      11.1 us   279.1 GB/s
+decode1_1024: 1 sequences, 1 tokens, 5.2 MB of cache
+  vllm         out vs f64 0.00144  cache vs f64 0
+    ops: RPAd-p_128-bq_1_1-bkv_4096_4096.1 13.6, %copy.11 1.1, %copy.6 0.6, %pad_maximum_fusion 0.5, %copy.7 0.5
+  vllm         wall      91.2 us  device      17.7 us   292.8 GB/s
+  decode: chose 3 input / 1 output buffers
+   * 3 input / 1 output buffers                                                      8.8 us  dma
+     4 input / 1 output buffers                                                      8.8 us  dma
+  prefill: chose PrefillTiles(pages=8), 2 input / 2 output buffers
+     PrefillTiles(pages=4), 3 input / 2 output buffers                               0.5 us  None
+   * PrefillTiles(pages=8), 2 input / 2 output buffers                               0.5 us  None
+     PrefillTiles(pages=4), 2 input / 2 output buffers                               0.5 us  None
+  autokernel   out vs f64 0.000565  cache vs f64 0
+    ops: rpa_decode.1.q_hbm 8.8, rpa_write.1.kv_cache_hbm 1.1, %fusion.17 0.7, %fusion.16 0.7, %gather_fusion.1 0.7
+  autokernel   wall      64.7 us  device      13.8 us   375.1 GB/s
+decode1_2048: 1 sequences, 1 tokens, 5.0 MB of cache
+  vllm         out vs f64 0.00145  cache vs f64 0
+    ops: RPAd-p_128-bq_1_1-bkv_4096_4096.1 13.3, %copy.11 1.2, %copy.6 0.6, %pad_maximum_fusion 0.5, %copy.7 0.5
+  vllm         wall      60.5 us  device      17.5 us   285.8 GB/s
+  decode: chose 3 input / 1 output buffers
+   * 3 input / 1 output buffers                                                      8.8 us  dma
+     4 input / 1 output buffers                                                      8.8 us  dma
+  prefill: chose PrefillTiles(pages=8), 2 input / 2 output buffers
+     PrefillTiles(pages=4), 3 input / 2 output buffers                               0.5 us  None
+   * PrefillTiles(pages=8), 2 input / 2 output buffers                               0.5 us  None
+     PrefillTiles(pages=4), 2 input / 2 output buffers                               0.5 us  None
+  autokernel   out vs f64 0.000508  cache vs f64 0
+    ops: rpa_decode.1.q_hbm 8.7, rpa_write.1.kv_cache_hbm 1.1, %gather_fusion 0.7, %gather_fusion.2 0.7, %gather_fusion.1 0.7
+  autokernel   wall      85.6 us  device      13.7 us   364.4 GB/s
+decode1_4096: 1 sequences, 1 tokens, 11.2 MB of cache
+  vllm         out vs f64 0.00107  cache vs f64 0
+    ops: RPAd-p_128-bq_1_1-bkv_4096_4096.1 21.5, %copy.11 1.1, %copy.6 0.7, %pad_maximum_fusion 0.5, %copy.7 0.5
+  vllm         wall      62.5 us  device      25.6 us   435.5 GB/s
+  decode: chose 4 input / 1 output buffers
+     3 input / 1 output buffers                                                     17.2 us  dma
+   * 4 input / 1 output buffers                                                     17.0 us  dma
+  prefill: chose PrefillTiles(pages=8), 2 input / 2 output buffers
+     PrefillTiles(pages=4), 3 input / 2 output buffers                               0.5 us  None
+   * PrefillTiles(pages=8), 2 input / 2 output buffers                               0.5 us  None
+     PrefillTiles(pages=4), 2 input / 2 output buffers                               0.5 us  None
+  autokernel   out vs f64 0.000331  cache vs f64 0
+    ops: rpa_decode.1.q_hbm 17.0, rpa_write.1.kv_cache_hbm 1.1, %gather_fusion 0.7, %gather_fusion.1 0.7, %gather_fusion.2 0.7
+  autokernel   wall      67.1 us  device      22.1 us   505.2 GB/s
+decode1_8192x: 1 sequences, 1 tokens, 33.6 MB of cache
+  vllm         out vs f64 0.00101  cache vs f64 0
+    ops: RPAd-p_128-bq_1_1-bkv_4096_4096.1 51.1, %copy.11 1.2, %copy.6 0.6, %pad_maximum_fusion 0.5, %copy.7 0.5
+  vllm         wall      75.6 us  device      55.2 us   607.7 GB/s
+  decode: chose 3 input / 1 output buffers
+   * 3 input / 1 output buffers                                                     46.2 us  dma
+     4 input / 1 output buffers                                                     46.2 us  dma
+  prefill: chose PrefillTiles(pages=8), 2 input / 2 output buffers
+     PrefillTiles(pages=4), 3 input / 2 output buffers                               0.5 us  None
+   * PrefillTiles(pages=8), 2 input / 2 output buffers                               0.5 us  None
+     PrefillTiles(pages=4), 2 input / 2 output buffers                               0.5 us  None
+  autokernel   out vs f64 0.000178  cache vs f64 0
+    ops: rpa_decode.1.q_hbm 46.2, rpa_write.1.kv_cache_hbm 1.1, %gather_fusion.2 0.7, %gather_fusion 0.7, %gather_fusion.1 0.7
+  autokernel   wall      75.9 us  device      51.3 us   654.5 GB/s
+decode8_512: 8 sequences, 8 tokens, 14.3 MB of cache
+  vllm         out vs f64 0.00347  cache vs f64 0
+    ops: RPAd-p_128-bq_1_1-bkv_4096_4096.1 51.5, %copy.11 1.2, %copy.6 0.6, %pad_maximum_fusion 0.5, %copy.7 0.5
+  vllm         wall      81.3 us  device      55.7 us   257.5 GB/s
+  decode: chose 3 input / 2 output buffers
+   * 3 input / 2 output buffers                                                     24.1 us  dma
+     4 input / 2 output buffers                                                     24.0 us  dma
+  prefill: chose PrefillTiles(pages=8), 2 input / 2 output buffers
+     PrefillTiles(pages=4), 3 input / 2 output buffers                               0.6 us  None
+   * PrefillTiles(pages=8), 2 input / 2 output buffers                               0.5 us  None
+     PrefillTiles(pages=4), 2 input / 2 output buffers                               0.5 us  None
+  autokernel   out vs f64 0.00123  cache vs f64 0
+    ops: rpa_decode.1.q_hbm 24.1, rpa_write.1.kv_cache_hbm 2.9, %fusion.9 1.0, rpa_prefill.1 0.9, %compare_select_fusion.17 0.8
+  autokernel   wall      71.2 us  device      37.8 us   379.1 GB/s
+decode8_1024: 8 sequences, 8 tokens, 35.9 MB of cache
+  vllm         out vs f64 0.00254  cache vs f64 0
+    ops: RPAd-p_128-bq_1_1-bkv_4096_4096.1 60.0, %copy.11 1.2, %copy.6 0.6, %pad_maximum_fusion 0.5, %copy.7 0.5
+  vllm         wall      99.8 us  device      64.1 us   560.4 GB/s
+  decode: chose 3 input / 2 output buffers
+   * 3 input / 2 output buffers                                                     50.8 us  dma
+     4 input / 2 output buffers                                                     50.9 us  dma
+  prefill: chose PrefillTiles(pages=8), 2 input / 2 output buffers
+     PrefillTiles(pages=4), 3 input / 2 output buffers                               0.6 us  None
+   * PrefillTiles(pages=8), 2 input / 2 output buffers                               0.5 us  None
+     PrefillTiles(pages=4), 2 input / 2 output buffers                               0.5 us  None
+  autokernel   out vs f64 0.000683  cache vs f64 0
+    ops: rpa_decode.1.q_hbm 50.8, rpa_write.1.kv_cache_hbm 2.9, %fusion.9 1.1, rpa_prefill.1 0.9, %compare_select_fusion.17 0.8
+  autokernel   wall      88.6 us  device      64.5 us   557.0 GB/s
+decode8_2048: 8 sequences, 8 tokens, 65.6 MB of cache
+  vllm         out vs f64 0.00178  cache vs f64 0
+    ops: RPAd-p_128-bq_1_1-bkv_4096_4096.1 94.4, %copy.11 1.1, %copy.6 0.6, %pad_maximum_fusion 0.5, %copy.7 0.5
+  vllm         wall     125.4 us  device      98.6 us   665.3 GB/s
+  decode: chose 3 input / 2 output buffers
+   * 3 input / 2 output buffers                                                     91.1 us  dma
+     4 input / 2 output buffers                                                     91.0 us  dma
+  prefill: chose PrefillTiles(pages=8), 2 input / 2 output buffers
+     PrefillTiles(pages=4), 3 input / 2 output buffers                               0.5 us  None
+   * PrefillTiles(pages=8), 2 input / 2 output buffers                               0.5 us  None
+     PrefillTiles(pages=4), 2 input / 2 output buffers                               0.5 us  None
+  autokernel   out vs f64 0.000576  cache vs f64 0
+    ops: rpa_decode.1.q_hbm 91.0, rpa_write.1.kv_cache_hbm 2.9, %fusion.9 1.0, rpa_prefill.1 0.8, %compare_select_fusion.17 0.8
+  autokernel   wall     132.6 us  device     104.5 us   627.8 GB/s
+decode8_4096: 8 sequences, 8 tokens, 118.0 MB of cache
+  vllm         out vs f64 0.00114  cache vs f64 0
+    ops: RPAd-p_128-bq_1_1-bkv_4096_4096.1 163.6, %copy.11 1.1, %copy.6 0.6, %pad_maximum_fusion 0.5, %copy.7 0.5
+  vllm         wall     194.7 us  device     167.6 us   703.7 GB/s
+  decode: chose 3 input / 2 output buffers
+   * 3 input / 2 output buffers                                                    159.6 us  dma
+     4 input / 2 output buffers                                                    159.6 us  dma
+  prefill: chose PrefillTiles(pages=4), 2 input / 2 output buffers
+     PrefillTiles(pages=4), 3 input / 2 output buffers                               0.5 us  None
+     PrefillTiles(pages=8), 2 input / 2 output buffers                               0.5 us  None
+   * PrefillTiles(pages=4), 2 input / 2 output buffers                               0.5 us  None
+     PrefillTiles(pages=2), 2 input / 2 output buffers                               0.5 us  None
+  autokernel   out vs f64 0.000467  cache vs f64 0
+    ops: rpa_decode.1.q_hbm 159.5, rpa_write.1.kv_cache_hbm 2.9, %fusion.9 1.1, rpa_prefill.1 0.8, %compare_select_fusion.17 0.8
+  autokernel   wall     197.7 us  device     173.1 us   681.5 GB/s
+decode8_8192x: 8 sequences, 8 tokens, 268.4 MB of cache
+  vllm         out vs f64 0.000775  cache vs f64 0
+    ops: RPAd-p_128-bq_1_1-bkv_4096_4096.1 361.4, %copy.11 1.1, %copy.6 0.6, %pad_maximum_fusion 0.5, %copy.7 0.5
+  vllm         wall     398.4 us  device     365.6 us   734.3 GB/s
+  decode: chose 3 input / 2 output buffers
+   * 3 input / 2 output buffers                                                    356.3 us  dma
+     4 input / 2 output buffers                                                    356.2 us  dma
+  prefill: chose PrefillTiles(pages=4), 3 input / 2 output buffers
+   * PrefillTiles(pages=4), 3 input / 2 output buffers                               0.5 us  None
+     PrefillTiles(pages=8), 2 input / 2 output buffers                               0.5 us  None
+     PrefillTiles(pages=2), 3 input / 2 output buffers                               0.6 us  None
+  autokernel   out vs f64 0.000272  cache vs f64 0
+    ops: rpa_decode.1.q_hbm 356.2, rpa_write.1.kv_cache_hbm 2.9, %fusion.9 1.1, rpa_prefill.1 0.9, %compare_select_fusion.17 0.8
+  autokernel   wall     402.6 us  device     370.0 us   725.6 GB/s
+decode32_512: 32 sequences, 32 tokens, 62.8 MB of cache
+  vllm         out vs f64 0.0103  cache vs f64 0
+/usr/local/lib/python3.13/dist-packages/jax/_src/interpreters/mlir.py:1453: UserWarning: Some donated buffers were not usable: bfloat16[32,8,128], bfloat16[32,8,128].
+See an explanation at https://docs.jax.dev/en/latest/faq.html#buffer-donation.
+    ops: RPAd-p_128-bq_1_1-bkv_4096_4096.1 197.8, %copy.11 1.7, %copy.6 0.9, %copy.7 0.7, %pad_maximum_fusion 0.5
+  vllm         wall     235.2 us  device     203.4 us   308.6 GB/s
+  decode: chose 3 input / 2 output buffers
+   * 3 input / 2 output buffers                                                     96.0 us  dma
+     4 input / 2 output buffers                                                     96.0 us  dma
+  prefill: chose PrefillTiles(pages=8), 2 input / 2 output buffers
+     PrefillTiles(pages=4), 3 input / 2 output buffers                               0.6 us  None
+   * PrefillTiles(pages=8), 2 input / 2 output buffers                               0.6 us  None
+     PrefillTiles(pages=4), 2 input / 2 output buffers                               0.7 us  None
+  autokernel   out vs f64 0.00127  cache vs f64 0
+    ops: rpa_decode.1.q_hbm 95.9, rpa_write.1.kv_cache_hbm 7.7, rpa_prefill.1 1.2, %fusion.9 1.1, %gather_fusion 0.9
+  autokernel   wall     141.5 us  device     116.6 us   538.4 GB/s
+decode32_1024: 32 sequences, 32 tokens, 127.7 MB of cache
+  vllm         out vs f64 0.00393  cache vs f64 0
+    ops: RPAd-p_128-bq_1_1-bkv_4096_4096.1 212.1, %copy.11 1.7, %copy.6 0.8, %copy.7 0.7, %pad_maximum_fusion 0.6
+  vllm         wall     252.6 us  device     217.5 us   587.1 GB/s
+  decode: chose 3 input / 2 output buffers
+   * 3 input / 2 output buffers                                                    181.5 us  dma
+     4 input / 2 output buffers                                                    181.4 us  dma
+  prefill: chose PrefillTiles(pages=8), 2 input / 2 output buffers
+     PrefillTiles(pages=4), 3 input / 2 output buffers                               0.7 us  None
+   * PrefillTiles(pages=8), 2 input / 2 output buffers                               0.7 us  None
+     PrefillTiles(pages=4), 2 input / 2 output buffers                               0.7 us  None
+  autokernel   out vs f64 0.000915  cache vs f64 0
+    ops: rpa_decode.1.q_hbm 181.4, rpa_write.1.kv_cache_hbm 7.7, rpa_prefill.1 1.2, %fusion.9 1.0, %gather_fusion.3 0.9
+  autokernel   wall     231.9 us  device     202.0 us   632.3 GB/s
+decode32_2048: 32 sequences, 32 tokens, 262.2 MB of cache
+  vllm         out vs f64 0.00294  cache vs f64 0
+    ops: RPAd-p_128-bq_1_1-bkv_4096_4096.1 356.9, %copy.11 1.6, %copy.6 0.8, %copy.7 0.7, %pad_maximum_fusion 0.6
+  vllm         wall     394.4 us  device     362.4 us   723.4 GB/s
+  decode: chose 3 input / 2 output buffers
+   * 3 input / 2 output buffers                                                    360.0 us  dma
+     4 input / 2 output buffers                                                    360.0 us  dma
+  prefill: chose PrefillTiles(pages=4), 3 input / 2 output buffers
+   * PrefillTiles(pages=4), 3 input / 2 output buffers                               0.6 us  None
+     PrefillTiles(pages=8), 2 input / 2 output buffers                               0.6 us  None
+     PrefillTiles(pages=2), 3 input / 2 output buffers                               0.8 us  None
+  autokernel   out vs f64 0.000666  cache vs f64 0
+    ops: rpa_decode.1.q_hbm 360.0, rpa_write.1.kv_cache_hbm 7.6, rpa_prefill.1 1.2, %gather_fusion 1.0, %fusion.9 1.0
+  autokernel   wall     412.4 us  device     380.7 us   688.7 GB/s
+decode32_4096: 32 sequences, 32 tokens, 579.7 MB of cache
+  vllm         out vs f64 0.00272  cache vs f64 0
+    ops: RPAd-p_128-bq_1_1-bkv_4096_4096.1 806.0, %copy.11 1.7, %copy.6 0.9, %copy.7 0.7, %pad_maximum_fusion 0.6
+  vllm         wall     840.5 us  device     811.6 us   714.2 GB/s
+  decode: chose 3 input / 2 output buffers
+   * 3 input / 2 output buffers                                                    779.1 us  dma
+     4 input / 2 output buffers                                                    779.1 us  dma
+  prefill: chose PrefillTiles(pages=8), 2 input / 2 output buffers
+     PrefillTiles(pages=4), 3 input / 2 output buffers                               0.7 us  None
+   * PrefillTiles(pages=8), 2 input / 2 output buffers                               0.6 us  None
+     PrefillTiles(pages=4), 2 input / 2 output buffers                               0.6 us  None
+  autokernel   out vs f64 0.000515  cache vs f64 0
+    ops: rpa_decode.1.q_hbm 779.1, rpa_write.1.kv_cache_hbm 7.7, rpa_prefill.1 1.2, %fusion.9 1.0, %compare_select_fusion.17 0.9
+  autokernel   wall     838.0 us  device     799.6 us   724.9 GB/s
+decode32_8192x: 32 sequences, 32 tokens, 1073.7 MB of cache
+    ops: RPAd-p_128-bq_1_1-bkv_4096_4096.1 1425.7, %copy.11 1.7, %copy.6 0.8, %copy.7 0.7, %pad_maximum_fusion 0.6
+  vllm         wall    1466.8 us  device    1431.2 us   750.2 GB/s
+  decode: chose 3 input / 2 output buffers
+   * 3 input / 2 output buffers                                                   1420.3 us  dma
+     4 input / 2 output buffers                                                   1420.4 us  dma
+  prefill: chose PrefillTiles(pages=8), 2 input / 2 output buffers
+     PrefillTiles(pages=4), 3 input / 2 output buffers                               0.7 us  None
+   * PrefillTiles(pages=8), 2 input / 2 output buffers                               0.6 us  None
+     PrefillTiles(pages=4), 2 input / 2 output buffers                               0.6 us  None
+    ops: rpa_decode.1.q_hbm 1420.5, rpa_write.1.kv_cache_hbm 7.6, rpa_prefill.1 1.2, %fusion.9 1.1, %gather_fusion.4 0.9
+  autokernel   wall    1482.1 us  device    1441.1 us   745.1 GB/s
+decode128_512: 128 sequences, 128 tokens, 264.9 MB of cache
+  vllm         out vs f64 0.00758  cache vs f64 0
+/usr/local/lib/python3.13/dist-packages/jax/_src/interpreters/mlir.py:1453: UserWarning: Some donated buffers were not usable: bfloat16[128,8,128], bfloat16[128,8,128].
+See an explanation at https://docs.jax.dev/en/latest/faq.html#buffer-donation.
+    ops: RPAd-p_128-bq_1_1-bkv_4096_4096.1 786.0, %copy.11 4.8, %copy.7 2.6, %copy.6 2.2, %pad_maximum_fusion 1.2
+  vllm         wall     834.8 us  device     799.7 us   331.2 GB/s
+  decode: chose 3 input / 2 output buffers
+   * 3 input / 2 output buffers                                                    394.4 us  dma
+     4 input / 2 output buffers                                                    393.5 us  dma
+  prefill: chose PrefillTiles(pages=8), 2 input / 2 output buffers
+     PrefillTiles(pages=4), 3 input / 2 output buffers                               1.2 us  None
+   * PrefillTiles(pages=8), 2 input / 2 output buffers                               1.2 us  None
+     PrefillTiles(pages=4), 2 input / 2 output buffers                               1.2 us  None
+  autokernel   out vs f64 0.00157  cache vs f64 0
+    ops: rpa_decode.1.q_hbm 394.1, rpa_write.1.kv_cache_hbm 26.8, rpa_prefill.1 1.7, %gather_fusion 1.5, %gather_fusion.9 1.5
+  autokernel   wall     482.1 us  device     444.4 us   596.0 GB/s
+decode128_1024: 128 sequences, 128 tokens, 529.7 MB of cache
+  vllm         out vs f64 0.00456  cache vs f64 0
+    ops: RPAd-p_128-bq_1_1-bkv_4096_4096.1 847.0, %copy.11 4.9, %copy.7 2.6, %copy.6 2.3, %reshape.3.args_8_ 1.2
+  vllm         wall     897.3 us  device     860.8 us   615.4 GB/s
+  decode: chose 3 input / 2 output buffers
+   * 3 input / 2 output buffers                                                    748.2 us  dma
+     4 input / 2 output buffers                                                    748.1 us  dma
+  prefill: chose PrefillTiles(pages=4), 3 input / 2 output buffers
+   * PrefillTiles(pages=4), 3 input / 2 output buffers                               1.2 us  None
+     PrefillTiles(pages=8), 2 input / 2 output buffers                               1.2 us  None
+     PrefillTiles(pages=2), 3 input / 2 output buffers                               1.4 us  None
+  autokernel   out vs f64 0.001  cache vs f64 0
+    ops: rpa_decode.1.q_hbm 748.1, rpa_write.1.kv_cache_hbm 26.8, rpa_prefill.1 1.8, %gather_fusion 1.5, %gather_fusion.3 1.5
+  autokernel   wall     830.2 us  device     798.6 us   663.3 GB/s
+decode128_2048: 128 sequences, 128 tokens, 1124.7 MB of cache
+    ops: RPAd-p_128-bq_1_1-bkv_4096_4096.1 1499.2, %copy.11 4.9, %copy.7 2.6, %copy.6 2.2, %pad_maximum_fusion 1.2
+  vllm         wall    1554.8 us  device    1513.0 us   743.4 GB/s
+  decode: chose 3 input / 2 output buffers
+   * 3 input / 2 output buffers                                                   1530.7 us  dma
+     4 input / 2 output buffers                                                   1530.6 us  dma
+  prefill: chose PrefillTiles(pages=8), 2 input / 2 output buffers
+     PrefillTiles(pages=4), 3 input / 2 output buffers                               1.2 us  None
+   * PrefillTiles(pages=8), 2 input / 2 output buffers                               1.2 us  None
+     PrefillTiles(pages=4), 2 input / 2 output buffers                               1.2 us  None
+    ops: rpa_decode.1.q_hbm 1530.9, rpa_write.1.kv_cache_hbm 26.8, rpa_prefill.1 1.7, %gather_fusion.3 1.6, %gather_fusion.10 1.6
+  autokernel   wall    1628.2 us  device    1581.5 us   711.1 GB/s
+decode128_4096: 128 sequences, 128 tokens, 2229.7 MB of cache
+    ops: RPAd-p_128-bq_1_1-bkv_4096_4096.1 3106.4, %copy.11 4.8, %copy.7 2.6, %copy.6 2.2, %reshape.3.args_8_ 1.2
+  vllm         wall    3158.8 us  device    3120.2 us   714.6 GB/s
+  decode: chose 3 input / 2 output buffers
+   * 3 input / 2 output buffers                                                   2996.8 us  dma
+     4 input / 2 output buffers                                                   2996.8 us  dma
+  prefill: chose PrefillTiles(pages=8), 2 input / 2 output buffers
+     PrefillTiles(pages=4), 3 input / 2 output buffers                               1.2 us  None
+   * PrefillTiles(pages=8), 2 input / 2 output buffers                               1.2 us  None
+     PrefillTiles(pages=4), 2 input / 2 output buffers                               1.2 us  None
+    ops: rpa_decode.1.q_hbm 2996.9, rpa_write.1.kv_cache_hbm 26.7, rpa_prefill.1 1.7, %gather_fusion.9 1.5, %gather_fusion.3 1.5
+  autokernel   wall    3098.8 us  device    3047.2 us   731.7 GB/s
+prefill1x512: 1 sequences, 512 tokens, 2.1 MB of cache
+  vllm         out vs f64 0.0214  cache vs f64 0
+/usr/local/lib/python3.13/dist-packages/jax/_src/interpreters/mlir.py:1453: UserWarning: Some donated buffers were not usable: bfloat16[512,8,128], bfloat16[512,8,128].
+See an explanation at https://docs.jax.dev/en/latest/faq.html#buffer-donation.
+    ops: RPAm-p_128-bq_256_128-bkv_1024_512.1 48.3, %copy.7 18.0, %copy.11 7.2, %copy.6 6.7, %reshape.3.args_8_ 6.6
+  vllm         wall     122.0 us  device      93.8 us    22.4 GB/s
+  vllm-prefill out vs f64 0.0214  cache vs f64 0
+    ops: RPAp-p_128-bq_256_128-bkv_1024_512.1 54.8, %copy.9 18.1, %copy.13 7.2, %copy.8 6.6, %reshape.3.args_8_ 6.5
+  vllm-prefill wall     136.7 us  device     104.9 us    20.0 GB/s
+  decode: chose 3 input / 1 output buffers
+   * 3 input / 1 output buffers                                                      1.1 us  overhead
+  prefill: chose PrefillTiles(pages=4), 3 input / 2 output buffers
+   * PrefillTiles(pages=4), 3 input / 2 output buffers                              61.3 us  compute
+     PrefillTiles(pages=8), 2 input / 2 output buffers                              92.8 us  compute
+     PrefillTiles(pages=2), 3 input / 2 output buffers                              63.3 us  compute
+  autokernel   out vs f64 0.00798  cache vs f64 0
+    ops: rpa_prefill.1 61.2, rpa_write.1.kv_cache_hbm 7.4, rpa_decode.1.q_hbm 1.0, %fusion.14 0.7, %gather_fusion 0.7
+  autokernel   wall     102.1 us  device      73.1 us    28.7 GB/s
+prefill1x1024: 1 sequences, 1024 tokens, 4.2 MB of cache
+  vllm         out vs f64 0.023  cache vs f64 0
+/usr/local/lib/python3.13/dist-packages/jax/_src/interpreters/mlir.py:1453: UserWarning: Some donated buffers were not usable: bfloat16[1024,8,128], bfloat16[1024,8,128].
+See an explanation at https://docs.jax.dev/en/latest/faq.html#buffer-donation.
+    ops: RPAm-p_128-bq_256_128-bkv_1024_512.1 124.8, %copy.7 32.8, %copy.11 13.6, %reshape.3.args_8_ 13.1, %copy.6 12.3
+  vllm         wall     244.4 us  device     208.8 us    20.1 GB/s
+  vllm-prefill out vs f64 0.023  cache vs f64 0
+    ops: RPAp-p_128-bq_256_128-bkv_1024_512.1 131.5, %copy.9 32.8, %copy.13 13.4, %reshape.3.args_8_ 13.0, %copy.8 12.3
+  vllm-prefill wall     253.1 us  device     220.0 us    19.1 GB/s
+  decode: chose 3 input / 1 output buffers
+   * 3 input / 1 output buffers                                                      1.0 us  overhead
+  prefill: chose PrefillTiles(pages=4), 3 input / 2 output buffers
+   * PrefillTiles(pages=4), 3 input / 2 output buffers                             145.5 us  compute
+     PrefillTiles(pages=8), 2 input / 2 output buffers                             179.2 us  compute
+     PrefillTiles(pages=2), 3 input / 2 output buffers                             156.8 us  compute
+  autokernel   out vs f64 0.00762  cache vs f64 0
+    ops: rpa_prefill.1 145.6, rpa_write.1.kv_cache_hbm 13.7, rpa_decode.1.q_hbm 1.0, %gather_fusion.2 0.7, %gather_fusion.1 0.7
+  autokernel   wall     191.2 us  device     163.8 us    25.6 GB/s
+prefill1x2048: 1 sequences, 2048 tokens, 8.4 MB of cache
+  vllm         out vs f64 0.0224  cache vs f64 0
+/usr/local/lib/python3.13/dist-packages/jax/_src/interpreters/mlir.py:1453: UserWarning: Some donated buffers were not usable: bfloat16[2048,8,128], bfloat16[2048,8,128].
+See an explanation at https://docs.jax.dev/en/latest/faq.html#buffer-donation.
+    ops: RPAm-p_128-bq_256_128-bkv_1024_512.1 372.2, %copy.7 62.3, %copy.11 26.5, %reshape.3.args_8_ 25.7, %copy.6 23.3
+  vllm         wall     568.6 us  device     533.4 us    15.7 GB/s
+  vllm-prefill out vs f64 0.0224  cache vs f64 0
+    ops: RPAp-p_128-bq_256_128-bkv_1024_512.1 378.9, %copy.9 62.3, %copy.13 26.4, %reshape.3.args_8_ 25.7, %copy.8 23.3
+  vllm-prefill wall     583.3 us  device     544.6 us    15.4 GB/s
+  decode: chose 3 input / 1 output buffers
+   * 3 input / 1 output buffers                                                      1.0 us  overhead
+  prefill: chose PrefillTiles(pages=4), 3 input / 2 output buffers
+   * PrefillTiles(pages=4), 3 input / 2 output buffers                             403.8 us  compute
+     PrefillTiles(pages=8), 2 input / 2 output buffers                             474.4 us  compute
+     PrefillTiles(pages=2), 3 input / 2 output buffers                             461.4 us  compute
+  autokernel   out vs f64 0.00842  cache vs f64 0
+    ops: rpa_prefill.1 403.5, rpa_write.1.kv_cache_hbm 26.4, rpa_decode.1.q_hbm 1.0, %fusion.write_rows_smem 0.7, %gather_fusion 0.7
+  autokernel   wall     464.5 us  device     434.5 us    19.3 GB/s
+prefill1x4096: 1 sequences, 4096 tokens, 16.8 MB of cache
+/usr/local/lib/python3.13/dist-packages/jax/_src/interpreters/mlir.py:1453: UserWarning: Some donated buffers were not usable: bfloat16[4096,8,128], bfloat16[4096,8,128].
+See an explanation at https://docs.jax.dev/en/latest/faq.html#buffer-donation.
+    ops: RPAm-p_128-bq_256_128-bkv_1024_512.1 1264.7, %copy.7 121.4, %copy.11 52.0, %reshape.3.args_8_ 51.2, %copy.6 45.5
+  vllm         wall    1619.2 us  device    1580.4 us    10.6 GB/s
+    ops: RPAp-p_128-bq_256_128-bkv_1024_512.1 1271.4, %copy.9 121.5, %copy.13 51.9, %reshape.3.args_8_ 51.2, %copy.8 45.5
+  vllm-prefill wall    1631.5 us  device    1591.5 us    10.5 GB/s
+  decode: chose 3 input / 1 output buffers
+   * 3 input / 1 output buffers                                                      0.9 us  overhead
+  prefill: chose PrefillTiles(pages=4), 3 input / 2 output buffers
+   * PrefillTiles(pages=4), 3 input / 2 output buffers                            1276.1 us  compute
+     PrefillTiles(pages=8), 2 input / 2 output buffers                            1432.6 us  compute
+     PrefillTiles(pages=2), 3 input / 2 output buffers                            1540.3 us  compute
+    ops: rpa_prefill.1 1275.3, rpa_write.1.kv_cache_hbm 51.6, rpa_decode.1.q_hbm 1.0, %fusion.write_rows_smem 0.7, %subtract_add_fusion 0.7
+  autokernel   wall    1363.1 us  device    1330.9 us    12.6 GB/s
+prefill1x8192: 1 sequences, 8192 tokens, 33.6 MB of cache
+/usr/local/lib/python3.13/dist-packages/jax/_src/interpreters/mlir.py:1453: UserWarning: Some donated buffers were not usable: bfloat16[8192,8,128], bfloat16[8192,8,128].
+See an explanation at https://docs.jax.dev/en/latest/faq.html#buffer-donation.
+    ops: RPAm-p_128-bq_256_128-bkv_1024_512.1 4641.5, %copy.7 239.6, %copy.11 103.1, %reshape.3.args_8_ 102.1, %copy.6 89.8
+  vllm         wall    5309.4 us  device    5266.1 us     6.4 GB/s
+    ops: RPAp-p_128-bq_256_128-bkv_1024_512.1 4647.9, %copy.9 239.6, %copy.13 103.2, %reshape.3.args_8_ 102.1, %copy.8 89.8
+  vllm-prefill wall    5333.3 us  device    5277.0 us     6.4 GB/s
+  decode: chose 3 input / 1 output buffers
+   * 3 input / 1 output buffers                                                      1.0 us  overhead
+  prefill: chose PrefillTiles(pages=4), 3 input / 2 output buffers
+   * PrefillTiles(pages=4), 3 input / 2 output buffers                            4446.6 us  compute
+     PrefillTiles(pages=8), 2 input / 2 output buffers                            4819.5 us  compute
+     PrefillTiles(pages=2), 3 input / 2 output buffers                            5577.0 us  compute
+    ops: rpa_prefill.1 4443.2, rpa_write.1.kv_cache_hbm 102.4, rpa_decode.1.q_hbm 1.0, %subtract_add_fusion 0.7, %fusion.write_rows_smem 0.7
+  autokernel   wall    4595.1 us  device    4549.6 us     7.4 GB/s
+prefill4x1024: 4 sequences, 4096 tokens, 16.8 MB of cache
+  vllm         out vs f64 0.0207  cache vs f64 0
+    ops: RPAm-p_128-bq_256_128-bkv_1024_512.1 469.3, %copy.7 121.4, %copy.11 52.0, %reshape.3.args_8_ 51.2, %copy.6 45.4
+  vllm         wall     821.7 us  device     784.9 us    21.4 GB/s
+  vllm-prefill out vs f64 0.0207  cache vs f64 0
+    ops: RPAp-p_128-bq_256_128-bkv_1024_512.1 475.9, %copy.9 121.4, %copy.13 52.0, %reshape.3.args_8_ 51.2, %copy.8 45.5
+  vllm-prefill wall     832.1 us  device     796.0 us    21.1 GB/s
+  decode: chose 4 input / 2 output buffers
+     3 input / 2 output buffers                                                      1.8 us  overhead
+   * 4 input / 2 output buffers                                                      1.7 us  overhead
+  prefill: chose PrefillTiles(pages=4), 3 input / 2 output buffers
+   * PrefillTiles(pages=4), 3 input / 2 output buffers                             563.5 us  compute
+     PrefillTiles(pages=8), 2 input / 2 output buffers                             697.3 us  compute
+     PrefillTiles(pages=2), 3 input / 2 output buffers                             600.9 us  compute
+  autokernel   out vs f64 0.00973  cache vs f64 0
+    ops: rpa_prefill.1 563.5, rpa_write.1.kv_cache_hbm 52.0, %subtract_add_fusion 5.8, %fusion.9 5.8, %maximum_subtract_fusion 1.8
+  autokernel   wall     670.6 us  device     638.9 us    26.3 GB/s
+prefill8x512: 8 sequences, 4096 tokens, 16.8 MB of cache
+  vllm         out vs f64 0.0274  cache vs f64 0
+    ops: RPAm-p_128-bq_256_128-bkv_1024_512.1 335.0, %copy.7 121.4, %copy.11 51.8, %reshape.3.args_8_ 51.3, %copy.6 45.4
+  vllm         wall     682.8 us  device     650.5 us    25.8 GB/s
+  vllm-prefill out vs f64 0.0274  cache vs f64 0
+    ops: RPAp-p_128-bq_256_128-bkv_1024_512.1 341.2, %copy.9 121.4, %copy.13 52.0, %reshape.3.args_8_ 51.2, %copy.8 45.5
+  vllm-prefill wall     703.6 us  device     661.3 us    25.4 GB/s
+  decode: chose 3 input / 2 output buffers
+   * 3 input / 2 output buffers                                                      2.8 us  dma
+     4 input / 2 output buffers                                                      2.9 us  dma
+  prefill: chose PrefillTiles(pages=4), 3 input / 2 output buffers
+   * PrefillTiles(pages=4), 3 input / 2 output buffers                             444.7 us  compute
+     PrefillTiles(pages=8), 2 input / 2 output buffers                             697.4 us  compute
+     PrefillTiles(pages=2), 3 input / 2 output buffers                             444.3 us  compute
+  autokernel   out vs f64 0.00935  cache vs f64 0
+    ops: rpa_prefill.1 445.6, rpa_write.1.kv_cache_hbm 52.1, %fusion.2 11.3, rpa_decode.1.q_hbm 2.8, %fusion.15 1.0
+  autokernel   wall     560.4 us  device     521.7 us    32.2 GB/s
+prefill16x256: 16 sequences, 4096 tokens, 16.8 MB of cache
+  vllm         out vs f64 0.025  cache vs f64 0
+    ops: RPAm-p_128-bq_256_128-bkv_1024_512.1 334.5, %copy.7 121.4, %copy.11 52.0, %reshape.3.args_8_ 51.2, %copy.6 45.4
+  vllm         wall     685.0 us  device     649.9 us    25.8 GB/s
+  vllm-prefill out vs f64 0.025  cache vs f64 0
+    ops: RPAp-p_128-bq_256_128-bkv_1024_512.1 340.4, %copy.9 121.4, %copy.13 52.0, %reshape.3.args_8_ 51.3, %copy.8 45.5
+  vllm-prefill wall     701.2 us  device     660.6 us    25.4 GB/s
+  decode: chose 3 input / 2 output buffers
+   * 3 input / 2 output buffers                                                      4.9 us  dma
+     4 input / 2 output buffers                                                      4.9 us  dma
+  prefill: chose PrefillTiles(pages=2), 3 input / 2 output buffers
+     PrefillTiles(pages=4), 3 input / 2 output buffers                             444.8 us  compute
+     PrefillTiles(pages=8), 2 input / 2 output buffers                             697.4 us  compute
+   * PrefillTiles(pages=2), 3 input / 2 output buffers                             366.0 us  compute
+     PrefillTiles(pages=1), 3 input / 2 output buffers                             430.6 us  compute
+  autokernel   out vs f64 0.01  cache vs f64 0
+    ops: rpa_prefill.1 367.7, rpa_write.1.kv_cache_hbm 52.1, rpa_decode.1.q_hbm 4.8, %fusion.9 1.0, %gather_fusion.9 0.8
+  autokernel   wall     468.0 us  device     435.6 us    38.5 GB/s
+chunk256@4096: 1 sequences, 256 tokens, 16.8 MB of cache
+  vllm         out vs f64 0.00196  cache vs f64 0
+/usr/local/lib/python3.13/dist-packages/jax/_src/interpreters/mlir.py:1453: UserWarning: Some donated buffers were not usable: bfloat16[256,8,128], bfloat16[256,8,128].
+See an explanation at https://docs.jax.dev/en/latest/faq.html#buffer-donation.
+    ops: RPAm-p_128-bq_128_128-bkv_1024_512.1 148.1, %copy.7 5.1, %copy.11 4.0, %copy.6 4.0, %reshape.3.args_8_ 3.4
+  vllm         wall     197.6 us  device     168.7 us    99.5 GB/s
+  vllm-prefill out vs f64 0.00196  cache vs f64 0
+    ops: RPAp-p_128-bq_128_128-bkv_1024_512.1 148.1, %copy.9 5.2, %copy.8 4.0, %copy.13 4.0, %reshape.3.args_8_ 3.4
+  vllm-prefill wall     204.2 us  device     169.4 us    99.0 GB/s
+  decode: chose 3 input / 1 output buffers
+   * 3 input / 1 output buffers                                                      1.0 us  overhead
+  prefill: chose PrefillTiles(pages=4), 3 input / 2 output buffers
+   * PrefillTiles(pages=4), 3 input / 2 output buffers                             137.8 us  compute
+     PrefillTiles(pages=8), 2 input / 2 output buffers                             141.5 us  compute
+     PrefillTiles(pages=2), 3 input / 2 output buffers                             178.0 us  compute
+  autokernel   out vs f64 0.000451  cache vs f64 0
+    ops: rpa_prefill.1 137.6, rpa_write.1.kv_cache_hbm 4.0, rpa_decode.1.q_hbm 1.0, %gather_fusion.2 0.7, %fusion.14 0.7
+  autokernel   wall     180.6 us  device     146.1 us   114.8 GB/s
+chunk512@4096: 1 sequences, 512 tokens, 16.8 MB of cache
+  vllm         out vs f64 0.00239  cache vs f64 0
+    ops: RPAm-p_128-bq_256_128-bkv_1024_512.1 283.1, %copy.7 18.0, %copy.11 7.2, %copy.6 6.7, %reshape.3.args_8_ 6.5
+  vllm         wall     359.1 us  device     328.5 us    51.1 GB/s
+  vllm-prefill out vs f64 0.00239  cache vs f64 0
+    ops: RPAp-p_128-bq_256_128-bkv_1024_512.1 289.8, %copy.9 18.0, %copy.13 7.3, %copy.8 6.7, %reshape.3.args_8_ 6.6
+  vllm-prefill wall     374.3 us  device     339.8 us    49.4 GB/s
+  decode: chose 3 input / 1 output buffers
+   * 3 input / 1 output buffers                                                      1.0 us  overhead
+  prefill: chose PrefillTiles(pages=4), 3 input / 2 output buffers
+   * PrefillTiles(pages=4), 3 input / 2 output buffers                             269.0 us  compute
+     PrefillTiles(pages=8), 2 input / 2 output buffers                             276.6 us  compute
+     PrefillTiles(pages=2), 3 input / 2 output buffers                             337.1 us  compute
+  autokernel   out vs f64 0.000499  cache vs f64 0
+    ops: rpa_prefill.1 268.8, rpa_write.1.kv_cache_hbm 7.3, rpa_decode.1.q_hbm 1.0, %fusion.15 0.7, %gather_fusion.2 0.7
+  autokernel   wall     310.6 us  device     280.6 us    59.8 GB/s
+chunk512@8192: 1 sequences, 512 tokens, 33.6 MB of cache
+  vllm         out vs f64 0.00207  cache vs f64 0
+    ops: RPAm-p_128-bq_256_128-bkv_1024_512.1 548.3, %copy.7 18.0, %copy.11 7.3, %copy.6 6.7, %reshape.3.args_8_ 6.6
+  vllm         wall     626.9 us  device     593.8 us    56.5 GB/s
+  vllm-prefill out vs f64 0.00207  cache vs f64 0
+    ops: RPAp-p_128-bq_256_128-bkv_1024_512.1 555.0, %copy.9 18.0, %copy.13 7.3, %copy.8 6.7, %reshape.3.args_8_ 6.6
+  vllm-prefill wall     648.7 us  device     605.1 us    55.5 GB/s
+  decode: chose 3 input / 1 output buffers
+   * 3 input / 1 output buffers                                                      1.0 us  overhead
+  prefill: chose PrefillTiles(pages=4), 3 input / 2 output buffers
+   * PrefillTiles(pages=4), 3 input / 2 output buffers                             506.5 us  compute
+     PrefillTiles(pages=8), 2 input / 2 output buffers                             521.7 us  compute
+     PrefillTiles(pages=2), 3 input / 2 output buffers                             650.4 us  compute
+  autokernel   out vs f64 0.000321  cache vs f64 0
+    ops: rpa_prefill.1 506.2, rpa_write.1.kv_cache_hbm 7.3, rpa_decode.1.q_hbm 1.0, %fusion.14 0.7, %gather_fusion.1 0.7
+  autokernel   wall     552.7 us  device     518.0 us    64.8 GB/s
+chunk1024@8192: 1 sequences, 1024 tokens, 33.6 MB of cache
+  vllm         out vs f64 0.00211  cache vs f64 0
+    ops: RPAm-p_128-bq_256_128-bkv_1024_512.1 1053.3, %copy.7 32.8, %copy.11 13.6, %reshape.3.args_8_ 13.0, %copy.6 12.2
+  vllm         wall    1172.9 us  device    1137.2 us    29.5 GB/s
+  vllm-prefill out vs f64 0.00211  cache vs f64 0
+    ops: RPAp-p_128-bq_256_128-bkv_1024_512.1 1060.0, %copy.9 32.8, %copy.13 13.6, %reshape.3.args_8_ 13.0, %copy.8 12.3
+  vllm-prefill wall    1188.5 us  device    1148.6 us    29.2 GB/s
+  decode: chose 3 input / 1 output buffers
+   * 3 input / 1 output buffers                                                      1.1 us  overhead
+  prefill: chose PrefillTiles(pages=4), 3 input / 2 output buffers
+   * PrefillTiles(pages=4), 3 input / 2 output buffers                             977.0 us  compute
+     PrefillTiles(pages=8), 2 input / 2 output buffers                            1037.0 us  compute
+     PrefillTiles(pages=2), 3 input / 2 output buffers                            1252.8 us  compute
+  autokernel   out vs f64 0.000342  cache vs f64 0
+    ops: rpa_prefill.1 976.4, rpa_write.1.kv_cache_hbm 13.6, rpa_decode.1.q_hbm 1.0, %gather_fusion.2 0.7, %gather_fusion 0.7
+  autokernel   wall    1025.7 us  device     994.6 us    33.7 GB/s
+mixed32+2x512: 34 sequences, 1056 tokens, 298.6 MB of cache
+  vllm         out vs f64 0.00725  cache vs f64 0
+/usr/local/lib/python3.13/dist-packages/jax/_src/interpreters/mlir.py:1453: UserWarning: Some donated buffers were not usable: bfloat16[1056,8,128], bfloat16[1056,8,128].
+See an explanation at https://docs.jax.dev/en/latest/faq.html#buffer-donation.
+    ops: RPAd-p_128-bq_1_1-bkv_4096_4096.1 375.7, RPAm-p_128-bq_256_128-bkv_1024_512.1 357.4, %copy.7 22.2, %reshape.3.args_8_ 13.3, %copy.11 12.9
+  vllm         wall     845.4 us  device     806.5 us   370.3 GB/s
+  vllm-prefill out vs f64 0.00725  cache vs f64 0
+    ops: RPAd-p_128-bq_1_1-bkv_4096_4096.1 375.7, RPAp-p_128-bq_256_128-bkv_1024_512.1 364.2, %copy.9 22.2, %reshape.3.args_8_ 13.4, %copy.13 12.8
+  vllm-prefill wall     857.5 us  device     817.4 us   365.3 GB/s
+  decode: chose 3 input / 2 output buffers
+   * 3 input / 2 output buffers                                                    380.0 us  dma
+     4 input / 2 output buffers                                                    379.9 us  dma
+  prefill: chose PrefillTiles(pages=4), 3 input / 2 output buffers
+   * PrefillTiles(pages=4), 3 input / 2 output buffers                             353.7 us  compute
+     PrefillTiles(pages=8), 2 input / 2 output buffers                             424.5 us  compute
+     PrefillTiles(pages=2), 3 input / 2 output buffers                             431.0 us  compute
+  autokernel   out vs f64 0.00108  cache vs f64 0
+    ops: rpa_decode.1.q_hbm 380.1, rpa_prefill.1 353.9, rpa_write.1.kv_cache_hbm 20.1, %fusion.9 1.0, %gather_fusion.4 0.9
+  autokernel   wall     799.7 us  device     765.9 us   389.9 GB/s
+mixed64+1x1024: 65 sequences, 1088 tokens, 535.8 MB of cache
+  vllm         out vs f64 0.00554  cache vs f64 0
+/usr/local/lib/python3.13/dist-packages/jax/_src/interpreters/mlir.py:1453: UserWarning: Some donated buffers were not usable: bfloat16[1088,8,128], bfloat16[1088,8,128].
+See an explanation at https://docs.jax.dev/en/latest/faq.html#buffer-donation.
+    ops: RPAd-p_128-bq_1_1-bkv_4096_4096.1 697.0, RPAm-p_128-bq_256_128-bkv_1024_512.1 523.2, %copy.7 34.3, %reshape.3.args_8_ 13.7, %copy.11 13.2
+  vllm         wall    1338.1 us  device    1307.2 us   409.9 GB/s
+  vllm-prefill out vs f64 0.00554  cache vs f64 0
+    ops: RPAd-p_128-bq_1_1-bkv_4096_4096.1 696.9, RPAp-p_128-bq_256_128-bkv_1024_512.1 530.0, %copy.9 34.2, %reshape.3.args_8_ 13.8, %copy.13 13.2
+  vllm-prefill wall    1358.9 us  device    1318.3 us   406.5 GB/s
+  decode: chose 3 input / 2 output buffers
+   * 3 input / 2 output buffers                                                    712.0 us  dma
+     4 input / 2 output buffers                                                    712.0 us  dma
+  prefill: chose PrefillTiles(pages=4), 3 input / 2 output buffers
+   * PrefillTiles(pages=4), 3 input / 2 output buffers                             502.3 us  compute
+     PrefillTiles(pages=8), 2 input / 2 output buffers                             547.2 us  compute
+     PrefillTiles(pages=2), 3 input / 2 output buffers                             626.8 us  compute
+  autokernel   out vs f64 0.000647  cache vs f64 0
+    ops: rpa_decode.1.q_hbm 711.9, rpa_prefill.1 502.4, rpa_write.1.kv_cache_hbm 26.4, %gather_fusion.1 1.1, %gather_fusion.5 1.1
+  autokernel   wall    1289.0 us  device    1257.2 us   426.2 GB/s
+mixed128+4x256: 132 sequences, 1152 tokens, 583.9 MB of cache
+  vllm         out vs f64 0.0185  cache vs f64 0
+/usr/local/lib/python3.13/dist-packages/jax/_src/interpreters/mlir.py:1453: UserWarning: Some donated buffers were not usable: bfloat16[1152,8,128], bfloat16[1152,8,128].
+See an explanation at https://docs.jax.dev/en/latest/faq.html#buffer-donation.
+    ops: RPAd-p_128-bq_1_1-bkv_4096_4096.1 867.8, RPAm-p_128-bq_256_128-bkv_1024_512.1 270.8, %copy.7 36.3, %copy.11 14.6, %reshape.3.args_8_ 14.6
+  vllm         wall    1271.8 us  device    1231.3 us   474.2 GB/s
+  vllm-prefill out vs f64 0.0185  cache vs f64 0
+    ops: RPAd-p_128-bq_1_1-bkv_4096_4096.1 867.9, RPAp-p_128-bq_256_128-bkv_1024_512.1 277.0, %copy.9 36.3, %reshape.3.args_8_ 14.6, %copy.13 14.4
+  vllm-prefill wall    1280.1 us  device    1242.0 us   470.1 GB/s
+[exit -9, killed after 3600 s]

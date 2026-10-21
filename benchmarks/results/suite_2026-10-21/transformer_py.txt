@@ -1,0 +1,15 @@
+# TPU v5e (Colab), 2026-10-21, commit 080fc71: python benchmarks/transformer.py  [interrupted]
+Config(layers=4, d_model=1024, heads=8, ffn=4096, vocab=32768), batch 4, seq 2048: ms (TFLOP/s)
+  plain JAX + splash (default blocks)    24.181  (  62.5)
+  plain JAX + splash ( 512 x 1024)    11.348  ( 133.2)
+  autokernel, tuned                       9.179  ( 164.7)
+  speedup 2.63x / 1.24x; max |logits - baseline| 0.0391
+  layer (fused): LayerTiles(block_q=512, block_kv=512, block_f=512), 4 input / 2 output buffers
+    tuned device times: fused 1.233 ms; split 0.539 + 0.741 ms
+  qkv:   NormMatmulTiles(tm=1024, tn=1024, tk=1024), 3 input / 2 output buffers
+  head:  NormMatmulTiles(tm=2048, tn=2048, tk=1024), 3 input / 2 output buffers
+Config(layers=4, d_model=2048, heads=16, ffn=8192, vocab=32768), batch 2, seq 2048: ms (TFLOP/s)
+
+
+tools/colab_tpu.sh: line 28: 18370 Terminated: 15          "$COLAB" exec -s "$SESSION" -f tools/colab_driver.py --timeout ${TIMEOUT:-14400}
+     18371                       | tee tpu-run.txt
