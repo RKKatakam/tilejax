@@ -176,7 +176,7 @@ def proposals(kernel: Kernel, signature: Signature, trial: Trial) -> list[Config
         buffering.append(dataclasses.replace(pipe, output_buffers=pipe.output_buffers + 1))
     if pipe.burst:
         buffering = []  # (a burst's slots follow from its steps)
-    if plan.single_step and profile.bottleneck == "dma":
+    if plan.single_step and not schedule.runtime_tiles and profile.bottleneck == "dma":
         buffering += [Pipeline.bursts(g) for g in _bursts(pipe.burst)]
     moves = [Config(config.tunable, p) for p in buffering if fits(plan, schedule, p)]
 

@@ -73,8 +73,8 @@ def cache_bytes(q_lens: list[int], kv_lens: list[int]) -> int:
 
 
 def timed(fn, inputs: dict, runs: int = 10) -> tuple[float, float]:
-    """(wall seconds, device seconds) per call, the cache donated and fed back."""
-    step = jax.jit(fn, donate_argnums=(3,))
+    """(wall seconds, device seconds) per call, the cache donated and fed back, fresh q, k and v donated."""
+    step = jax.jit(fn, donate_argnums=(0, 1, 2, 3))
     args = list(args_of(inputs))
     args[3] = jnp.copy(args[3])
     fresh = [tuple(jnp.copy(a) for a in args[:3]) for _ in range(3 + 5 * runs + runs)]  # (RPA donates q, k, v)
@@ -132,8 +132,6 @@ def main() -> None:
         want = reference(inputs, SCALE) if opts.check else None
         for method in names:
             fn = available[method]
-            if method == "autokernel" and any(q > 1 for q in q_lens):
-                continue  # (decode batches only, so far)
             if method == "autokernel" and on_tpu:
                 from ragged_paged_attention import tune
 

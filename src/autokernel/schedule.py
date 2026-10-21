@@ -79,6 +79,7 @@ class Schedule:
     tile_values: dict[str, np.ndarray] = field(default_factory=dict)
     static_runs: dict[int, np.ndarray] = field(default_factory=dict)
     cursor: bool = False  # runtime ranges: steps found as the kernel runs (`steps`: a tile's phases once each)
+    runtime_tiles: bool = False  # the one parallel loop's bounds read index arrays: tiles counted as it runs
 
     @property
     def steps_per_tile(self) -> int:
@@ -298,7 +299,7 @@ def _cursor(plan: Plan, counts: tuple[int, ...]) -> Schedule:
     tiles = repeats * len(active)
     _check_tiles(plan, tiles, repeats * len(skipped))
     return Schedule(
-        tiles=tiles,
+        tiles=tiles,  # (with a runtime count of tiles, a stand-in: the kernel counts them)
         total_tiles=math.prod(r.count for r in plan.parallel),
         steps=tiles * len(counts),
         phase_counts=counts,
@@ -312,7 +313,8 @@ def _cursor(plan: Plan, counts: tuple[int, ...]) -> Schedule:
         tile_tables=bool(skipped),
         tables=tables,
         empty=True,
-        cursor=True,
+        cursor=not plan.single_step,  # (single steps: the step is the tile, counted when the kernel starts)
+        runtime_tiles=plan.parallel[0].bounds is not None,
     )
 
 

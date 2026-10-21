@@ -216,7 +216,10 @@ def test_runtime_masks_with_static_and_unmasked_phases():
     ("code", "message"),
     [
         ("a = ids[0] + ids[0:8, :].sum()", "read element by element (an index array, kept in SMEM) and as tiles"),
-        ("a = ids[ids[0, 0], 0]", "elements are indexed by loop variables and constants"),
+        (
+            "b = jnp.zeros((2,), jnp.int32)\n                a = ids[b[0], 0]",
+            "elements are indexed by loop variables, constants and other elements",
+        ),
         ("a = ids[0]", "index every one of ids's 2 dims"),
         ("a = ids[i // 128 + 8, 0]", "reads element 9 of a dim of 9 at i=128"),
     ],

@@ -61,9 +61,9 @@ from . import mxu, v5e
 from .errors import KernelError
 from .parse import Nest
 from .pipeline import TILE_SLOTS, Pipeline
-from .plan import Kind, Operand, Output, Plan, Range, Tile
+from .plan import Kind, Operand, Output, Plan, Range, Tile, Window
 from .schedule import CODE_SHIFT, FILL_TABLE, STEP_CODE, STEP_COUNT, STEP_TILE, TILE_TABLE, Schedule
-from .tilecode import as_store, assigned, flatten, reads
+from .tilecode import as_store, assigned, element_reads, flatten, reads
 from .tunable import choices, is_tunable
 
 __all__ = ["COMPUTE", "FILLS_IN_FLIGHT", "OUT_WAIT", "REGIONS", "WAIT", "generate"]
@@ -78,6 +78,9 @@ MODULES = {"jax": jax, "jnp": jnp, "np": np, "pl": pl, "pltpu": pltpu}
 _WEAK = "_weak"
 _PHASE_STEPS = "_phase_steps"
 _PAIRS = "_pairs"
+_UNPAIRS = "_store_pairs"
+_COPIES = "_Copies"
+_STRIDED = "_strided"
 
 
 def generate(plan: Plan, schedule: Schedule, pipeline: Pipeline, *, trace: bool = False) -> tuple[str, str]:
@@ -164,8 +167,10 @@ class _Generator:
         self.nest = nest = plan.nest
         self.single = plan.single_step
         self.burst = pipeline.burst
-        if self.burst and not self.single:
-            raise KernelError(f"{nest.name}: copies move in bursts only in kernels whose tiles take one step")
+        if self.burst and not (self.single and not schedule.runtime_tiles):
+            raise KernelError(
+                f"{nest.name}: copies move in bursts only in kernels whose tiles take one step, counted when built"
+            )
         self.value_reads = _value_reads(plan)
         self.uses_weak = any(r.var in self.value_reads and r.count > 1 for r in plan.loops)
         bound = assigned(nest.tile) | {r.var for r in plan.loops}
@@ -186,6 +191,9 @@ class _Generator:
                 _WEAK,
                 _PHASE_STEPS,
                 _PAIRS,
+                _UNPAIRS,
+                _COPIES,
+                _STRIDED,
                 "functools",
                 *self.indices,
             }
@@ -226,6 +234,7 @@ class _Generator:
         self.views = {op.name: n(f"{op.name}_ref") for op in plan.operands}
         # Operands read as words (`autokernel.pairs`): their VMEM slots seen as uint32, (rows, d).
         self.words = {name: n(f"{name}_words") for name in sorted(set(plan.packed.values()))}
+        self.packing = bool(self.words or plan.unpacked)  # (the kernel takes `interpret`: the words differ)
         self.n_interpret = n("interpret")  # (the interpreter can't see a VMEM buffer as another dtype)
         # Per-tile windows consecutive tiles may share: copied only when they move; SMEM holds each one's slot.
         self.shared = [op for op in plan.operands if op.kind is Kind.TILE and _may_stay(op, plan)]
@@ -241,6 +250,8 @@ class _Generator:
         self.repeated = bool(plan.repeats)  # steps decode to a repeat loop's iteration (`rb`) too
         self.cursor = schedule.cursor
         self.n_cursor, self.n_counts, self.n_advance = n("cursor"), n("counts"), n("advance")
+        # How many tiles run: a number, or (a runtime count of tiles) counted when the kernel starts.
+        self.n_tiles = n("n_tiles") if schedule.runtime_tiles else str(schedule.tiles)
         self.n_at, self.n_rep, self.n_code, self.n_c, self.n_slot = n("at"), n("rep"), n("code"), n("c"), n("slot")
 
     # ------------------------------------------------------------------ the module
@@ -257,7 +268,12 @@ class _Generator:
         tunable = f", {self.plan.tunable}" if self.plan.tunable is not None else ""
         w(f"# for {inputs}{tunable}; {self.pipeline}{'; with trace regions' if self.trace else ''}.")
         w("")
-        w(*(["import functools"] if self.words else []), "import jax", "import jax.numpy as jnp", "import numpy as np")
+        w(
+            *(["import functools"] if self.packing else []),
+            "import jax",
+            "import jax.numpy as jnp",
+            "import numpy as np",
+        )
         w("from jax.experimental import pallas as pl", "from jax.experimental.pallas import tpu as pltpu")
         definitions = self.definitions
         if definitions.imports:
@@ -276,12 +292,42 @@ class _Generator:
         if self._uses_mxu(kernel):
             for fn in mxu.FUNCTIONS.values():
                 w("", "", *inspect.getsource(fn).splitlines())
+        if any(_gathered(op.tile) for op in self.plan.operands):
+            w("", "")
+            with w.block(f"class {_COPIES}:"):
+                w('"""Copies started and waited together: a window gathered from several places of an array."""')
+                w("")
+                with w.block("def __init__(self, *copies):"):
+                    w("self.copies = copies")
+                w("")
+                with w.block("def start(self):"), w.block("for copy in self.copies:"):
+                    w("copy.start()")
+                w("")
+                with w.block("def wait(self):"), w.block("for copy in self.copies:"):
+                    w("copy.wait()")
         if self.words:
             w("", "")
             with w.block(f"def {_PAIRS}(x):"):
                 w("# autokernel.pairs: a 16-bit tile's pairs of rows (..., 2, d) as uint32 words (..., d), for the")
                 w("# interpreter (on a TPU the kernel reads its VMEM buffer as words).")
                 w("return jax.lax.bitcast_convert_type(jnp.swapaxes(x, -1, -2), jnp.uint32)")
+            w("", "")
+            with w.block(f"def {_STRIDED}(words, start, n, stride, interpret):"):
+                w("# Rows start, start + stride, ...: n of them. On a TPU, a strided load from the VMEM buffer (the")
+                w("# interpreter has the words as a value).")
+                with w.block("if interpret:"):
+                    w("return words.reshape(n, stride, words.shape[-1])[:, start, :]")
+                w("return words[pl.ds(start, n, stride=stride)]")
+        if self.plan.unpacked:
+            w("", "")
+            with w.block(f"def {_UNPAIRS}(bufs, slot, words, interpret):"):
+                w("# autokernel.unpairs: uint32 words (..., d) stored into slot `slot` of a 16-bit buffer of pairs of")
+                w("# rows (..., 2, d). On a TPU, into the buffer seen as words (the interpreter can't bitcast it).")
+                with w.block("if interpret:"):
+                    w("bufs[slot] = jnp.swapaxes(jax.lax.bitcast_convert_type(words, bufs.dtype), -1, -2)")
+                    w("return")
+                w("rows, d = int(np.prod(bufs.shape[1:-2])), bufs.shape[-1]")
+                w("bufs.bitcast(jnp.uint32).at[slot].reshape(rows, d)[...] = words.reshape(rows, d)")
         if self.uses_weak:
             w("", "")
             with w.block(f"def {_WEAK}(x):"):
@@ -386,7 +432,7 @@ class _Generator:
             with w.block("return pl.pallas_call("):
                 w(
                     f"functools.partial({self.kernel_name}, {self.n_interpret}=bool(interpret)),"
-                    if self.words
+                    if self.packing
                     else f"{self.kernel_name},"
                 )
                 shapes = [f"jax.ShapeDtypeStruct({out.shape}, jnp.{out.dtype.name})" for out in plan.outputs]
@@ -475,7 +521,7 @@ class _Generator:
             params += [self.fill_bufs[out], self.fill_sems[out]]
         params += [self.tile_slots] if self.shared else []
         params += [self.n_cursor] if self.cursor else []
-        if self.words:
+        if self.packing:
             params.append(f"*, {self.n_interpret}")
         with w.block(f"def {self.kernel_name}({', '.join(params)}):"):
             self._step_fn(w)
@@ -566,7 +612,7 @@ class _Generator:
                     continue
                 start, stop = (self._render(b, block_of) for b in r.bounds)
                 counts.append(f"jnp.maximum(jax.lax.div(({stop}) - ({start}) + {r.step - 1}, {r.step}), 0)")
-            w(f"return ({_tuple(counts)})")
+            w(f"return ({_tuple(counts or ['1'])})")  # (a tile without reduction loops: one step)
 
         n = self.local("n")
 
@@ -599,11 +645,30 @@ class _Generator:
         their blocks (`block_of`), elements read from SMEM, Python's `and`/`or`/`if` as jnp's."""
         gen = self
 
+        runtime = {r.var for r in gen.plan.loops if r.bounds is not None}
+        shapes = {index.name: index.shape for index in gen.plan.indices}
+
         class Values(ast.NodeTransformer):
             def visit_Name(self, node: ast.Name) -> ast.expr:
                 if node.id in block_of:
                     return _parse_expr(f"({gen._val(gen._range(node.id), block_of[node.id], block_of)})")
                 return ast.Name(gen.smem[node.id], ast.Load()) if node.id in gen.smem else node
+
+            def visit_Subscript(self, node: ast.Subscript) -> ast.expr:
+                # An element at a position known only as the kernel runs (from a runtime range, or another
+                # element) is clamped into its array, as JAX clamps: SMEM has no bounds checks.
+                dims = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
+                late = any(reads(d) & runtime or element_reads(d, shapes) for d in dims)
+                node = self.generic_visit(node)  # type: ignore[assignment]
+                if not (late and isinstance(node.value, ast.Name) and node.value.id in gen.smem.values()):
+                    return node
+                name = next(k for k, v in gen.smem.items() if v == node.value.id)  # type: ignore[union-attr]
+                dims = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
+                clipped = [
+                    _parse_expr(f"jnp.clip(X, 0, {n - 1})", X=d) for d, n in zip(dims, shapes[name], strict=True)
+                ]
+                node.slice = ast.Tuple(clipped, ast.Load()) if len(clipped) > 1 else clipped[0]
+                return node
 
         return ast.unparse(_Vectorize().visit(Values().visit(copy.deepcopy(expr))))
 
@@ -650,13 +715,19 @@ class _Generator:
         w(f"{t} = {index} - {self.n_rep} * {per_pattern}")
         return t
 
-    def _window_index(self, tile: Tile, block_of: dict[str, str]) -> str:
-        """The index of `tile`'s window into its HBM array, given each loop's block expression."""
+    def _window_index(self, tile: Tile, block_of: dict[str, str], element: int | None = None) -> str:
+        """The index of `tile`'s window into its HBM array, given each loop's block expression (of a gathered
+        window, its `element`-th element's)."""
         dims = []
         for window, dim in zip(tile.windows, self._array_shape(tile.array), strict=True):
             r = self._range(window.loop) if window.loop else None
-            if window.index is not None:
+            if window.index is not None and window.size is not None:  # gathered: one element of the slice
+                dims.append(self._runtime_index(_element(window.index, element or 0), block_of, dim))
+            elif window.index is not None:
                 dims.append(self._runtime_index(window.index, block_of, dim))
+            elif window.rows is not None:
+                start, count = self._rows(window, block_of, dim)
+                dims.append(f"pl.ds({start}, {count})")
             elif r is None:
                 if window.size is None:
                     dims.append(str(window.offset))
@@ -676,6 +747,29 @@ class _Generator:
                 start = _scaled(block_of[r.var], r)
                 dims.append(start if window.size is None else f"pl.ds({start}, {window.size})")
         return ", ".join(dims)
+
+    def _rows(self, window: Window, block_of: dict[str, str], dim: int) -> tuple[str, str]:
+        """A ragged window's first row and how many rows it copies (those before its stop, inside the dim)."""
+        start, stop = (self._render(b, block_of) for b in window.rows)  # type: ignore[union-attr]
+        first = f"jnp.clip({start}, 0, {dim})"
+        return first, f"jnp.clip(jnp.minimum({stop}, {dim}) - {first}, 0, {window.size})"
+
+    def _slot_index(self, tile: Tile, element: int | None, block_of: dict[str, str]) -> str:
+        """The part of a VMEM slot a copy of `tile`'s window fills ("": all of it): a gathered element's row,
+        or a ragged window's first rows."""
+        dims, part = [], False
+        for window, dim in zip(tile.windows, self._array_shape(tile.array), strict=True):
+            if window.size is None:
+                continue
+            if window.index is not None:
+                dims.append(str(element))
+                part = True
+            elif window.rows is not None:
+                dims.append(f"pl.ds(0, {self._rows(window, block_of, dim)[1]})")
+                part = True
+            else:
+                dims.append(":")
+        return ", ".join(dims) if part else ""
 
     def _runtime_index(self, element: ast.Subscript, block_of: dict[str, str], dim: int) -> str:
         """An index read from an index array when the kernel runs, at the loops' values for these blocks,
@@ -712,9 +806,15 @@ class _Generator:
                 block_of[r.var] = kb if op.phase is not None and self.plan.phases[op.phase].range is r else "0"
             for r in self.plan.repeat_loops:  # (repeat loops move only streamed operands)
                 block_of[r.var] = self.n_rb if op.kind in (Kind.STREAM, Kind.ITERATION) and self.repeated else "0"
-            src = f"{self.hbm[op.tile.array]}.at[{self._window_index(op.tile, block_of)}]"
-            dst = (buf, sem) if op.kind is Kind.ONCE else (f"{buf}.at[{slot}]", f"{sem}.at[{slot}]")
-            w(f"return pltpu.make_async_copy({src}, {dst[0]}, {dst[1]})")
+            sem_ = sem if op.kind is Kind.ONCE else f"{sem}.at[{slot}]"
+            copies = []
+            for element in range(_gathered(op.tile)) if _gathered(op.tile) else [None]:
+                src = f"{self.hbm[op.tile.array]}.at[{self._window_index(op.tile, block_of, element)}]"
+                part = self._slot_index(op.tile, element, block_of)
+                dst = buf if op.kind is Kind.ONCE else f"{buf}.at[{slot}]"
+                dst = f"{dst}.at[{part}]" if part else dst
+                copies.append(f"pltpu.make_async_copy({src}, {dst}, {sem_})")
+            w(f"return {copies[0]}" if len(copies) == 1 else f"return {_COPIES}({', '.join(copies)})")
 
     def _moves_fn(self, w: _Writer, op: Operand) -> None:
         """`<op>_moves(at, prev)`: does the per-tile window move from tile `prev` to tile `at`?"""
@@ -731,8 +831,12 @@ class _Generator:
         """Where `tile`'s window starts in each dim a loop (or index array) moves, given the loops' blocks."""
         starts = []
         for window, dim in zip(tile.windows, self._array_shape(tile.array), strict=True):
-            if window.index is not None:
+            if window.index is not None and window.size is not None:
+                starts.append(self._runtime_index(_element(window.index, 0), block_of, dim))
+            elif window.index is not None:
                 starts.append(self._runtime_index(window.index, block_of, dim))
+            elif window.rows is not None:
+                starts += list(self._rows(window, block_of, dim))
             elif window.loop is not None and self._range(window.loop).count > 1:
                 starts.append(_scaled(block_of[window.loop], self._range(window.loop)))
         return starts
@@ -747,7 +851,9 @@ class _Generator:
             if out.phase is not None:
                 block_of[self.plan.phases[out.phase].range.var] = self.n_kb
             dst = f"{self.hbm[name]}.at[{self._window_index(tile, block_of)}]"
-            w(f"return pltpu.make_async_copy({self.bufs[name]}.at[{slot}], {dst}, {self.sems[name]}.at[{slot}])")
+            part = self._slot_index(tile, None, block_of)
+            src = f"{self.bufs[name]}.at[{slot}]" + (f".at[{part}]" if part else "")
+            w(f"return pltpu.make_async_copy({src}, {dst}, {self.sems[name]}.at[{slot}])")
 
     def _fill_copy_fns(self, w: _Writer) -> None:
         sch, c = self.schedule, self.n_c
@@ -771,6 +877,11 @@ class _Generator:
     def _setup(self, w: _Writer) -> None:
         plan, sch = self.plan, self.schedule
         w("")
+        if sch.runtime_tiles:
+            r = plan.parallel[0]
+            start, stop = (self._render(b, {}) for b in r.bounds)  # type: ignore[union-attr]
+            w("# The tiles that run, from the parallel loop's bounds.")
+            w(f"{self.n_tiles} = jnp.maximum(jax.lax.div(({stop}) - ({start}) + {r.step - 1}, {r.step}), 0)")
         if sch.runtime:
             count = f"{self.table_params[STEP_COUNT]}[0]"
             w(f"{self.n_steps} = {count}" if sch.repeats == 1 else f"{self.n_steps} = {sch.repeats} * {count}")
@@ -788,7 +899,8 @@ class _Generator:
         if per_tile:
             w("# The first tile's per-tile inputs.")
             at0 = sch.blocks_at(0)
-            w(*[f"{self.copy_fns[op.name]}({at0}, 0).start()" for op in per_tile])
+            with self._when(w, f"{self.n_tiles} > 0" if sch.runtime_tiles else None, "_first_tile_inputs"):
+                w(*[f"{self.copy_fns[op.name]}({at0}, 0).start()" for op in per_tile])
             # (A shared window's slot flips when it moves: tile 0's moves into slot 0.)
             w(*[f"{self.tile_slots}[{k}] = 1" for k in range(len(self.shared))])
         streamed = [op for op in plan.operands if op.kind is Kind.STREAM]
@@ -803,9 +915,16 @@ class _Generator:
             self._cursor_setup(w, streamed)
             return
         ahead = min(self.pipeline.input_buffers - 1, sch.steps)
+        if sch.runtime_tiles:  # (a step per tile, counted only now)
+            ahead = self.pipeline.input_buffers - 1
         if not ((streamed or iterated) and ahead):
             return
         w(f"# The first {ahead} step(s)' inputs.")
+        if sch.runtime_tiles:
+            for step in range(ahead):
+                with self._when(w, f"{step} < {self.n_tiles}", f"_first_inputs{step}"):
+                    w(*[f"{self.copy_fns[op.name]}({self.n_blocks}({step}), 0, {step}).start()" for op in streamed])
+            return
         if sch.runtime:  # the steps are known only now
             names = ("first_tile", "first_ph", "first_rb", "first_kb", "first_first", "first_empty")
             tile, ph, rb, kb, first, empty = (self.local(name) for name in names)
@@ -834,7 +953,7 @@ class _Generator:
     def _cursor_setup(self, w: _Writer, streamed: list[Operand]) -> None:
         """Both cursors at the first step; the first `input_buffers - 1` steps' inputs started, the second
         cursor moved past them."""
-        cursor, tiles = self.n_cursor, self.schedule.tiles
+        cursor, tiles = self.n_cursor, self.n_tiles
         w("# The cursors: this step, and the next step whose inputs are fetched.")
         w(*[f"{cursor}[{row}, {i}] = 0" for row in (0, 1) for i in range(3)])
         if not streamed:
@@ -944,7 +1063,7 @@ class _Generator:
         s, tile, ph, kb, at = self.n_s, self.n_tile, self.n_ph, self.n_kb, self.n_at
         first, last, empty = self.n_first, self.n_last, self.n_empty
         phases = len(plan.phases)
-        steps = self.n_steps if sch.runtime else str(sch.steps)
+        steps = self.n_steps if sch.runtime else self.n_tiles if sch.runtime_tiles else str(sch.steps)
         if self.single:  # a step is a tile: it is every phase's first and last step
             tile_first = tile_last = None
         else:
@@ -968,7 +1087,7 @@ class _Generator:
             if self.burst:
                 self._burst_start(w, streamed)
             elif streamed or iterated:
-                ahead_ok = f"{self.n_cursor}[1, 0] < {sch.tiles}" if self.cursor else f"{s} + {depth - 1} < {steps}"
+                ahead_ok = f"{self.n_cursor}[1, 0] < {self.n_tiles}" if self.cursor else f"{s} + {depth - 1} < {steps}"
                 with self._when(w, ahead_ok, "_fetch_ahead"):
                     ahead_tile, ahead_ph = self.local("ahead_tile"), self.local("ahead_ph")
                     ahead_kb, ahead_empty = self.local("ahead_kb"), self.local("ahead_empty")
@@ -1033,8 +1152,9 @@ class _Generator:
                 cond = f"{tile} >= {out_slots}" if tile_last is None else f"{tile_last} & ({tile} >= {out_slots})"
                 with self._when(w, cond, "_free_output_slot") if per_tile_outs else nullcontext():
                     zero = (0,) * len(plan.parallel)
-                    for out in per_tile_outs:
-                        w(f"{self.copy_fns[out.name]}({zero}, {_int_expr(tile, '%', out_slots)}).wait()")
+                    for out in per_tile_outs:  # (a ragged copy's size is its tile's: the copy of tile - slots)
+                        at = f"{self.n_blocks}({tile} - {out_slots})" if _ragged(out.tile) else zero
+                        w(f"{self.copy_fns[out.name]}({at}, {_int_expr(tile, '%', out_slots)}).wait()")
 
             if self.filled:
                 with self._when(w, tile_first, "_fill_skipped_tiles"):
@@ -1051,7 +1171,7 @@ class _Generator:
                     w(*[f"{self.copy_fns[out.name]}({at}, {slot}).start()" for out in plan.outputs])
                 self._burst_end(w, streamed)
         if self.cursor:  # until the cursor has passed the last tile
-            w(f"jax.lax.while_loop(lambda _: {self.n_cursor}[0, 0] < {sch.tiles}, {body}, jnp.int32(0))")
+            w(f"jax.lax.while_loop(lambda _: {self.n_cursor}[0, 0] < {self.n_tiles}, {body}, jnp.int32(0))")
 
     def _burst_start(self, w: _Writer, streamed: list[Operand]) -> None:
         """At a burst's first step: wait until the previous burst's outputs are out, then start fetching the
@@ -1092,7 +1212,7 @@ class _Generator:
             prev = f"{blocks}(jnp.maximum({tile} - 1, 0))"
             w(f"{moves[op.name]} = ({tile} == 0) | {self.moved_fns[op.name]}({at}, {prev})")
             w(f"{slots}[{k}] = jnp.where({moves[op.name]}, 1 - {slots}[{k}], {slots}[{k}])")
-        with self._when(w, f"{tile} + 1 < {self.schedule.tiles}", "_next_tile_inputs"):
+        with self._when(w, f"{tile} + 1 < {self.n_tiles}", "_next_tile_inputs"):
             next_slot = _int_expr(f"{tile} + 1", "%", TILE_SLOTS)
             for op in per_tile:
                 if op in self.shared:
@@ -1196,20 +1316,46 @@ class _Generator:
                     ]
                 )
                 continue
+            if sch.runtime_tiles:  # the last tiles' copies, of the tiles counted when the kernel started
+                for i in range(ob):
+                    last = f"{self.n_tiles} - {i + 1}"
+                    with self._when(w, f"{self.n_tiles} > {i}", f"_last_out{i}"):
+                        slot = _int_expr(f"({last})", "%", ob)
+                        w(f"{self.copy_fns[out.name]}({self.n_blocks}({last}), {slot}).wait()")
+                continue
             # The last copies of each output: a tile per tile, or per step of its phase.
             stores = sch.tiles * (1 if out.phase is None else self.plan.phases[out.phase].range.count)
             kb = "" if out.phase is None else "0, "
             for n in range(max(0, stores - ob), stores):
-                w(f"{self.copy_fns[out.name]}({zero}, {kb}{n % ob}).wait()")
+                at = sch.blocks_at(n) if _ragged(out.tile) else zero  # (a ragged copy's size is its tile's)
+                w(f"{self.copy_fns[out.name]}({at}, {kb}{n % ob}).wait()")
         for _ in range(min(sch.fills, FILLS_IN_FLIGHT) if self.filled else 0):
             w(*[f"{self.fill_copies[out.name]}({zero}).wait()" for out in self.filled])
 
 
+def _ragged(tile: Tile) -> bool:
+    """Does `tile`'s window copy as many rows as its bounds say (`autokernel.rows`)?"""
+    return any(w.rows is not None for w in tile.windows)
+
+
+def _gathered(tile: Tile) -> int:
+    """How many elements `tile`'s window gathers through an index array (0: it gathers none)."""
+    return next((w.size for w in tile.windows if w.index is not None and w.size is not None), 0)  # type: ignore[return-value]
+
+
+def _element(gather: ast.Subscript, element: int) -> ast.Subscript:
+    """The index array element a gathered window's `element`-th row reads: `idx[a : a + n]` -> `idx[a + element]`."""
+    dims = list(gather.slice.elts) if isinstance(gather.slice, ast.Tuple) else [gather.slice]
+    dims = [_parse_expr(f"({ast.unparse(d.lower)}) + {element}") if isinstance(d, ast.Slice) else d for d in dims]  # type: ignore[arg-type]
+    index = ast.Tuple(dims, ast.Load()) if len(dims) > 1 else dims[0]
+    return ast.Subscript(gather.value, index, ast.Load())
+
+
 def _may_stay(op: Operand, plan: Plan) -> bool:
-    """May a per-tile window be the same for consecutive tiles? If an index array places it, or a parallel
-    loop of more than one block doesn't move it."""
+    """May a per-tile window be the same for consecutive tiles? If an index array places it (or its rows), or
+    a parallel loop of more than one block doesn't move it."""
     moved_by_all = all(r.var in op.tile.loops for r in plan.parallel if r.count > 1)
-    return any(w.index is not None for w in op.tile.windows) or not moved_by_all
+    return any(w.index is not None or w.rows is not None for w in op.tile.windows) or not moved_by_all
 
 
 def _value_reads(plan: Plan) -> set[str]:
@@ -1265,9 +1411,16 @@ class _TileCode:
             out = next(o for o in plan.outputs if o.name == store.output)
             ob, buf = gen.pipeline.output_buffers, gen.bufs[out.name]
             value = self._cast(self._expr(store.value), out.value, out.tile.shape, out.dtype, f"{buf}.dtype")
+
+            def put(slot: str) -> ast.stmt:
+                if out.name in plan.unpacked:  # (words: into the buffer seen as words)
+                    words = self._expr(store.value.args[0])  # type: ignore[attr-defined]
+                    return _parse_stmt(f"{_UNPAIRS}({buf}, {slot}, WORDS, {gen.n_interpret})", WORDS=words)
+                return _parse_stmt(f"{buf}[{slot}] = VALUE", VALUE=value)
+
             if out.phase is None:
                 slot = _int_expr(gen.n_tile, "%", ob)
-                store_ = _parse_stmt(f"{buf}[{slot}] = VALUE", VALUE=value)
+                store_ = put(slot)
                 if gen.burst:  # copied out at the burst's end
                     return [store_]
                 return [store_, _parse_stmt(f"{gen.copy_fns[out.name]}({gen.n_at}, {slot}).start()")]
@@ -1278,7 +1431,7 @@ class _TileCode:
             wait = f"@pl.when({n} >= {ob})\ndef {free}():\n    {gen.copy_fns[out.name]}({zero}, 0, {slot}).wait()"
             return [
                 ast.parse(wait).body[0],
-                _parse_stmt(f"{buf}[{slot}] = VALUE", VALUE=value),
+                put(slot),
                 _parse_stmt(f"{gen.copy_fns[out.name]}({gen.n_at}, {gen.n_kb}, {slot}).start()"),
             ]
         if isinstance(stmt, ast.With):
@@ -1339,7 +1492,7 @@ class _TileCode:
         return target
 
     def _expr(self, expr: ast.expr) -> ast.expr:
-        gen, plan, renamed = self.gen, self.plan, self.renamed
+        gen, plan, renamed, code = self.gen, self.plan, self.renamed, self
 
         scalars = {r.var for r in plan.loops} | set(plan.constants)
 
@@ -1352,6 +1505,13 @@ class _TileCode:
                 return _parse_expr(f"{gen.words[operand]}[...].reshape({shape})")
 
             def visit_Subscript(self, node: ast.Subscript) -> ast.expr:
+                packed = plan.packed.get((node.value.lineno, node.value.col_offset))
+                if isinstance(node.value, ast.Name) and node.value.id not in renamed:
+                    packed = plan.packed_names.get(node.value.id)  # (words bound to a name: still strided)
+                if isinstance(node.value, ast.Call | ast.Name) and packed is not None:
+                    rows = code._packed_rows(packed, node)
+                    if rows is not None:  # one row of each pair-row group: a strided load
+                        return rows
                 operand = plan.reads.get(plan.read_key(node))
                 if operand is not None:
                     return _parse_expr(f"{gen.views[operand.name]}[...]")
@@ -1375,6 +1535,22 @@ class _TileCode:
                 return node
 
         return mxu.rewrite_matmuls(Rewrite().visit(copy.deepcopy(expr)))
+
+    def _packed_rows(self, operand: str, node: ast.Subscript) -> ast.expr | None:
+        """`pairs(x[...])[..., g, :]` (every other index `:`): row g of each group of the words' rows, as a
+        strided load from the VMEM buffer; None for other indexing (of the loaded words)."""
+        gen = self.gen
+        shape = next(op for op in self.plan.operands if op.name == operand).tile.shape
+        lead, group, d = shape[:-3], shape[-3], shape[-1]  # words (..., group, d)
+        dims = list(node.slice.elts) if isinstance(node.slice, ast.Tuple) else [node.slice]
+        full = [isinstance(i, ast.Slice) and i.lower is None and i.upper is None and i.step is None for i in dims]
+        if len(dims) != len(shape) - 1 or full[-2] or not all(full[:-2] + full[-1:]):
+            return None
+        n = math.prod(lead) if lead else 1
+        g = ast.unparse(self._expr(dims[-2]))
+        return _parse_expr(
+            f"{_STRIDED}({gen.words[operand]}, {g}, {n}, {group}, {gen.n_interpret}).reshape({(*lead, d)})"
+        )
 
     @staticmethod
     def _cast(

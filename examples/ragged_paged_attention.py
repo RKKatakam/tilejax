@@ -30,21 +30,61 @@ MASK_VALUE = -1e30  # finite: exp(old max - new max) never computes -inf + inf
 # --------------------------------------------------------------------------- the step's new keys and values
 
 
+@autokernel.kernel
+def rpa_write(kv_cache, keys, values, page_indices, write_page, write_rows, write_first, write_stop, n_writes):
+    """The cache (pages, page_size, Hkv, 2, D) updated in place with the step's new keys and values (T, Hkv,
+    D), a tile per run of a sequence's new tokens that lands in one page: the tokens from write_rows[w] go
+    to positions write_first[w] to write_stop[w] of page page_indices[write_page[w]]."""
+    ps, dtype = kv_cache.shape[1], kv_cache.dtype
+    out = kv_cache
+    for w in range(n_writes[0]):  # the runs, counted as the kernel runs
+        k = keys[autokernel.rows(write_rows[w], write_rows[w] + write_stop[w] - write_first[w], ps), :, :]
+        v = values[autokernel.rows(write_rows[w], write_rows[w] + write_stop[w] - write_first[w], ps), :, :]
+        words = key_value_words(k, v)
+        out = out.at[page_indices[write_page[w]], autokernel.rows(write_first[w], write_stop[w], ps), :, :, :].set(
+            autokernel.unpairs(words, dtype)
+        )
+    return out
+
+
+def writes(kv_lens, page_indices, cu_q_lens, distribution, page_size, max_tokens):
+    """`rpa_write`'s runs, in plain JAX (small dense ops): sequence s's new tokens, at positions
+    [kv_len - q_len, kv_len), cut at page boundaries. Arrays of a run count's bound, cdiv(T, page_size) +
+    sequences."""
+    S = kv_lens.shape[0]
+    pps = page_indices.shape[0] // S
+    seqs = jnp.arange(S, dtype=jnp.int32)
+    q_len = jnp.where(seqs < distribution[2], cu_q_lens[1:] - cu_q_lens[:-1], 0)
+    first = kv_lens - q_len
+    runs = jnp.where(q_len > 0, (kv_lens - 1) // page_size - first // page_size + 1, 0)
+    ends = jnp.cumsum(runs)
+    w = jnp.arange(-(-max_tokens // page_size) + S, dtype=jnp.int32)
+    seq = jnp.minimum(jnp.sum(ends[None, :] <= w[:, None], axis=1, dtype=jnp.int32), S - 1)
+    page = first[seq] // page_size + w - (ends[seq] - runs[seq])
+    start = jnp.maximum(first[seq], page * page_size)
+    return {
+        "write_page": seq * pps + page,
+        "write_rows": cu_q_lens[seq] + start - first[seq],
+        "write_first": start - page * page_size,
+        "write_stop": jnp.minimum(kv_lens[seq], (page + 1) * page_size) - page * page_size,
+        "n_writes": ends[-1:],
+    }
+
+
 def write_new_tokens(kv_cache, keys, values, kv_lens, page_indices, cu_q_lens, distribution):
     """The cache with the step's new tokens' keys and values at their positions [kv_len - q_len, kv_len),
-    in place (one XLA scatter; padding tokens are dropped)."""
-    T = keys.shape[0]
-    S, ps = kv_lens.shape[0], kv_cache.shape[1]
-    pps = page_indices.shape[0] // S
-    t = jnp.arange(T, dtype=jnp.int32)
-    seq = jnp.minimum(jnp.sum(cu_q_lens[None, 1:] <= t[:, None], axis=1, dtype=jnp.int32), S - 1)  # (no search loop)
-    real = t < cu_q_lens[distribution[2]]
-    pos = kv_lens[seq] - (cu_q_lens[seq + 1] - cu_q_lens[seq]) + (t - cu_q_lens[seq])
-    page = jnp.where(real, page_indices[seq * pps + pos // ps], kv_cache.shape[0])  # (out of bounds: dropped)
-    return kv_cache.at[page, pos % ps].set(jnp.stack([keys, values], axis=2).astype(kv_cache.dtype))
+    in place."""
+    runs = writes(kv_lens, page_indices, cu_q_lens, distribution, kv_cache.shape[1], keys.shape[0])
+    return rpa_write(kv_cache, keys, values, page_indices, *runs.values())
 
 
 # --------------------------------------------------------------------------- decode: one new token per sequence
+
+
+def key_value_words(k, v):
+    """Keys and values (..., D) bf16 as the cache's (key | value << 16) words (..., D)."""
+    bits = lambda x: jax.lax.bitcast_convert_type(x.astype(jnp.float32), jnp.uint32)  # noqa: E731
+    return (bits(k) >> 16) | (bits(v) & jnp.uint32(0xFFFF0000))
 
 
 def keys_values(words):
@@ -109,6 +149,128 @@ def make_decode(sm_scale: float) -> autokernel.Kernel:
     return rpa_decode
 
 
+# --------------------------------------------------------------------------- prefill and mixed: a block of queries
+
+
+BLOCK_Q = 256  # query tokens per tile
+
+
+@autokernel.tunable
+class PrefillTiles:
+    pages: int = autokernel.choice(1, 2, 4, 8, default=4)  # cache pages per step
+
+
+def head_rows(qb, kv_heads):
+    """A block of queries (BQ, H, D) as each kv head's rows (Hkv, BQ * G, D), row t * G + i its token t's
+    query head g * G + i (G = H / Hkv, as GQA groups heads)."""
+    bq, h, d = qb.shape
+    g = h // kv_heads
+    return jnp.stack([qb[:, i * g : (i + 1) * g, :].reshape(bq * g, d) for i in range(kv_heads)])
+
+
+def token_heads(rows, heads):
+    """`head_rows` undone: (Hkv, BQ * G, D) -> (BQ, H, D)."""
+    kv_heads, n, d = rows.shape
+    g = heads // kv_heads
+    return jnp.concatenate([rows[i].reshape(n // g, g, d) for i in range(kv_heads)], axis=1)
+
+
+def visible(heads, rows, cols, first_row, first_col, stop):
+    """Which (row, column) pairs attend: row t * G + i (a query at position first_row + t) sees the column's
+    position first_col + c if it is no later than its own and before `stop`."""
+    g = heads
+    shape = (1, rows, cols)
+    pos = first_row + jax.lax.broadcasted_iota(jnp.int32, shape, 1) // g
+    col = first_col + jax.lax.broadcasted_iota(jnp.int32, shape, 2)
+    return (col <= pos) & (col < stop)
+
+
+def online_softmax_heads(s, v, row_max, row_sum, acc):
+    """`online_softmax` for every kv head at once: s (Hkv, R, n), v (Hkv, n, D), lane-wide stats (Hkv, R, 128)."""
+    n, d = s.shape[-1], v.shape[-1]
+    max_new = jnp.maximum(row_max, jnp.max(s, axis=-1, keepdims=True))
+    p = jnp.exp(s - jnp.tile(max_new, (1, 1, n // LANES)))
+    alpha = jnp.exp(row_max - max_new)
+    row_sum = alpha * row_sum + jnp.sum(p, axis=-1, keepdims=True)
+    pv = jax.lax.dot_general(p.astype(v.dtype), v, (((2,), (1,)), ((0,), (0,))), preferred_element_type=jnp.float32)
+    return max_new, row_sum, jnp.tile(alpha, (1, 1, d // LANES)) * acc + pv
+
+
+def make_prefill(sm_scale: float) -> autokernel.Kernel:
+    """The attention of the sequences with several new tokens (RPA's prefill and mixed cases), a tile per
+    block of a sequence's queries."""
+
+    @autokernel.kernel
+    def rpa_prefill(
+        q, kv_cache, page_indices, tile_page, tile_rows, tile_pos, tile_stop, n_tiles, tiles=PrefillTiles()
+    ):
+        """q (T, H, D), the cache (pages, page_size, Hkv, 2, D) holding the new tokens already. Tile k <
+        n_tiles[0] is the queries tile_rows[k] to tile_rows[k + 1] (at most BLOCK_Q rows) of a sequence whose
+        pages start at page_indices[tile_page[k]]: its first query sits at position tile_pos[k], and they
+        attend to the positions before tile_stop[k]. The output is q updated in place: those rows become
+        their attention outputs."""
+        _, H, D = q.shape
+        ps, Hkv = kv_cache.shape[1], kv_cache.shape[2]
+        G, NP, BQ = H // Hkv, tiles.pages, BLOCK_Q
+        dtype = q.dtype
+        out = q
+        for k in range(n_tiles[0]):  # the tiles, counted as the kernel runs
+            qh = head_rows(q[autokernel.rows(tile_rows[k], tile_rows[k + 1], BQ), :, :], Hkv)
+            row_max = jnp.full((Hkv, BQ * G, LANES), MASK_VALUE, jnp.float32)
+            row_sum = jnp.zeros((Hkv, BQ * G, LANES), jnp.float32)
+            acc = jnp.zeros((Hkv, BQ * G, D), jnp.float32)
+            for j in range(0, tile_stop[k], NP * ps):  # NP pages a step, up to the tile's last query
+                # The step's NP pages, as words (NP, ps, Hkv, D).
+                words = autokernel.pairs(
+                    kv_cache[page_indices[tile_page[k] + j // ps : tile_page[k] + j // ps + NP], :, :, :, :]
+                )
+                kv = [keys_values(words[:, :, g, :]) for g in range(Hkv)]
+                k_heads = jnp.stack([k_ for k_, _ in kv])  # (Hkv, NP * ps, D)
+                v_heads = jnp.stack([v_ for _, v_ in kv])
+                s = jax.lax.dot_general(qh, k_heads, (((2,), (2,)), ((0,), (0,))), preferred_element_type=jnp.float32)
+                ok = visible(G, BQ * G, NP * ps, tile_pos[k], j, tile_stop[k])
+                row_max, row_sum, acc = online_softmax_heads(
+                    jnp.where(ok, s * sm_scale, MASK_VALUE), v_heads, row_max, row_sum, acc
+                )
+            o = acc * jnp.tile(1.0 / jnp.maximum(row_sum, 1e-30), (1, 1, D // LANES))
+            out = out.at[autokernel.rows(tile_rows[k], tile_rows[k + 1], BQ), :, :].set(token_heads(o, H).astype(dtype))
+        return out
+
+    return rpa_prefill
+
+
+@functools.cache
+def prefill_kernel(sm_scale: float) -> autokernel.Kernel:
+    return make_prefill(sm_scale)
+
+
+def prefill_tiles(kv_lens, page_indices, cu_q_lens, distribution, block_q=BLOCK_Q, max_tokens=None):
+    """The prefill kernel's tiles, in plain JAX (small dense ops; a TPU gathers and scatters slowly): a tile
+    per block of block_q queries of each sequence in [distribution[0], distribution[2]). Arrays of a tile
+    count's bound, cdiv(T, block_q) + sequences; their rows start at tile_rows (one more)."""
+    S = kv_lens.shape[0]
+    pps = page_indices.shape[0] // S
+    seqs = jnp.arange(S, dtype=jnp.int32)
+    q_len = cu_q_lens[1:] - cu_q_lens[:-1]
+    mixed = (seqs >= distribution[0]) & (seqs < distribution[2])
+    blocks = jnp.where(mixed, (q_len + block_q - 1) // block_q, 0)
+    ends = jnp.cumsum(blocks)
+    n = -(-max_tokens // block_q) + S
+    k = jnp.arange(n, dtype=jnp.int32)
+    seq = jnp.minimum(jnp.sum(ends[None, :] <= k[:, None], axis=1, dtype=jnp.int32), S - 1)
+    b = k - (ends[seq] - blocks[seq])
+    rows = cu_q_lens[seq] + b * block_q
+    stop = jnp.minimum(rows + block_q, cu_q_lens[seq + 1])
+    pos = kv_lens[seq] - q_len[seq] + b * block_q
+    return {
+        "tile_page": seq * pps,
+        "tile_rows": jnp.concatenate([rows[:1], stop]),  # (a tile's rows end where the next one's start)
+        "tile_pos": pos,
+        "tile_stop": pos + (stop - rows),
+        "n_tiles": ends[-1:],
+    }
+
+
 @functools.cache
 def decode_kernel(sm_scale: float) -> autokernel.Kernel:
     return make_decode(sm_scale)
@@ -116,17 +278,22 @@ def decode_kernel(sm_scale: float) -> autokernel.Kernel:
 
 def tune(inputs: dict[str, Any], sm_scale: float) -> Any:
     """Tune the kernels on these inputs (under jax.jit they would tune on random ones); the tuning."""
-    args = args_of(inputs)
-    cache = write_new_tokens(args[3], args[1], args[2], *args[4:])
-    return decode_kernel(float(sm_scale)).tuning(args[0], cache, *args[4:6], args[7])
+    q, k, v, cache, kv_lens, page_indices, cu_q_lens, distribution = args_of(inputs)
+    cache = write_new_tokens(cache, k, v, kv_lens, page_indices, cu_q_lens, distribution)
+    decode = decode_kernel(float(sm_scale)).tuning(q, cache, kv_lens, page_indices, distribution)
+    tiles = prefill_tiles(kv_lens, page_indices, cu_q_lens, distribution, max_tokens=q.shape[0])
+    prefill = prefill_kernel(float(sm_scale)).tuning(q, cache, page_indices, *tiles.values())
+    return f"decode: {decode}\nprefill: {prefill}"
 
 
 @functools.partial(jax.jit, static_argnames=("sm_scale",), donate_argnames=("queries", "kv_cache"))
 def autokernel_rpa(queries, keys, values, kv_cache, kv_lens, page_indices, cu_q_lens, distribution, *, sm_scale=1.0):
-    """RPA v3's `ragged_paged_attention` (default options): (out (T, H, D), the updated cache). Decode-only
-    batches for now."""
+    """RPA v3's `ragged_paged_attention` (default options): (out (T, H, D), the updated cache). The decode
+    sequences' attention, then the others' (both kernels update the queries in place)."""
     kv_cache = write_new_tokens(kv_cache, keys, values, kv_lens, page_indices, cu_q_lens, distribution)
     out = decode_kernel(float(sm_scale))(queries, kv_cache, kv_lens, page_indices, distribution)
+    tiles = prefill_tiles(kv_lens, page_indices, cu_q_lens, distribution, max_tokens=queries.shape[0])
+    out = prefill_kernel(float(sm_scale))(out, kv_cache, page_indices, *tiles.values())
     return out, kv_cache
 
 

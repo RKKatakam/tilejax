@@ -35,7 +35,7 @@ import inspect
 import itertools
 import traceback
 import types
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any
@@ -46,7 +46,7 @@ import numpy as np
 from jax._src import core as jax_core
 from jax._src import source_info_util
 
-from . import mxu, packing, v5e
+from . import mxu, packing, ragged, v5e
 from .errors import KernelError
 from .parse import Loop, Nest
 from .tilecode import as_store, assigned, element_reads, first_reads, flatten, reads
@@ -89,13 +89,17 @@ class Range:
 class Window:
     """How a tile indexes one array dim: from element `offset` (plus the value of `loop`, if any), `size`
     elements; `size` None is an integer index, which drops the dim from the tile. An integer index may be an
-    element of an index array (`index`, `expert[e]`), read when the kernel runs: `index_loops` move it."""
+    element of an index array (`index`, `expert[e]`), read when the kernel runs: `index_loops` move it. With
+    `index` a slice of an index array (`pages[b, p : p + n]`, `size` n) the window gathers those n
+    elements of the dim; with `rows` (`autokernel.rows(start, stop, size)`), it is `size` elements from
+    start, of which those before stop are copied."""
 
     loop: str | None
     offset: int
     size: int | None
     index: ast.Subscript | None = None
     index_loops: frozenset[str] = frozenset()
+    rows: tuple[ast.expr, ast.expr] | None = None
 
 
 @dataclass(frozen=True)
@@ -224,8 +228,11 @@ class Plan:
     assigned_types: Mapping[int, Mapping[str, jax.ShapeDtypeStruct]]  # id(stmt) -> the types it assigns
     constants: Mapping[str, Any]  # names the tile code reads from the module, closure and prologue
     scopes: tuple[str, ...]  # the names of the tile code's `jax.named_scope`s
-    # Tile reads taken as words (`autokernel.pairs(x[...])`): the call's (line, column) -> the operand read.
+    # Tile reads taken as words (`autokernel.pairs(x[...])`): the call's (line, column) -> the operand read;
+    # names the tile code binds once to such words (`words = pairs(x[...])`) -> the operand.
     packed: Mapping[tuple[int, int], str]
+    packed_names: Mapping[str, str]
+    unpacked: frozenset[str]  # outputs stored from words (`out.at[...].set(autokernel.unpairs(words, dtype))`)
     tile_ops: int  # operations in a tile's code traced as plain JAX (each phase body twice): its size
     env: dict[str, Any]  # the function's module and closure values, with the prologue's names over them
 
@@ -265,8 +272,8 @@ class Plan:
 
     @property
     def cursor(self) -> bool:
-        """Does a reduction loop have runtime bounds, so the kernel finds each step as it runs?"""
-        return any(phase.range.bounds is not None for phase in self.phases)
+        """Does a loop have runtime bounds, so the kernel finds each step (and tile) as it runs?"""
+        return any(r.bounds is not None for r in (*self.parallel, *(phase.range for phase in self.phases)))
 
     def eval(self, node: ast.expr, values: Mapping[str, Any] | None = None) -> Any:
         """Evaluate an expression of the function on the prologue's names (and `values`, e.g. loop values)."""
@@ -326,10 +333,12 @@ class _Planner:
         phases, segments, repeats = self._phases(reductions, repeat_loops)
         operands, reads_ = self._operands(phases, segments, repeats)
         packed = self._packed(reads_)
+        packed_names = self._packed_names(packed)
         stored_by = {name: self._storing_phase(name, phases) for name in self.nest.outputs}
-        if any(phase.range.bounds is not None for phase in phases):
-            self._check_cursor(stored_by)
+        if any(r.bounds is not None for r in (*parallel, *(phase.range for phase in phases))):
+            self._check_cursor(stored_by, outputs)
         output_tiles = {name: self._output_tile(name, *outputs[name], parallel) for name in self.nest.outputs}
+        unpacked = self._unpacked(output_tiles)
         self._check_reads_before_assignment()
         sequence = _Sequence(phases, segments, repeats)
         # Values the tile code updates part of (`a = a.at[k].set(v)`) live in VMEM too: Mosaic can't update
@@ -364,6 +373,8 @@ class _Planner:
             constants=self._constants(),
             scopes=scopes,
             packed=packed,
+            packed_names=packed_names,
+            unpacked=unpacked,
             tile_ops=types.ops,
             env=self.env,
         )
@@ -453,10 +464,14 @@ class _Planner:
         return Range(loop.var, r.start, r.step, len(r), loop.mask, runtime)
 
     def _runtime_range(self, loop: Loop) -> Range:
-        """A reduction loop whose bounds read index arrays: its start and stop are read when the kernel runs
-        (its step is an int when planning)."""
-        if loop not in self.nest.reductions:
-            raise self.error("only reduction loops' bounds may read index arrays", loop.node)
+        """A loop whose bounds read index arrays: its start and stop are read when the kernel runs (its step is
+        an int when planning). A reduction loop, or the one parallel loop (the kernel's tiles, counted as it
+        runs)."""
+        single = self.nest.parallel == (loop,)
+        if loop not in self.nest.reductions and not single:
+            raise self.error(
+                "only reduction loops' bounds, or a kernel's one parallel loop's, may read index arrays", loop.node
+            )
         if loop.mask is not None:
             raise self.error("a loop with runtime bounds can't be masked: put the condition in its bounds", loop.mask)
         start, stop, step = (ast.Constant(0), loop.bounds[0], 1) if len(loop.bounds) == 1 else (*loop.bounds[:2], None)
@@ -474,8 +489,23 @@ class _Planner:
             f"{text}: each index is `v:v + size` or `v` for a loop variable v, `:`, or constants (`start:stop`, an int)"
         )
         loop_vars = reads(index) & self.ranges.keys()
+        computed = reads(index) & assigned(self.nest.tile)
+        if computed and (self._is_rows(index) or isinstance(index, ast.Subscript)):
+            raise self.error(
+                f"{text}: a window's index can't read `{sorted(computed)[0]}`, which the tile code computes: the "
+                "kernel copies the window before the tile code runs",
+                index,
+            )
         if isinstance(index, ast.Subscript) and isinstance(index.value, ast.Name) and index.value.id in self.indices:
-            return Window(None, 0, None, index, frozenset(loop_vars))  # bounds: clamped when the kernel runs
+            sliced = [i for i in _dims(index) if isinstance(i, ast.Slice)]
+            if not sliced:
+                return Window(None, 0, None, index, frozenset(loop_vars))  # bounds: clamped when the kernel runs
+            return Window(None, 0, self._gathered(sliced, text), index, frozenset(loop_vars))
+        if self._is_rows(index):
+            start, stop, size = index.args  # type: ignore[attr-defined]
+            if reads(size) & self.ranges.keys():
+                raise self.error(f"{text}: autokernel.rows's size is an int when planning", size)
+            return Window(None, 0, self._int(size, text), None, frozenset(loop_vars), rows=(start, stop))
         if isinstance(index, ast.Slice):
             lower, upper = index.lower, index.upper
             if index.step is not None:
@@ -501,6 +531,33 @@ class _Planner:
             more = f": `{sorted(computed)[0]}` is computed by the tile code" if computed else ""
             raise self.error(f"{usage}, or an element of an index array written in place (`w[ids[e], :]`){more}", index)
         return self._checked(Window(None, self._int(index, text), None), dim, text, index)
+
+    def _gathered(self, sliced: list[ast.Slice], text: str) -> int:
+        """How many elements `idx[..., a : a + n]` gathers: n (one dim sliced so, n an int when planning)."""
+        usage = f"{text}: a window gathered through an index array slices one of its dims, `idx[a : a + n]`"
+        index = sliced[0]
+        if (
+            len(sliced) != 1
+            or index.step is not None
+            or index.lower is None
+            or not (isinstance(index.upper, ast.BinOp) and isinstance(index.upper.op, ast.Add))
+            or ast.dump(index.upper.left) != ast.dump(index.lower)
+            or reads(index.upper.right) & self.ranges.keys()
+        ):
+            raise self.error(usage, index)
+        return self._int(index.upper.right, text)
+
+    def _is_rows(self, index: ast.expr) -> bool:
+        """Is `index` a call of `autokernel.rows`?"""
+        if not (isinstance(index, ast.Call) and isinstance(index.func, ast.Name | ast.Attribute)):
+            return False
+        try:
+            func = self.eval(index.func)
+        except KernelError:
+            return False
+        if func is ragged.rows and (len(index.args) != 3 or index.keywords):
+            raise self.error("autokernel.rows takes (start, stop, size)", index)
+        return func is ragged.rows
 
     def _int(self, node: ast.expr, text: str) -> int:
         value = self.eval(node)
@@ -707,13 +764,59 @@ class _Planner:
                 found[(node.lineno, node.col_offset)] = operand.name
         return found
 
+    def _unpacked(self, output_tiles: Mapping[str, Tile]) -> frozenset[str]:
+        """The outputs stored from words (`unpairs(words, dtype)`, the stored value), into 16-bit tiles of
+        pairs of rows; `unpairs` anywhere else is an error."""
+        stored = {id(store.value): name for name, store in self.nest.stores.items()}
+        found = set()
+        for stmt in self.nest.tile:
+            for node in ast.walk(stmt):
+                if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name | ast.Attribute)):
+                    continue
+                try:
+                    func = self.eval(node.func)
+                except KernelError:
+                    continue  # a method of a value, a local function: not `unpairs`
+                if func is not packing.unpairs:
+                    continue
+                name = stored.get(id(node))
+                if name is None or len(node.args) != 2 or node.keywords:
+                    raise self.error(
+                        "autokernel.unpairs(words, dtype) is a stored value, `out.at[...].set(unpairs(w, out.dtype))`",
+                        node,
+                    )
+                tile = output_tiles[name]
+                if tile.dtype.itemsize != 2 or len(tile.shape) < 2 or tile.shape[-2] != 2:
+                    raise self.error(
+                        f"autokernel.unpairs stores a 16-bit tile of pairs of rows (..., 2, d), not {tile.dtype.name}"
+                        f"{list(tile.shape)}",
+                        node,
+                    )
+                found.add(name)
+        return frozenset(found)
+
+    def _packed_names(self, packed: Mapping[tuple[int, int], str]) -> dict[str, str]:
+        """The names the tile code assigns once, to words (`words = autokernel.pairs(x[...])`)."""
+        counts: dict[str, int] = {}
+        for stmt in flatten(self.nest.tile):
+            for name in assigned([stmt]):
+                counts[name] = counts.get(name, 0) + 1
+        found = {}
+        for stmt in flatten(self.nest.tile):
+            if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+                value, name = stmt.value, stmt.targets[0].id
+                if isinstance(value, ast.Call) and (value.lineno, value.col_offset) in packed and counts[name] == 1:
+                    found[name] = packed[(value.lineno, value.col_offset)]
+        return found
+
     def _index_arrays(self) -> list[Index]:
         """The inputs read element by element (`lengths[b]`), in parameter order: int32, read only that way,
         indexed by loop variables and constants."""
         nest, params = self.nest, set(self.nest.params)
         trees: list[ast.AST] = [*nest.tile, *(loop.mask for loop in nest.reductions if loop.mask is not None)]
-        trees += [bound for loop in nest.reductions for bound in loop.bounds]
-        elements = [n for tree in trees for n in element_reads(tree, params)]
+        trees += [bound for loop in nest.loops for bound in loop.bounds]
+        gathers = [n for tree in trees for n in _gathers(tree, params)]
+        elements = [n for tree in trees for n in element_reads(tree, params)] + gathers
         found = []
         for p, name in enumerate(nest.params):
             mine = [n for n in elements if n.value.id == name]  # type: ignore[attr-defined]
@@ -745,9 +848,15 @@ class _Planner:
                 text = ast.unparse(node)
                 if len(index) != len(spec.shape):
                     raise self.error(f"{text}: index every one of {name}'s {len(spec.shape)} dims", node)
-                if any(isinstance(n, ast.Subscript) for i in index for n in ast.walk(i)):
+                index = [i for i in index if not isinstance(i, ast.Slice)] + [  # (a gather's slice's bounds)
+                    b for i in index if isinstance(i, ast.Slice) for b in (i.lower, i.upper) if b is not None
+                ]
+                nested = [n for i in index for n in ast.walk(i) if isinstance(n, ast.Subscript)]
+                if any(not (isinstance(n.value, ast.Name) and n.value.id in params) for n in nested):
                     raise self.error(
-                        f"{text}: an index array's elements are indexed by loop variables and constants", node
+                        f"{text}: an index array's elements are indexed by loop variables, constants and other "
+                        "elements",
+                        node,
                     )
             found.append(Index(name, p, tuple(spec.shape), np.dtype(spec.dtype)))
         return found
@@ -757,14 +866,14 @@ class _Planner:
         evaluating each index at every value of the loops it reads (index arrays are in SMEM, unchecked)."""
         nest = self.nest
         trees: list[ast.AST] = [*nest.tile, *(loop.mask for loop in nest.reductions if loop.mask is not None)]
-        trees += [bound for loop in nest.reductions for bound in loop.bounds]
+        trees += [bound for loop in nest.loops for bound in loop.bounds]
         for node in (n for tree in trees for n in element_reads(tree, self.indices)):
             index = self.indices[node.value.id]  # type: ignore[attr-defined]
             dims = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
             for expr, dim in zip(dims, index.shape, strict=True):
                 loops = [self.ranges[v] for v in sorted(reads(expr) & self.ranges.keys())]
-                if any(r.bounds is not None for r in loops):
-                    continue  # a runtime range's values are known when the kernel runs: it clamps them
+                if any(r.bounds is not None for r in loops) or element_reads(expr, self.indices):
+                    continue  # known only when the kernel runs (a runtime range's values, an element): clamped
                 for values in itertools.product(*(range(r.count) for r in loops)):
                     at = {r.var: r.value(b) for r, b in zip(loops, values, strict=True)}
                     value = evaluate(nest, self.env, expr, at)
@@ -776,10 +885,18 @@ class _Planner:
                             node,
                         )
 
-    def _check_cursor(self, stored_by: dict[str, int | None]) -> None:
+    def _check_cursor(self, stored_by: dict[str, int | None], outputs: dict[str, Any]) -> None:
         """A kernel with runtime ranges finds its steps as it runs, from the bounds alone: its reduction loops
-        have no masks, there are no repeat loops, and outputs are stored per tile."""
-        node = next(loop.node for loop in self.nest.reductions if self.ranges[loop.var].bounds is not None)
+        have no masks, there are no repeat loops, and outputs are stored per tile; with a runtime count of
+        tiles, nothing masks tiles and every output is an input updated in place (no tile stores the rest)."""
+        node = next(loop.node for loop in self.nest.loops if self.ranges[loop.var].bounds is not None)
+        if self.ranges[self.nest.parallel[0].var].bounds is not None:
+            plain = [name for name, (_, _, fill) in outputs.items() if fill is not None]
+            if plain:
+                raise self.error(
+                    f"a kernel with a runtime count of tiles stores only outputs updated in place (`{plain[0]} = x`)",
+                    node,
+                )
         if any(r.mask is not None for r in self.ranges.values() if r.var in {lp.var for lp in self.nest.reductions}):
             raise self.error("a kernel with runtime loop bounds can't mask its reduction loops", node)
         if self.nest.repeats:
@@ -814,7 +931,10 @@ class _Planner:
         store = self.nest.stores[name]
         tile = self._tile(name, shape, dtype, store.index, store.node)
         uses = [w.loop for w in tile.windows if w.loop] + [v for w in tile.windows for v in sorted(w.index_loops)]
+        if any(w.index is not None and w.size is not None for w in tile.windows):
+            raise self.error(f"{tile.text}: an output tile isn't gathered through an index array", store.node)
         scatter = next((w.index for w in tile.windows if w.index is not None), None)
+        scatter = scatter or next((w.rows[0] for w in tile.windows if w.rows is not None), None)
         if scatter is not None and fill is not None:
             raise self.error(
                 f"{tile.text}: an index array places this tile, so no tile might store the rest of `{name}`: "
@@ -824,7 +944,9 @@ class _Planner:
         r = self.nest.stored_in[name]
         placing = [*parallel, *([self.ranges[self.nest.reductions[r].var]] if r is not None else [])]
         for r in placing:
-            if uses.count(r.var) != 1:
+            # (Index arrays place a scattered tile: any of its dims may read the loop, the arrays' values
+            # keep its tiles apart.)
+            if uses.count(r.var) != 1 and not (scatter is not None and r.var in uses):
                 what = "every parallel loop places" if r in parallel else f"`{r.var}`'s steps each store"
                 raise self.error(
                     f"{tile.text}: {what} each output tile, so `{r.var}` indexes exactly one dim of the output",
@@ -832,7 +954,7 @@ class _Planner:
                 )
         for window, dim in zip(tile.windows, shape, strict=True):
             r = self.ranges.get(window.loop) if window.loop else None
-            if window.index is not None:
+            if window.index is not None or window.rows is not None:
                 continue  # a window the kernel chooses when it runs: it needn't cover the dim
             if r is None:
                 if window.offset != 0 or window.size != dim:
@@ -1129,8 +1251,33 @@ class _TypeTrace:
 
 
 def _is_autokernel(value: Any) -> bool:
-    """Is `value` autokernel's package or `autokernel.pairs` (which only the planner reads)?"""
-    return value is packing.pairs or (isinstance(value, types.ModuleType) and value.__name__ == __package__)
+    """Is `value` autokernel's package or one of its kernel-code functions (which only the planner reads:
+    the kernel reads VMEM, or copies rows, in their place)?"""
+    return (
+        value is packing.pairs
+        or value is packing.unpairs
+        or value is ragged.rows
+        or (isinstance(value, types.ModuleType) and value.__name__ == __package__)
+    )
+
+
+def _dims(node: ast.Subscript) -> list[ast.expr]:
+    """A subscript's indices, one per dim."""
+    return list(node.slice.elts) if isinstance(node.slice, ast.Tuple) else [node.slice]
+
+
+def _gathers(tree: ast.AST, arrays: Iterable[str]) -> list[ast.Subscript]:
+    """Slices of `arrays` that are an index of another subscript: windows gathered through an index array,
+    `x[idx[a : a + n], :]`."""
+    names = set(arrays)
+    return [
+        i
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Subscript)
+        for i in _dims(n)
+        if isinstance(i, ast.Subscript) and isinstance(i.value, ast.Name) and i.value.id in names
+        if any(isinstance(d, ast.Slice) for d in _dims(i))
+    ]
 
 
 def _count_ops(jaxpr: Any) -> int:
