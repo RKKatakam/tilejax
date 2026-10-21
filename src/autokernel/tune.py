@@ -184,7 +184,7 @@ def proposals(kernel: Kernel, signature: Signature, trial: Trial) -> list[Config
     for tunable in neighbours(config.tunable) if config.tunable is not None else ():
         try:
             plan, schedule = kernel.build(signature, tunable)
-            pipeline = _keep(plan, schedule, pipe)
+            pipeline = _keep(plan, schedule, pipe, here)
         except KernelError:
             continue  # breaks a layout rule, doesn't divide a loop, doesn't fit in VMEM, ...
         if _loop_steps(plan) == loops:
@@ -199,15 +199,20 @@ def proposals(kernel: Kernel, signature: Signature, trial: Trial) -> list[Config
     return moves + [c for _, c in near]
 
 
-def _keep(plan: Plan, schedule: Schedule, pipe: Pipeline) -> Pipeline:
-    """The buffering for new tiles: `pipe` if it fits with them, else the most that does (for bursts, the
-    longest that fits; none if the tiles take more than one step)."""
-    if fits(plan, schedule, pipe) and (plan.single_step or not pipe.burst):
-        return pipe
-    burst = pipe.burst // 2 if plan.single_step else 0
-    while burst and not fits(plan, schedule, Pipeline.bursts(burst)):
+def _keep(plan: Plan, schedule: Schedule, pipe: Pipeline, before: _Stats) -> Pipeline:
+    """The buffering for new tiles: `pipe` if it fits with them, else the most that does. Bursts keep the
+    bytes they move (what a burst gains depends on), as near as a power of two of steps does, as long as
+    that fits; none if the new tiles take more than one step."""
+    if not pipe.burst:
+        return pipe if fits(plan, schedule, pipe) else default_pipeline(plan, schedule)
+    if not plan.single_step:
+        return default_pipeline(plan, schedule)
+    after = _stats(plan, schedule)
+    burst = pipe.burst * (before.dma_bytes / before.steps) / (after.dma_bytes / after.steps)
+    burst = min(MAX_BURST, 2 ** max(0, round(math.log2(burst))))
+    while burst > 1 and not fits(plan, schedule, Pipeline.bursts(burst)):
         burst //= 2
-    return Pipeline.bursts(burst) if burst else default_pipeline(plan, schedule)
+    return Pipeline.bursts(burst)
 
 
 def _bursts(burst: int) -> list[int]:

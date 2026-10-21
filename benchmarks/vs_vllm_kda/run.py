@@ -48,7 +48,18 @@ def methods(options: dict) -> dict:
     found = {"vllm": functools.partial(decode_kda, **options), "autokernel": functools.partial(kda_decode, **options)}
     if not options:
         found["xla"] = xla_decode
+        found["xla_highest"] = _highest(xla_decode)
     return found
+
+
+def _highest(fn):
+    """`fn` traced with f32 matmuls at full precision (XLA rewrites some reductions into matmuls)."""
+
+    def run(*args):
+        with jax.default_matmul_precision("highest"):
+            return fn(*args)
+
+    return run
 
 
 def step_bytes(inputs: dict) -> int:

@@ -11,7 +11,7 @@ from test_tune import Tiles, X, profile
 
 import autokernel
 from autokernel import Config, KernelError, Pipeline
-from autokernel.tune import _bursts, proposals
+from autokernel.tune import _bursts, _keep, _Stats, proposals
 
 # Rows of a pool updated in place, through an index array; a weight read once; the rows scaled.
 SCATTER = """
@@ -142,7 +142,7 @@ def test_copy_bound_single_step_kernels_try_bursts():
     configs = proposals(kernel, sig, autokernel.Trial(burst, profile(burst, seconds=10e-6, wait=5e-6)))
     assert [c.pipeline for c in configs] == [Pipeline.bursts(16), Pipeline.bursts(4)]
     configs = proposals(kernel, sig, autokernel.Trial(burst, profile(burst, seconds=10e-6)))
-    assert configs == [Config(Rows(tm=128), Pipeline.bursts(8))]
+    assert configs == [Config(Rows(tm=128), Pipeline.bursts(4))]  # tiles twice as big: as many bytes a burst
     # Compute-bound: no bursts.
     compute = autokernel.Trial(start, profile(start, seconds=10e-6))
     assert not any(c.pipeline.burst for c in proposals(kernel, sig, compute))
@@ -157,7 +157,7 @@ def test_neighbours_whose_tiles_take_steps_drop_the_bursts():
     configs = proposals(k, sig, autokernel.Trial(single, profile(single, seconds=10e-6)))
     stepped = next(c for c in configs if c.tunable == Tiles(tm=128, tk=128))
     assert stepped.pipeline == Pipeline(3, 2)
-    assert next(c for c in configs if c.tunable == Tiles(tm=64, tk=256)).pipeline == Pipeline.bursts(2)
+    assert next(c for c in configs if c.tunable == Tiles(tm=64, tk=256)).pipeline == Pipeline.bursts(4)
 
 
 @autokernel.tunable
@@ -179,4 +179,8 @@ def test_neighbours_keep_the_longest_bursts_that_fit():
     sig = kernel.signature(spec(16384, 512))
     start = Config(BigRows(), Pipeline.bursts(16))  # 2 MiB tiles: 48 slots, 96 MiB
     configs = proposals(kernel, sig, autokernel.Trial(start, profile(start, seconds=10e-6)))
-    assert configs == [Config(BigRows(tm=4096), Pipeline.bursts(4))]  # 8 MiB tiles: 16 or 8 steps don't fit
+    assert configs == [Config(BigRows(tm=4096), Pipeline.bursts(4))]  # 8 MiB tiles: as many bytes a burst
+    plan, schedule = kernel.build(sig, BigRows(tm=4096))
+    tiny = _Stats(steps=16, dma_bytes=16 * 2**26)  # steps of 64 MiB before: 16 MiB ones would need 64
+    assert _keep(plan, schedule, Pipeline.bursts(16), tiny) == Pipeline.bursts(4)  # (16 is the most, 4 fits)
+    assert _keep(plan, schedule, Pipeline(3, 2), tiny) == Pipeline(3, 2)
