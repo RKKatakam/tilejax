@@ -1012,8 +1012,8 @@ class _Planner:
 
     def _check_cursor(self, stored_by: dict[str, int | None], outputs: dict[str, Any]) -> None:
         """A kernel with runtime ranges (or computed index arrays) finds its steps as it runs, from the bounds
-        alone: its reduction loops have no masks, and outputs are stored per tile; with a runtime count of
-        tiles, nothing masks tiles and every output is an input updated in place (no tile stores the rest)."""
+        (and masks): outputs are stored per tile; with a runtime count of tiles, nothing masks tiles and every
+        output is an input updated in place (no tile stores the rest)."""
         bounded = [loop.node for loop in self.nest.loops if self.ranges[loop.var].bounds is not None]
         node = bounded[0] if bounded else self.nest.parallel[0].node
         if self.ranges[self.nest.parallel[0].var].bounds is not None:
@@ -1023,8 +1023,6 @@ class _Planner:
                     f"a kernel with a runtime count of tiles stores only outputs updated in place (`{plain[0]} = x`)",
                     node,
                 )
-        if any(r.mask is not None for r in self.ranges.values() if r.var in {lp.var for lp in self.nest.reductions}):
-            raise self.error("a kernel with runtime loop bounds can't mask its reduction loops", node)
         if any(phase is not None for phase in stored_by.values()):
             raise self.error("a kernel with runtime loop bounds stores its outputs per tile", node)
 

@@ -137,6 +137,38 @@ def test_indices_made_once_per_tile_and_constants_in_bounds():
     assert [c.repeat for c in kernel.lower(x).plan.computed] == [None]
 
 
+def test_masks_in_a_kernel_that_finds_its_steps_as_it_runs():
+    kernel = make_kernel(
+        """
+        def f(x, n, lengths):
+            out = jnp.zeros((24, 128))
+            for i in range(0, 24, 8):
+                acc = jnp.zeros((8, 128))
+                for j in range(0, n[0], 128):  # a runtime range: the cursor
+                    acc += x[i : i + 8, j : j + 128]
+                for j2 in range(0, 512, 128):
+                    if j2 >= lengths[i // 8] or j2 == 128:  # a runtime mask, skipping blocks as the cursor moves
+                        continue
+                    acc += x[i : i + 8, j2 : j2 + 128] * 2
+                for j3 in range(0, 256, 128):
+                    if j3 > 0:  # a static mask
+                        continue
+                    acc += x[i : i + 8, j3 : j3 + 128] * 3
+                out = out.at[i : i + 8, :].set(acc)
+            return out
+        """
+    )
+    x, n, lengths = rand((24, 512)), jnp.array([256], jnp.int32), jnp.array([512, 0, 200], jnp.int32)
+    out = run_checking_races(kernel, x, n, lengths)
+    xs = f64(x)
+    for t, length in enumerate([512, 0, 200]):
+        rows = xs[8 * t : 8 * t + 8]
+        want = rows[:, :128] + rows[:, 128:256] + 3 * rows[:, :128]
+        want += 2 * sum(rows[:, j : j + 128] for j in range(0, 512, 128) if j < length and j != 128)
+        np.testing.assert_allclose(f64(out[8 * t : 8 * t + 8]), want, rtol=1e-5, atol=1e-5)
+    assert kernel.lower(x, n, lengths).schedule.cursor and "def seek(" in kernel.lower(x, n, lengths).source
+
+
 def test_a_runtime_range_in_a_repeat_loop():
     kernel = make_kernel(
         """

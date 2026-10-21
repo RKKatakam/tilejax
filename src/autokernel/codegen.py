@@ -257,6 +257,12 @@ class _Generator:
         # Computed index arrays (plan.Computed): a VMEM buffer the tile code's value is staged in, and its SMEM
         # copy, which windows and bounds read; the counters (the steps whose inputs started, and how many times
         # each computed array has been made) in SMEM.
+        # Masked reduction loops in a kernel that finds its steps as it runs: each cursor also holds the next
+        # block its mask runs and two flags (its phase's first step; an empty step), the blocks between
+        # skipped by a scalar loop as it moves (`seek`).
+        self.cursor_masked = [p for p, phase in enumerate(plan.phases) if phase.range.mask is not None]
+        self.cursor_fields = (4 if self.repeated else 3) + (2 if self.cursor_masked else 0)
+        self.n_seek, self.n_enter, self.n_skips = n("seek"), n("enter"), n("skips")
         self.stage = {c.name: n(f"{c.name}_stage") for c in plan.computed}
         self.computed_smem = {c.name: n(f"{c.name}_smem") for c in plan.computed}
         self.n_stage_sem, self.n_counters = n("stage_sem"), n("counters")
@@ -509,10 +515,11 @@ class _Generator:
             names = ", ".join(op.name for op in self.shared)
             lines.append(f"pltpu.SMEM(({len(self.shared)},), jnp.int32),  # {self.tile_slots}: the slots of {names}")
         if self.cursor:
-            fields = "(tile, phase, block, iteration)" if self.repeated else "(tile, phase, block)"
+            names = ["tile", "phase", "block", *(["iteration"] if self.repeated else [])]
+            names += ["next block", "flags"] if self.cursor_masked else []
             lines.append(
-                f"pltpu.SMEM((2, {4 if self.repeated else 3}), jnp.int32),  # {self.n_cursor}: {fields} now and "
-                "fetched next"
+                f"pltpu.SMEM((2, {self.cursor_fields}), jnp.int32),  # {self.n_cursor}: ({', '.join(names)}) now "
+                "and fetched next"
             )
             made = "".join(f", times `{c.name}` was made" for c in self.plan.computed)
             lines.append(
@@ -651,6 +658,9 @@ class _Generator:
                 counts.append(f"jnp.maximum(jax.lax.div(({stop}) - ({start}) + {r.step - 1}, {r.step}), 0)")
             w(f"return ({_tuple(counts or ['1'])})")  # (a tile without reduction loops: one step)
 
+        if self.cursor_masked:
+            self._masked_cursor_fns(w, args)
+            return
         n = self.local("n")
         fields = [tile, ph, kb, *([rb] if self.repeated else [])]
 
@@ -698,6 +708,96 @@ class _Generator:
                 w(f"{cursor}[row, 1] = jnp.where(more, {ph}, jnp.where(later, {ph} + 1, 0))")
                 w(f"{cursor}[row, 0] = jnp.where(more | later, {tile}, {tile} + 1)")
 
+    def _masked_cursor_fns(self, w: _Writer, args: str) -> None:
+        """The cursor functions when masks skip blocks: `skips`, `seek`, `enter`, `step` and `advance`."""
+        plan, tile, ph, kb, rb, cursor = self.plan, self.n_tile, self.n_ph, self.n_kb, self.n_rb, self.n_cursor
+        phases = len(plan.phases)
+        nxt, flags = (4 if self.repeated else 3), (5 if self.repeated else 4)
+        n, k = self.local("n"), self.local("k")
+
+        def count(w: _Writer, phase: str) -> None:
+            w(f"{n} = {self.n_counts}({args})[0]")
+            for p in range(1, phases):
+                w(f"{n} = jnp.where({phase} == {p}, {self.n_counts}({args})[{p}], {n})")
+
+        with w.block(f"def {self.n_skips}({tile}, {rb}, {ph}, {k}):"):
+            w('"""Does phase ph\'s mask skip its block k (of the tile-th tile, in iteration rb)?"""')
+            self._unpack(w, f"{self.n_blocks}({tile})")
+            skip = "False"
+            for p in self.cursor_masked:  # (jnp.where reads every mask: each at a block of its own loop)
+                phase = plan.phases[p]
+                own = f"jnp.minimum({k}, {phase.range.count - 1})"
+                values = {r.var: self.blk[r.var] for r in plan.parallel} | {phase.range.var: own}
+                if phase.repeat is not None:
+                    values[plan.repeats[phase.repeat].range.var] = rb
+                mask = self._render(phase.range.mask, values)  # type: ignore[arg-type]
+                skip = f"jnp.where({ph} == {p}, {mask}, {skip})"
+            w(f"return {skip}")
+        with w.block(f"def {self.n_seek}({tile}, {rb}, {ph}, {k}, {n}):"):
+            w('"""The first block from k its mask runs (n if none)."""')
+            # (Both sides are evaluated: the mask at a block inside the loop, so its index array reads stay in.)
+            inside = f"jnp.clip(b, 0, jnp.maximum({n} - 1, 0))"
+            cond = f"lambda b: (b < {n}) & {self.n_skips}({tile}, {rb}, {ph}, {inside})"
+            w(f"return jax.lax.while_loop({cond}, lambda b: b + 1, {k})")
+        with w.block(f"def {self.n_enter}(row, {tile}, {ph}, {rb}):"):
+            w('"""Put cursor `row` at the first step of phase ph of the tile-th tile (iteration rb): its first block')
+            w('that runs, or one empty step."""')
+            count(w, ph)
+            first = self.local("first_block")
+            w(f"{first} = {self.n_seek}({tile}, {rb}, {ph}, 0, {n})")
+            w(f"{cursor}[row, 0], {cursor}[row, 1] = {tile}, {ph}")
+            w(f"{cursor}[row, 2] = jnp.where({first} < {n}, {first}, 0)")
+            if self.repeated:
+                w(f"{cursor}[row, 3] = {rb}")
+            after = f"{self.n_seek}({tile}, {rb}, {ph}, {first} + 1, {n})"
+            w(f"{cursor}[row, {nxt}] = jnp.where({first} < {n}, {after}, {n})")
+            w(f"{cursor}[row, {flags}] = jnp.where({first} < {n}, 1, 3)")
+
+        fields = [tile, ph, kb, *([rb] if self.repeated else [])]
+
+        def read(w: _Writer) -> None:
+            w(f"{_tuple(fields)} = {', '.join(f'{cursor}[row, {i}]' for i in range(len(fields)))}")
+            count(w, ph)
+
+        with w.block(f"def {self.n_step}(row):"):
+            w(
+                '"""The step cursor `row` is at (0: this step, 1: the step fetched next): its tile, phase, '
+                + ("repeat loop iteration, " if self.repeated else "")
+                + "block,"
+            )
+            w('whether it is the phase\'s first and last step, and empty."""')
+            read(w)
+            first, last, empty = (f"({cursor}[row, {flags}] & 1) != 0", f"{cursor}[row, {nxt}] >= {n}",
+                                  f"({cursor}[row, {flags}] & 2) != 0")  # fmt: skip
+            w(f"return {self._targets(tile, ph, rb, kb, first, last, empty)}")
+        with w.block(f"def {self.n_advance}(row):"):
+            w('"""Move cursor `row` to the next step: the next block its mask runs, else the next phase (the first of')
+            w('its repeat loop again, in the next iteration), else the next tile."""')
+            read(w)
+            w(f"more = {cursor}[row, {nxt}] < {n}")
+            iteration = rb if self.repeated else "0"
+            with self._when(w, "more", "_next_block"):
+                w(f"{cursor}[row, 2] = {cursor}[row, {nxt}]")
+                w(f"{cursor}[row, {nxt}] = {self.n_seek}({tile}, {iteration}, {ph}, {cursor}[row, {nxt}] + 1, {n})")
+                w(f"{cursor}[row, {flags}] = 0")
+            with self._when(w, "jnp.logical_not(more)", "_next_phase"):
+                ends = {rep.last - 1: rep for rep in plan.repeats}
+                again = " | ".join(f"(({ph} == {p}) & ({rb} + 1 < {rep.range.count}))" for p, rep in ends.items())
+                w(f"again = {again or 'jnp.bool_(False)'}")
+                back = f"{ph} + 1"
+                for p, rep in ends.items():
+                    back = f"jnp.where({ph} == {p}, {rep.first}, {back})"
+                later = f"{ph} + 1 < {phases}"
+                keep = [p for p, phase in enumerate(plan.phases[:-1]) if phase.repeat is not None and p not in ends]
+                kept = " | ".join(f"({ph} == {p})" for p in keep) or "False"
+                w(f"to_ph = jnp.where(again, {back}, jnp.where({later}, {ph} + 1, 0))")
+                w(f"to_rb = jnp.where(again, {iteration} + 1, jnp.where({kept}, {iteration}, 0))")
+                w(f"to_tile = jnp.where(again | ({later}), {tile}, {tile} + 1)")
+                with self._when(w, f"to_tile < {self.n_tiles}", "_enter"):
+                    w(f"{self.n_enter}(row, to_tile, to_ph, to_rb)")
+                with self._when(w, f"to_tile >= {self.n_tiles}", "_past"):
+                    w(f"{cursor}[row, 0] = to_tile")
+
     def _fetch_once(self, w: _Writer, limit: str, name: str) -> None:
         """Start the inputs of the step cursor 1 is at, if fewer than `limit` steps' have started and it may
         start now (its windows and bounds read computed index arrays made for its iteration), and move it on."""
@@ -713,6 +813,14 @@ class _Generator:
         streamed = [op for op in plan.operands if op.kind is Kind.STREAM]
         iterated = [op for op in plan.operands if op.kind is Kind.ITERATION]
         with self._when(w, " & ".join(f"({c})" for c in conditions), name):
+            consumers = sorted({p for c in plan.computed for p in c.consumers})
+            if self.cursor_masked and consumers:
+                # The cursor entered this phase before what bounds it was made: enter it again, now that it is.
+                flags = 5 if self.repeated else 4
+                at = " | ".join(f"({cursor}[1, 1] == {p})" for p in consumers)
+                with self._when(w, f"({at}) & (({cursor}[1, {flags}] & 1) != 0)", "_enter_made"):
+                    rb_now = f"{cursor}[1, 3]" if self.repeated else "0"
+                    w(f"{self.n_enter}(1, {cursor}[1, 0], {cursor}[1, 1], {rb_now})")
             tile, ph, kb = self.local("ahead_tile"), self.local("ahead_ph"), self.local("ahead_kb")
             rb, first, empty = self.local("ahead_rb"), self.local("ahead_first"), self.local("ahead_empty")
             w(f"{self._targets(tile, ph, rb, kb, first if iterated else '_', '_', empty)} = {self.n_step}(1)")
@@ -1072,7 +1180,10 @@ class _Generator:
         started (those that may start), the second cursor moved past them."""
         cursor, counters = self.n_cursor, self.n_counters
         w("# The cursors: this step, and the next step whose inputs are fetched; the counters.")
-        w(*[f"{cursor}[{row}, {i}] = 0" for row in (0, 1) for i in range(4 if self.repeated else 3)])
+        if self.cursor_masked:  # (at the first block the masks run)
+            w(*[f"{self.n_enter}({row}, 0, 0, 0)" for row in (0, 1)])
+        else:
+            w(*[f"{cursor}[{row}, {i}] = 0" for row in (0, 1) for i in range(self.cursor_fields)])
         w(*[f"{counters}[{i}] = 0" for i in range(1 + len(self.plan.computed))])
         if not (streamed or any(op.kind is Kind.ITERATION for op in self.plan.operands)):
             return

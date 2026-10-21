@@ -411,22 +411,15 @@ def test_pairs_errors(code, message):
         ),
         (
             "out = jnp.zeros((8, 128))\n    for i in range(0, 8, 8):\n        acc = jnp.zeros((8, 128))\n"
-            "        for j in range(0, n[0], 128):\n            if j > 0:\n                continue\n"
-            "            acc += x[i : i + 8, j : j + 128]\n        out = out.at[i : i + 8, :].set(acc)",
-            "a loop with runtime bounds can't be masked",
-        ),
-        (
-            "out = jnp.zeros((8, 128))\n    for i in range(0, 8, 8):\n        acc = jnp.zeros((8, 128))\n"
             "        for j in range(0, n[0], 0.5):\n            acc += x[i : i + 8, j : j + 128]\n"
             "        out = out.at[i : i + 8, :].set(acc)",
             "a loop with runtime bounds steps by a positive int, not 0.5",
         ),
         (
             "out = jnp.zeros((8, 128))\n    for i in range(0, 8, 8):\n        acc = jnp.zeros((8, 128))\n"
-            "        for j in range(0, n[0], 128):\n            acc += x[i : i + 8, j : j + 128]\n"
-            "        for j2 in range(0, 256, 128):\n            if j2 > 0:\n                continue\n"
-            "            acc += x[i : i + 8, j2 : j2 + 128]\n        out = out.at[i : i + 8, :].set(acc)",
-            "a kernel with runtime loop bounds can't mask its reduction loops",
+            "        for j in range(0, n[0], 128):\n            if j > 0:\n                continue\n"
+            "            acc += x[i : i + 8, j : j + 128]\n        out = out.at[i : i + 8, :].set(acc)",
+            "a loop with runtime bounds can't be masked",
         ),
         (
             "out = jnp.zeros((8, 256))\n    for i in range(0, 8, 8):\n        acc = jnp.zeros((8, 128))\n"
