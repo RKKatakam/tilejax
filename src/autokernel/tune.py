@@ -11,7 +11,8 @@ distinct values: two tiles storing one window would race.)
 2. **Trace.** Each candidate runs under the JAX profiler. Its device time ranks it, and its trace
    regions (profiling.py) say what limits it.
 3. **Change the schedule** the way the bottleneck says, and keep what's faster:
-   - copies exposed (`dma`): more input buffers, then the neighbouring schedules that move fewer bytes;
+   - copies exposed (`dma`): more input buffers (in a kernel whose tiles take one step, copies in bursts
+     too: pipeline.py), then the neighbouring schedules that move fewer bytes;
    - output copies exposed: more output buffers;
    - per-step overhead (`overhead`): the neighbouring schedules with fewer, bigger steps;
    - compute-bound, or no regions: every neighbouring schedule, fewest steps first.
@@ -36,7 +37,7 @@ import numpy as np
 
 from . import profiling, v5e
 from .errors import KernelError
-from .pipeline import MAX_INPUT_BUFFERS, MAX_OUTPUT_BUFFERS, Pipeline, default_pipeline, fits, vmem_bytes
+from .pipeline import MAX_BURST, MAX_INPUT_BUFFERS, MAX_OUTPUT_BUFFERS, Pipeline, default_pipeline, fits, vmem_bytes
 from .plan import Kind, Operand, Plan
 from .profiling import KernelProfile
 from .schedule import Schedule
@@ -173,14 +174,20 @@ def proposals(kernel: Kernel, signature: Signature, trial: Trial) -> list[Config
         buffering.append(dataclasses.replace(pipe, input_buffers=pipe.input_buffers + 1))
     if profile.regions and profile.out_wait_s > exposed and pipe.output_buffers < MAX_OUTPUT_BUFFERS:
         buffering.append(dataclasses.replace(pipe, output_buffers=pipe.output_buffers + 1))
+    if pipe.burst:
+        buffering = []  # (a burst's slots follow from its steps)
+    if plan.single_step and profile.bottleneck == "dma":
+        buffering += [Pipeline.bursts(g) for g in _bursts(pipe.burst)]
     moves = [Config(config.tunable, p) for p in buffering if fits(plan, schedule, p)]
 
     near: list[tuple[_Stats, Config]] = []
     for tunable in neighbours(config.tunable) if config.tunable is not None else ():
         try:
             plan, schedule = kernel.build(signature, tunable)
-            # Keep the buffering if it fits with the new tiles, else the most that does.
-            pipeline = pipe if fits(plan, schedule, pipe) else default_pipeline(plan, schedule)
+            # Keep the buffering if it fits with the new tiles (and they still take one step for bursts), else
+            # the most that does.
+            keep = fits(plan, schedule, pipe) and (plan.single_step or not pipe.burst)
+            pipeline = pipe if keep else default_pipeline(plan, schedule)
         except KernelError:
             continue  # breaks a layout rule, doesn't divide a loop, doesn't fit in VMEM, ...
         if _loop_steps(plan) == loops:
@@ -193,6 +200,14 @@ def proposals(kernel: Kernel, signature: Signature, trial: Trial) -> list[Config
     else:
         near = sorted(near, key=lambda n: n[0].steps)
     return moves + [c for _, c in near]
+
+
+def _bursts(burst: int) -> list[int]:
+    """The bursts (in steps) to try after copies in bursts of `burst` steps (0: no bursts): the largest
+    first from none (on a v5e, bursts of 8-16 MiB moved the most), else twice and half as many steps."""
+    if not burst:
+        return [g for g in (16, 8, 4) if g <= MAX_BURST]
+    return [g for g in (2 * burst, burst // 2) if 2 <= g <= MAX_BURST]
 
 
 def _smaller(kernel: Kernel, signature: Signature, config: Config) -> list[Config]:

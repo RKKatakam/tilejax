@@ -2,8 +2,14 @@
 
 Block sizes are the user's (they are in the loops); how many VMEM slots each copy rotates through is the
 kernel's. More input slots let fetches run further ahead of the compute; more output slots let more
-tiles' copies to HBM be in flight. `autokernel.optimize` picks them from where a profile says the kernel
-waits (profiling.py).
+tiles' copies to HBM be in flight. The tuner picks them from where a profile says the kernel waits
+(profiling.py).
+
+A kernel whose tiles take one step can also move its copies in bursts: the inputs of a burst of steps
+together, then their outputs together, so at any time the copies in flight all read HBM or all write it.
+A v5e's HBM loses ~6% to turning around between reads and writes: streaming a pool through VMEM and back
+in 1 MiB copies moved 640-650 GB/s however deep the pipeline (reads alone: 731, writes alone: 639); in
+alternating bursts of 8-16 MiB, 677-683 GB/s (XLA's elementwise pass: 673).
 """
 
 from __future__ import annotations
@@ -16,6 +22,7 @@ from .plan import Kind, Plan
 from .schedule import Schedule
 
 __all__ = [
+    "MAX_BURST",
     "MAX_INPUT_BUFFERS",
     "MAX_OUTPUT_BUFFERS",
     "TILE_SLOTS",
@@ -27,18 +34,38 @@ __all__ = [
 
 MAX_INPUT_BUFFERS = 4
 MAX_OUTPUT_BUFFERS = 3
+MAX_BURST = 16
 TILE_SLOTS = 2  # an input that changes once per tile: this tile's and the next one's
 
 
 @dataclass(frozen=True, order=True)
 class Pipeline:
     """VMEM slots per copy: `input_buffers` for each input tile that changes every step (fetched that many
-    steps ahead, less one), `output_buffers` for each output tile."""
+    steps ahead, less one), `output_buffers` for each output tile. With `burst` steps (`Pipeline.bursts`),
+    the copies move in bursts instead: a burst's inputs are fetched while the burst before it computes, and
+    its outputs are copied out once the next burst's inputs are in (2 * burst input slots, burst output
+    slots)."""
 
     input_buffers: int = 3
     output_buffers: int = 2
+    burst: int = 0
+
+    @staticmethod
+    def bursts(steps: int) -> Pipeline:
+        """Copies in bursts of `steps` steps."""
+        return Pipeline(2 * steps, steps, steps)
 
     def __post_init__(self) -> None:
+        if self.burst:
+            if not (
+                1 <= self.burst <= MAX_BURST
+                and (self.input_buffers, self.output_buffers) == (2 * self.burst, self.burst)
+            ):
+                raise KernelError(
+                    f"a pipeline of bursts of 1 to {MAX_BURST} steps has 2 input buffers and 1 output buffer per "
+                    f"step of a burst, not {self.input_buffers} and {self.output_buffers} for {self.burst}"
+                )
+            return
         if not (1 <= self.input_buffers <= MAX_INPUT_BUFFERS and 1 <= self.output_buffers <= MAX_OUTPUT_BUFFERS):
             raise KernelError(
                 f"a pipeline has 1 to {MAX_INPUT_BUFFERS} input buffers and 1 to {MAX_OUTPUT_BUFFERS} output "
@@ -55,6 +82,8 @@ class Pipeline:
         }[kind]
 
     def __str__(self) -> str:
+        if self.burst:
+            return f"bursts of {self.burst} steps"
         return f"{self.input_buffers} input / {self.output_buffers} output buffers"
 
 
