@@ -190,7 +190,7 @@ def test_two_repeat_loops_and_static_tables():
     sch = lowered.schedule
     assert not sch.runtime and sch.iterations == 2 and lowered.steps == 1 + 2 + 2 * 2
     assert [sch.iteration_at(s) for s in range(lowered.steps)] == [0, 1, 1, 0, 0, 1, 1]
-    assert "def _before_phase1():" in lowered.source  # the second loop's code before its phase
+    assert "def _first_of_phase1():" in lowered.source  # the second loop's code before its phase
 
 
 CHOSEN = """

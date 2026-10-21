@@ -486,7 +486,8 @@ class _Planner:
     def _window(self, index: ast.expr, dim: int, text: str) -> Window:
         """How the index expression `index` selects from a dim of size `dim`."""
         usage = (
-            f"{text}: each index is `v:v + size` or `v` for a loop variable v, `:`, or constants (`start:stop`, an int)"
+            f"{text}: each index is `e:e + size` (e an expression of loop variables) or `v` for a loop variable v, "
+            "`:`, or constants (`start:stop`, an int)"
         )
         loop_vars = reads(index) & self.ranges.keys()
         computed = reads(index) & assigned(self.nest.tile)
@@ -519,6 +520,16 @@ class _Planner:
                 ):
                     raise self.error(usage, index)
                 return self._checked(Window(lower.id, 0, self._int(upper.right, text)), dim, text, index)
+            if (
+                loop_vars
+                and isinstance(upper, ast.BinOp)
+                and isinstance(upper.op, ast.Add)
+                and ast.dump(upper.left) == ast.dump(lower)
+                and not reads(upper.right) & self.ranges.keys()
+                and not computed
+            ):  # `e : e + size`, e computed from loop variables: the rows of `rows(e, e + size, size)`
+                size = self._int(upper.right, text)
+                return Window(None, 0, size, None, frozenset(loop_vars), rows=(lower, upper))  # type: ignore[arg-type]
             if loop_vars:
                 raise self.error(usage, index)
             start = 0 if lower is None else self._int(lower, text)
@@ -593,6 +604,17 @@ class _Planner:
             raise self.error(f"{text}: a tile keeps at least one dim (slice it, `v:v + 1`)", node)
         if not all(sliced[sliced.index(True) :]):
             raise self.error(f"{text}: integer indices go before every sliced dim", node)
+        # (NumPy indexing zips index arrays together, and puts their dims first when a slice separates them
+        # from integer indices: the loop nest's tile wouldn't be the kernel's.)
+        ragged = [k for k, i in enumerate(index) if self._is_rows(i)]
+        if len(ragged) > 1:
+            raise self.error(f"{text}: a tile reads through one `autokernel.rows` at most", node)
+        if ragged and 0 < sliced.index(True) < ragged[0]:
+            raise self.error(
+                f"{text}: `autokernel.rows` goes right after the integer indices (NumPy moves its dim to the front "
+                "otherwise): index the dims between them with slices of one, `v : v + 1`",
+                node,
+            )
         tile = Tile(array, windows, np.dtype(dtype), text)
         dims = [d for d, w in zip(shape, windows, strict=True) if w.size is not None]
         problems = v5e.layout_problems(tile.shape, dims, dtype)

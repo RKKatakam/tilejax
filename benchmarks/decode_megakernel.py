@@ -54,6 +54,7 @@ SHAPES = [  # layers, d_model, heads, kv_heads, ffn, vocab : batch, mean context
     "8,2048,16,8,6144,32768:8,4096",
     "8,2048,16,8,6144,32768:32,1024",
     "8,2048,16,8,6144,32768:64,512",
+    "8,2048,16,8,6144,32768:64,32",
 ]
 SMALL = ["2,256,4,2,512,1024:4,128"]  # --small: a quick run anywhere (the interpreter off a TPU)
 
@@ -63,8 +64,10 @@ def ragged_lengths(batch: int, mean: int, seed: int = 0) -> jax.Array:
 
 
 def cache_len(mean: int, extra: int) -> int:
-    """S_max: room for the longest sequence and `extra` more tokens, rounded up to a multiple of 1024."""
-    return -(-(3 * mean // 2 + extra) // 1024) * 1024
+    """S_max: room for the longest sequence and `extra` more tokens, rounded up to a multiple of 1024 (of 256
+    for short contexts: an input signature of their own, so the kernels tune on them, not on longer ones)."""
+    unit = 1024 if mean >= 256 else 256
+    return -(-(3 * mean // 2 + extra) // unit) * unit
 
 
 def max_diff(a: jax.Array, b: jax.Array) -> float:

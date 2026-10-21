@@ -12,7 +12,7 @@ distinct values: two tiles storing one window would race.)
    regions (profiling.py) say what limits it.
 3. **Change the schedule** the way the bottleneck says, and keep what's faster:
    - copies exposed (`dma`): more input buffers (in a kernel whose tiles take one step, copies in bursts
-     too: pipeline.py), then the neighbouring schedules that move fewer bytes;
+     too: pipeline.py), then the neighbouring schedules that move fewer bytes (or as many in fewer steps);
    - output copies exposed: more output buffers;
    - per-step overhead (`overhead`): the neighbouring schedules with fewer, bigger steps;
    - compute-bound, or no regions: every neighbouring schedule, fewest steps first.
@@ -190,8 +190,9 @@ def proposals(kernel: Kernel, signature: Signature, trial: Trial) -> list[Config
         if _loop_steps(plan) == loops:
             continue  # the same kernel (the code clamps the field to the array, say)
         near.append((_stats(plan, schedule), Config(tunable, pipeline)))
-    if profile.bottleneck == "dma":
-        near = sorted((n for n in near if n[0].dma_bytes < here.dma_bytes), key=lambda n: n[0].dma_bytes)
+    if profile.bottleneck == "dma":  # (fewer bytes; or as many in fewer steps, which never costs more)
+        near = [n for n in near if (n[0].dma_bytes, n[0].steps) < (here.dma_bytes, here.steps)]
+        near = sorted(near, key=lambda n: (n[0].dma_bytes, n[0].steps))
     elif profile.bottleneck == "overhead":
         near = sorted((n for n in near if n[0].steps < here.steps), key=lambda n: n[0].steps)
     else:

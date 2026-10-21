@@ -253,6 +253,51 @@ def f(kv, table):
 """
 
 
+@pytest.mark.parametrize(
+    ("read", "message"),
+    [
+        ("x[0, 0:1, autokernel.rows(n[0], 8, 8), :][0]", "`autokernel.rows` goes right after the integer indices"),
+        ("x[0, autokernel.rows(n[0], 1, 1), autokernel.rows(n[1], 9, 8), :][0]", "through one `autokernel.rows`"),
+    ],
+)
+def test_rows_that_numpy_would_index_otherwise_are_errors(read, message):
+    kernel = make_kernel(
+        f"""
+        def f(x, n):
+            out = jnp.zeros((8, 128))
+            for i in range(0, 8, 8):
+                out = out.at[i : i + 8, :].set({read})
+            return out
+        """,
+        autokernel=autokernel,
+    )
+    with pytest.raises(KernelError, match=message):
+        kernel.lower(rand((2, 1, 16, 128)), i32(0, 8))
+
+
+def test_pairs_of_a_window_read_once_per_iteration():
+    kernel = make_kernel(
+        """
+        def f(kv, x):
+            out = jnp.zeros((16, 128))
+            for i in range(0, 16, 16):
+                acc = jnp.zeros((16, 128))
+                for l in range(2):
+                    for k in range(0, 32, 16):
+                        keys = jax.lax.bitcast_convert_type(autokernel.pairs(kv[l, :, :, :]) << 16, jnp.float32)
+                        acc += keys + x[l, k : k + 16, :]
+                out = out.at[i : i + 16, :].set(acc)
+            return out
+        """,
+        autokernel=autokernel,
+    )
+    kv, x = rand((2, 16, 2, 128), dtype=jnp.bfloat16), rand((2, 32, 128))
+    out, _ = check(kernel, kv, x)
+    want = sum(2 * f64(kv[n, :, 0, :]) + f64(x[n, :16]) + f64(x[n, 16:]) for n in range(2))
+    np.testing.assert_allclose(f64(out), want, rtol=1e-5, atol=1e-5)
+    assert kernel.lower(kv, x).plan.operands[0].kind.value == "iteration"
+
+
 def test_pairs_reads_a_tiles_row_pairs_as_words():
     kernel = make_kernel(PAIRS, autokernel=autokernel)
     kv = rand((5, 16, 4, 2, 128), dtype=jnp.bfloat16)
@@ -450,7 +495,7 @@ def test_pairs_errors(code, message):
         ),
         (
             "out = x\n    for i in range(0, 8, 8):\n        out = out.at[i : i + 8, :].set(x[nothing(i), 0:128])",
-            "each index is `v:v",
+            "each index is `e:e",
         ),
         (
             "out = x\n    for i in range(0, 16, 8):\n        if i >= 0:\n            continue\n"

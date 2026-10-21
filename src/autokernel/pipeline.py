@@ -29,6 +29,7 @@ __all__ = [
     "Pipeline",
     "default_pipeline",
     "fits",
+    "rings",
     "vmem_bytes",
 ]
 
@@ -87,9 +88,36 @@ class Pipeline:
         return f"{self.input_buffers} input / {self.output_buffers} output buffers"
 
 
+def rings(plan: Plan) -> dict[str, str]:
+    """The operand whose ring of VMEM slots each operand uses (by name). Windows streamed by different
+    phases with the same tile shape and dtype share one ring: a step only ever uses its own slot of a ring
+    (the step's index modulo the ring's depth), and every earlier step that used it has run, so the windows
+    of one phase never meet another's there. Every other operand has a ring of its own (a phase's windows
+    are all in use at its steps; a once-per-iteration window lives across its phase)."""
+    owner, shared, used = {}, {}, {}  # (shape, dtype) -> its rings' owners; (phase, shape, dtype) -> rings used
+    for op in plan.operands:
+        if op.kind is not Kind.STREAM or op.phase is None:
+            owner[op.name] = op.name
+            continue
+        key = (op.tile.shape, op.tile.dtype)
+        n = used.get((op.phase, *key), 0)
+        used[(op.phase, *key)] = n + 1
+        owners = shared.setdefault(key, [])
+        if n == len(owners):
+            owners.append(op.name)
+        owner[op.name] = owners[n]
+    return owner
+
+
 def vmem_bytes(plan: Plan, schedule: Schedule, pipeline: Pipeline) -> int:
-    """VMEM the kernel's own buffers take: input slots, output slots and fills, carried values."""
-    total = sum(pipeline.slots(op.kind) * v5e.padded_bytes(op.tile.shape, op.tile.dtype) for op in plan.operands)
+    """VMEM the kernel's own buffers take: input slots (a ring per `rings` owner), output slots and fills,
+    carried values."""
+    owner = rings(plan)
+    total = sum(
+        pipeline.slots(op.kind) * v5e.padded_bytes(op.tile.shape, op.tile.dtype)
+        for op in plan.operands
+        if owner[op.name] == op.name
+    )
     total += sum(
         (pipeline.output_buffers + (1 if schedule.fills and out.fill is not None else 0))
         * v5e.padded_bytes(out.tile.shape, out.dtype)

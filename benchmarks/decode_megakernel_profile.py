@@ -27,6 +27,7 @@ SHAPES = [  # layers, d_model, heads, kv_heads, ffn, vocab : batch, mean context
     "8,2048,16,8,6144,32768:8,4096",
     "8,2048,16,8,6144,32768:32,1024",
     "8,2048,16,8,6144,32768:64,512",
+    "8,2048,16,8,6144,32768:64,32",
 ]
 
 
@@ -39,7 +40,8 @@ def main() -> None:
         config = Config(*map(int, model.split(",")))
         batch, mean = map(int, run.split(","))
         lengths = jnp.asarray(np.random.default_rng(0).integers(mean // 2, 3 * mean // 2, batch), jnp.int32)
-        s_max = -(-(3 * mean // 2 + 36) // 1024) * 1024
+        unit = 1024 if mean >= 256 else 256  # (benchmarks/decode_megakernel.py's cache_len)
+        s_max = -(-(3 * mean // 2 + 36) // unit) * unit
         params = init_params(config)
         caches = random_caches(config, lengths, s_max)
         tokens = jax.random.randint(jax.random.key(2), (batch,), 0, config.vocab)

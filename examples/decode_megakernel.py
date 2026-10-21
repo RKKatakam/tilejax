@@ -92,7 +92,7 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 import numpy as np
-from decode import LANES, gqa_decode, online_softmax, widen, xla_gqa_decode
+from decode import LANES, MASK_VALUE, gqa_decode, widen, xla_gqa_decode
 from decode_model import decode_mlp, rope
 from kv_cache import append
 from layer_stack import rmsnorm
@@ -118,15 +118,20 @@ class Config:
     vocab: int
 
 
+GROUPS = (1, 2, 4, 8)  # the sequences an attention step may take
+
+
 @autokernel.tunable
 class MegaTiles:
-    """Per step: rows of W_qkv, cache positions of a sequence, rows of W_o, hidden units, vocab columns."""
+    """Per step: rows of W_qkv, cache positions of a group of sequences, rows of W_o, hidden units, vocab
+    columns; and how many sequences an attention step takes."""
 
     block_d: int = autokernel.choice(128, 256, 512, 1024, 2048, default=256)
     block_kv: int = autokernel.choice(128, 256, 512, 1024, 2048, default=256)
     block_a: int = autokernel.choice(128, 256, 512, 1024, 2048, default=512)
     block_f: int = autokernel.choice(128, 256, 512, 1024, 2048, default=512)
     block_v: int = autokernel.choice(256, 512, 1024, 2048, 4096, default=1024)
+    group: int = autokernel.choice(*GROUPS, default=1)  # sequences per attention step
 
 
 # --------------------------------------------------------------------------- helpers (plain JAX, in the kernel)
@@ -221,6 +226,34 @@ def attention_start(qkv, heads, kv_heads):
     return jnp.stack(queries), jnp.stack(scores), row_sum, jnp.stack(values)
 
 
+def grouped(states, group):
+    """Per-sequence states (B, ...) as (B / group, group, ...): a group's are read as `state[g]`."""
+    return tuple(t.reshape(t.shape[0] // group, group, *t.shape[1:]) for t in states)
+
+
+def online_softmax_groups(s, v, ok, row_max, row_sum, acc):
+    """One online-softmax step of a group of sequences at once: scores s (G, H, bk) (masked where not `ok`)
+    against values v (G, bk, Dv); the lane-wide running max and sum (G, H, 128), the accumulator (G, H, Dv)."""
+    bk, dv = s.shape[-1], v.shape[-1]
+    s = jnp.where(ok, s, MASK_VALUE)
+    max_new = jnp.maximum(row_max, jnp.max(s, axis=-1, keepdims=True))
+    p = jnp.exp(s - jnp.tile(max_new, (1, 1, bk // LANES)))
+    alpha = jnp.exp(row_max - max_new)
+    row_sum = alpha * row_sum + jnp.sum(p, axis=-1, keepdims=True)
+    pv = jax.lax.dot_general(p.astype(v.dtype), v, (((2,), (1,)), ((0,), (0,))), preferred_element_type=jnp.float32)
+    return max_new, row_sum, jnp.tile(alpha, (1, 1, dv // LANES)) * acc + pv
+
+
+def group_lengths(lengths):
+    """For each group size in GROUPS (rows) and each sequence: the longest cache of its group, which an
+    attention step over the group reads up to."""
+    rows = []
+    for g in GROUPS:
+        padded = jnp.pad(lengths, (0, -lengths.shape[0] % g))
+        rows.append(jnp.repeat(padded.reshape(-1, g).max(axis=1), g)[: lengths.shape[0]])
+    return jnp.stack(rows)
+
+
 def attention_rows(acc, row_sum, heads, kv_heads):
     """The normalized attention output of every sequence, (B, H * Dh) f32 rows, from the per-sequence
     accumulators (B, H, Hkv * Dh) and lane-wide sums (B, H, 128)."""
@@ -238,6 +271,8 @@ def decode_megakernel(
     cos,
     sin,
     lengths,
+    group_max,
+    seq_lengths,
     k_cache,
     v_cache,
     attn_norm,
@@ -254,17 +289,17 @@ def decode_megakernel(
     tiles=MegaTiles(),
 ):
     """A whole decode step: x (B, D) the new tokens' embeddings, cos and sin (B, Dh) RoPE tables at their
-    positions, lengths (B,) the cached positions per sequence, caches (L, B * S_max, Hkv * Dh) (flattened),
-    weights stacked by layer (norms (L, 1, n)); q's 1/sqrt(Dh) is applied here. Returns the logits (B,
-    vocab) and every layer's new [k | v] rows (L, B, 2 * Hkv * Dh)."""
+    positions, lengths (B,) the cached positions per sequence (`group_lengths(lengths)` and lengths as (B, 1,
+    1) too), caches (L, B, S_max, Hkv * Dh), weights stacked by layer (norms (L, 1, n)); q's 1/sqrt(Dh) is
+    applied here. Returns the logits (B, vocab) and every layer's new [k | v] rows (L, B, 2 * Hkv * Dh)."""
     B, D = x.shape
-    L, BS, KVD = k_cache.shape
-    S = BS // B
+    L, _, S, KVD = k_cache.shape
     HD, F, V = wo.shape[1], w_up.shape[2], w_vocab.shape[1]
     H, Hkv = HD // HEAD_DIM, KVD // HEAD_DIM
     bd, bk, ba = min(tiles.block_d, D), min(tiles.block_kv, S), min(tiles.block_a, HD)
     bf, bv = min(tiles.block_f, F), min(tiles.block_v, V)
-    assert S % bk == 0  # a block of the flattened caches holds one sequence's positions, never two
+    G, R = tiles.group, GROUPS.index(tiles.group)  # sequences per attention step, and their group_max row
+    assert S % bk == 0 and B % G == 0
     scale = HEAD_DIM**-0.5
     dtype = x.dtype
     logits = jnp.zeros((B, V), dtype)
@@ -283,21 +318,37 @@ def decode_megakernel(
             k = qk_norm_rope(qkv[:, HD : HD + KVD], k_norm[layer, :, :], cos_t, sin_t)
             new = jnp.concatenate([q, k, qkv[:, HD + KVD :]], axis=1).astype(dtype)
             kv_rows = kv_rows.at[layer].set(new[:, HD:])
-            q_bd, row_max, row_sum, acc = attention_start(new, H, Hkv)
-            for j in range(0, B * S, bk):  # phase 2: attention, bk cached positions of sequence j // S per step
-                if j % S >= lengths[j // S]:  # past the sequence's cache: decided on the device
+            q_bd, row_max, row_sum, acc = grouped(attention_start(new, H, Hkv), G)
+            lens = seq_lengths[0:B, :, :].reshape(B // G, G, 1, 1)
+            for j in range(0, B // G * S, bk):  # phase 2: attention, bk cached positions of group j // S per step
+                if j % S >= group_max[R, j // S * G]:  # past the group's longest cache: decided on the device
                     continue
-                # Only the block's rows before the sequence's length are copied (the rest of the slot is stale).
-                kt = k_cache[layer, autokernel.rows(j, j - j % S + lengths[j // S], bk), :]
-                s = q_bd[j // S] @ kt.T
-                ok = j % S + jax.lax.broadcasted_iota(jnp.int32, s.shape, 1) < lengths[j // S]
-                valid = j % S + jax.lax.broadcasted_iota(jnp.int32, (bk, 1), 0) < lengths[j // S]
-                vt = jnp.where(valid, v_cache[layer, autokernel.rows(j, j - j % S + lengths[j // S], bk), :], 0)
-                m_j, l_j, acc_j = online_softmax(s, vt, ok, row_max[j // S], row_sum[j // S], acc[j // S])
+                # The group's G sequences, rows j % S.. up to the group's longest (the rest of the slot is stale).
+                kt = k_cache[
+                    layer : layer + 1,
+                    j // S * G : j // S * G + G,
+                    autokernel.rows(j % S, group_max[R, j // S * G], bk),
+                    :,
+                ][0]
+                vt = v_cache[
+                    layer : layer + 1,
+                    j // S * G : j // S * G + G,
+                    autokernel.rows(j % S, group_max[R, j // S * G], bk),
+                    :,
+                ][0]
+                s = jax.lax.dot_general(
+                    q_bd[j // S], kt, (((2,), (2,)), ((0,), (0,))), preferred_element_type=jnp.float32
+                )  # (G, H, bk): each sequence's heads against its own keys
+                ok = j % S + jax.lax.broadcasted_iota(jnp.int32, (G, 1, bk), 2) < lens[j // S]
+                valid = j % S + jax.lax.broadcasted_iota(jnp.int32, (G, bk, 1), 1) < lens[j // S]
+                m_j, l_j, acc_j = online_softmax_groups(
+                    s, jnp.where(valid, vt, 0), ok, row_max[j // S], row_sum[j // S], acc[j // S]
+                )
                 row_max = row_max.at[j // S].set(m_j)
                 row_sum = row_sum.at[j // S].set(l_j)
                 acc = acc.at[j // S].set(acc_j)
-            attn_blocks = lane_blocks(attention_rows(acc, row_sum, H, Hkv).astype(dtype), ba)
+            rows = attention_rows(acc.reshape(B, H, KVD), row_sum.reshape(B, H, LANES), H, Hkv)
+            attn_blocks = lane_blocks(rows.astype(dtype), ba)
             proj = jnp.zeros((B, D), jnp.float32)
             for a in range(0, HD, ba):  # phase 3: output projection, ba rows of W_o per step
                 proj += attn_blocks[a // ba] @ wo[layer, a : a + ba, :]
@@ -321,12 +372,11 @@ def decode_megakernel(
 
 def kernel_inputs(tokens, k_cache, v_cache, lengths, params) -> tuple[jax.Array, ...]:
     """`decode_megakernel`'s inputs for a step: the new tokens' embeddings (B,) -> (B, D), RoPE's cos and sin
-    at positions `lengths`, `lengths`, the caches (L, B, S_max, Hkv * Dh) flattened to (L, B * S_max, Hkv *
-    Dh) (free: a reshape of contiguous arrays), and the weights."""
-    L, B, S, KVD = k_cache.shape
+    at positions `lengths`, `lengths` (and its groups' longest, and as (B, 1, 1)), the caches (L, B, S_max,
+    Hkv * Dh), and the weights."""
     cos, sin = rope_tables(lengths, HEAD_DIM, ROPE_THETA)
-    caches = (k_cache.reshape(L, B * S, KVD), v_cache.reshape(L, B * S, KVD))
-    return (params["embed"][tokens], cos, sin, lengths, *caches, *(params[name] for name in WEIGHTS))
+    by_sequence = (lengths, group_lengths(lengths), lengths.reshape(-1, 1, 1))
+    return (params["embed"][tokens], cos, sin, *by_sequence, k_cache, v_cache, *(params[name] for name in WEIGHTS))
 
 
 def megakernel_step(tokens, k_cache, v_cache, lengths, params, tiles=None):

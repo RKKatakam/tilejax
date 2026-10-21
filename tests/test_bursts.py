@@ -140,7 +140,8 @@ def test_copy_bound_single_step_kernels_try_bursts():
     # From a burst: twice and half as many steps, no more input buffers; the tiles keep the bursts.
     burst = Config(Rows(), Pipeline.bursts(8))
     configs = proposals(kernel, sig, autokernel.Trial(burst, profile(burst, seconds=10e-6, wait=5e-6)))
-    assert [c.pipeline for c in configs] == [Pipeline.bursts(16), Pipeline.bursts(4)]
+    assert [c.pipeline for c in configs[:2]] == [Pipeline.bursts(16), Pipeline.bursts(4)]
+    assert configs[2:] == [Config(Rows(tm=128), Pipeline.bursts(4))]  # as many bytes in fewer steps
     configs = proposals(kernel, sig, autokernel.Trial(burst, profile(burst, seconds=10e-6)))
     assert configs == [Config(Rows(tm=128), Pipeline.bursts(4))]  # tiles twice as big: as many bytes a burst
     # Compute-bound: no bursts.

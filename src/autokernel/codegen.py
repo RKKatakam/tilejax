@@ -60,7 +60,7 @@ from jax.experimental.pallas import tpu as pltpu
 from . import mxu, v5e
 from .errors import KernelError
 from .parse import Nest
-from .pipeline import TILE_SLOTS, Pipeline
+from .pipeline import TILE_SLOTS, Pipeline, rings
 from .plan import Kind, Operand, Output, Plan, Range, Tile
 from .schedule import CODE_SHIFT, FILL_TABLE, STEP_CODE, STEP_COUNT, STEP_TILE, TILE_TABLE, Schedule
 from .tilecode import as_store, assigned, element_reads, flatten, reads
@@ -222,6 +222,10 @@ class _Generator:
         self.sems = {
             op.name: n(f"{op.name}_sem" if op.kind is Kind.ONCE else f"{op.name}_sems") for op in plan.operands
         }
+        # Streamed windows of different phases with one tile shape share a ring (pipeline.py's `rings`).
+        self.owner = rings(plan)
+        for op in plan.operands:
+            self.bufs[op.name], self.sems[op.name] = self.bufs[self.owner[op.name]], self.sems[self.owner[op.name]]
         self.bufs |= {out.name: n(f"{out.name}_bufs") for out in plan.outputs}
         self.sems |= {out.name: n(f"{out.name}_sems") for out in plan.outputs}
         self.refs = {c: n(f"{c}_ref") for c in plan.carried}
@@ -470,11 +474,14 @@ class _Generator:
     def _scratch_shapes(self) -> list[str]:
         lines = []
         for op in self.plan.operands:
+            if self.owner[op.name] != op.name:
+                continue
             slots = self.pipeline.slots(op.kind)
             shape = op.tile.shape if op.kind is Kind.ONCE else (slots, *op.tile.shape)
             sems = "()" if op.kind is Kind.ONCE else f"({slots},)"
+            texts = [o.tile.text for o in self.plan.operands if self.owner[o.name] == op.name]
             lines += [
-                f"pltpu.VMEM({shape}, jnp.{op.tile.dtype.name}),  # {self.bufs[op.name]}: {op.tile.text}",
+                f"pltpu.VMEM({shape}, jnp.{op.tile.dtype.name}),  # {self.bufs[op.name]}: {', '.join(texts)}",
                 f"pltpu.SemaphoreType.DMA({sems}),",
             ]
         slots = self.pipeline.output_buffers
@@ -513,7 +520,8 @@ class _Generator:
             *(self.hbm[o] for o in nest.outputs),
         ]
         for op in plan.operands:
-            params += [self.bufs[op.name], self.sems[op.name]]
+            if self.owner[op.name] == op.name:
+                params += [self.bufs[op.name], self.sems[op.name]]
         for out in plan.outputs:
             params += [self.bufs[out.name], self.sems[out.name]]
         params += list(self.refs.values())
@@ -1154,38 +1162,21 @@ class _Generator:
                 w(f"{name} = {slots[Kind.STREAM]}")
                 slots[Kind.STREAM] = name
             iteration_slots = self._iteration_slots(w, iterated, tile, self.n_rb, "iteration_slot")
-            with self._region(w, WAIT) if per_tile or streamed or iterated else nullcontext():  # (none empty)
+            # (A kernel whose tiles take steps waits for a phase's inputs, and sees their slots, in the phase's
+            # own code: below, in `_tile_code`.)
+            phased = [] if self.single else [*streamed, *iterated]
+            with self._region(w, WAIT) if per_tile or (self.single and streamed) else nullcontext():
                 if self.burst and streamed:  # the first burst's steps wait for their inputs (later ones: at its end)
                     with self._when(w, f"{s} < {self.burst}", "_first_burst"):
                         w(*[f"{self.copy_fns[op.name]}({at}, 0, {slots[Kind.STREAM]}).wait()" for op in streamed])
                 if per_tile:
                     with self._when(w, tile_first, "_tile_inputs"):
                         self._tile_inputs(w, per_tile, slots[Kind.TILE])
-                for phase, ops in self._by_phase([] if self.burst else streamed).items():
-                    with self._when(w, self._runs(ph, phase, empty), f"_wait_phase{phase}"):
-                        for op in ops:
-                            w(f"{self.copy_fns[op.name]}({at}, {self._rb(self.n_rb)}{kb}, {slots[Kind.STREAM]}).wait()")
-                for (phase, in_body), ops in self._by_iteration(iterated).items():
-                    cond = self._iteration_first(phase, in_body, ph, first, empty)
-                    with self._when(w, cond, f"_wait_iteration{phase}" + ("_body" if in_body else "")):
-                        for op in ops:
-                            w(f"{self.copy_fns[op.name]}({at}, {self.n_rb}, {iteration_slots[op.name]}).wait()")
+                if self.single and not self.burst:
+                    w(*[f"{self.copy_fns[op.name]}({at}, {kb}, {slots[Kind.STREAM]}).wait()" for op in streamed])
             for op in plan.operands:
-                buf = self.bufs[op.name]
-                if op in self.shared:
-                    slot = f"{self.tile_slots}[{self.shared.index(op)}]"
-                elif op.kind is Kind.ITERATION:
-                    slot = iteration_slots[op.name]
-                else:
-                    slot = slots.get(op.kind)
-                view = buf if op.kind is Kind.ONCE else f"{buf}.at[{slot}]"
-                w(f"{self.views[op.name]} = {view}")
-                if op.name in self.words:  # (a 16-bit (..., 2, d) slot holds (..., d) words)
-                    words = f"{buf}.bitcast(jnp.uint32)" + ("" if op.kind is Kind.ONCE else f".at[{slot}]")
-                    shape = f"{math.prod(op.tile.shape[:-2])}, {op.tile.shape[-1]}"
-                    w(f"{self.words[op.name]} = {words}.reshape({shape})")
-                    with w.block(f"if {self.n_interpret}:"):
-                        w(f"{self.words[op.name]} = {_PAIRS}({self.views[op.name]}[...]).reshape({shape})")
+                if op not in phased:
+                    self._view(w, op, slots, iteration_slots)
             self._loop_vars(w)
 
             out_slots = pipe.output_buffers
@@ -1202,8 +1193,7 @@ class _Generator:
                 with self._when(w, tile_first, "_fill_skipped_tiles"):
                     self._start_fills(w)
 
-            with self._region(w, COMPUTE):
-                self._tile_code(w, tile_first)
+            self._tile_code(w, tile_first, slots, iteration_slots)
             if self.cursor:
                 w(f"{self.n_advance}(0)", f"return {s} + 1")
             if self.burst:
@@ -1270,25 +1260,82 @@ class _Generator:
             else:
                 w(f"{self.copy_fns[op.name]}({at}, {slot}).wait()")
 
-    def _tile_code(self, w: _Writer, tile_first: str | None) -> None:
+    def _view(
+        self, w: _Writer, op: Operand, slots: dict[Kind, str], iteration_slots: dict[str, str], words: bool = True
+    ) -> None:
+        """Bind the name the tile code reads `op` through: its VMEM slot this step (and its words, which the
+        interpreter loads when they're bound: once the slot's copy is waited for)."""
+        buf = self.bufs[op.name]
+        if op in self.shared:
+            slot = f"{self.tile_slots}[{self.shared.index(op)}]"
+        elif op.kind is Kind.ITERATION:
+            slot = iteration_slots[op.name]
+        else:
+            slot = slots.get(op.kind)  # type: ignore[assignment]
+        view = buf if op.kind is Kind.ONCE else f"{buf}.at[{slot}]"
+        w(f"{self.views[op.name]} = {view}")
+        if words and op.name in self.words:  # (a 16-bit (..., 2, d) slot holds (..., d) words)
+            words = f"{buf}.bitcast(jnp.uint32)" + ("" if op.kind is Kind.ONCE else f".at[{slot}]")
+            shape = f"{math.prod(op.tile.shape[:-2])}, {op.tile.shape[-1]}"
+            w(f"{self.words[op.name]} = {words}.reshape({shape})")
+            with w.block(f"if {self.n_interpret}:"):
+                w(f"{self.words[op.name]} = {_PAIRS}({self.views[op.name]}[...]).reshape({shape})")
+
+    def _phase_inputs(
+        self, w: _Writer, p: int, slots: dict[Kind, str], iteration_slots: dict[str, str], before: bool
+    ) -> None:
+        """In phase p's code: wait for its once-per-iteration inputs at its first step (`before` its code
+        before the phase), or else for its streamed inputs at a step that runs its body; and see their slots."""
+        at, rb, kb = self.n_at, self.n_rb, self.n_kb
+        empty = f"jnp.logical_not({self.n_empty})" if self._may_be_empty(p) else None
+        if before:  # (at the phase's first step: the caller's branch)
+            iterated = [op for op in self.plan.operands if op.kind is Kind.ITERATION and op.phase == p]
+            for in_body, ops in itertools.groupby(sorted(iterated, key=lambda op: op.in_body), lambda op: op.in_body):
+                with self._when(w, empty if in_body else None, f"_wait_iteration{p}_body"), self._region(w, WAIT):
+                    w(*[f"{self.copy_fns[op.name]}({at}, {rb}, {iteration_slots[op.name]}).wait()" for op in ops])
+            return
+        streamed = [op for op in self.plan.operands if op.kind is Kind.STREAM and op.phase == p]
+        if streamed:
+            with self._when(w, empty, f"_wait_phase{p}"), self._region(w, WAIT):
+                for op in streamed:
+                    w(f"{self.copy_fns[op.name]}({at}, {self._rb(rb)}{kb}, {slots[Kind.STREAM]}).wait()")
+        for op in streamed:  # (after the waits: the interpreter loads words from a view when it's bound)
+            self._view(w, op, slots, iteration_slots)
+
+    def _tile_code(
+        self, w: _Writer, tile_first: str | None, slots: dict[Kind, str], iteration_slots: dict[str, str]
+    ) -> None:
         """The segments and the phase bodies: the code before the phases at a tile's first step; each
         phase's body at its steps (not at an empty one), with the code after it at its last step (where the
-        body's values are still in scope)."""
+        body's values are still in scope). In a phase's code, its inputs are waited for where they are first
+        needed: once-per-iteration ones before the code before the phase, streamed ones after it (so that code
+        runs while they arrive)."""
         plan, code = self.plan, _TileCode(self)
         if self.single:
-            w(*code.emit(plan.segments[0], "start", set()))
+            with self._region(w, COMPUTE):
+                w(*code.emit(plan.segments[0], "start", set()))
             return
         if plan.segments[0]:
-            with self._when(w, tile_first, "_start_tile"):
+            with self._when(w, tile_first, "_start_tile"), self._region(w, COMPUTE):
                 w(*code.emit(plan.segments[0], "start", set()))
         carried = set(plan.carried)
         for p, phase in enumerate(plan.phases):
             with self._when(w, self._in_phase(self.n_ph, p), f"_phase{p}"):
-                if phase.before:  # a repeat loop's code before its first phase, every iteration
-                    with self._when(w, self.n_first, f"_before_phase{p}"):
-                        w(*code.emit(phase.before, "between", set()))
+                iterated = [op for op in plan.operands if op.kind is Kind.ITERATION and op.phase == p]
+                for op in iterated:
+                    self._view(w, op, slots, iteration_slots, words=False)
+                if iterated or phase.before:
+                    with self._when(w, self.n_first, f"_first_of_phase{p}"):
+                        self._phase_inputs(w, p, slots, iteration_slots, before=True)
+                        if phase.before:  # a repeat loop's code before its first phase, every iteration
+                            with self._region(w, COMPUTE):
+                                w(*code.emit(phase.before, "between", set()))
+                for op in iterated:  # (their words: once they're in)
+                    if op.name in self.words:
+                        self._view(w, op, slots, iteration_slots)
+                self._phase_inputs(w, p, slots, iteration_slots, before=False)
                 empty = f"jnp.logical_not({self.n_empty})" if self._may_be_empty(p) else None
-                with self._when(w, empty, f"_body{p}"):
+                with self._when(w, empty, f"_body{p}"), self._region(w, COMPUTE):
                     w(*code.emit(phase.body, "body", set()))
                 after = plan.segments[p + 1]
                 repeat = next((rep for rep in plan.repeats if rep.last - 1 == p), None)
@@ -1299,7 +1346,7 @@ class _Generator:
                 # At the end, carried values are just values; before it, they're stored for later steps.
                 outside = assigned(phase.body) | carried if final and not repeat else assigned(phase.body) - carried
                 name = "_end_tile" if final and not repeat else f"_after_phase{p}"
-                with self._when(w, self.n_last, name):
+                with self._when(w, self.n_last, name), self._region(w, COMPUTE):
                     w(*code.emit(after, "between" if repeat or not final else "end", outside))
                     if ends_repeat:  # the tile's code after the repeat loop, as its last iteration ends
                         cond = f"{self.n_rb} == {repeat.range.count - 1}"  # type: ignore[union-attr]

@@ -8,11 +8,13 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from decode_megakernel import (
+    GROUPS,
     HEAD_DIM,
     WEIGHTS,
     Config,
     MegaTiles,
     decode_megakernel,
+    group_lengths,
     init_params,
     kernel_inputs,
     layer_caches,
@@ -188,15 +190,30 @@ def test_megakernel_plan_streams_every_layer_and_visits_only_cached_blocks():
         "q_bd_ref[j // S]",
         "acc_ref[j // S] = ",  # a partial update: only that sequence's state is stored
         "logit_blocks_ref[c // bv] = ",
-        "jnp.logical_not(j % S >= lengths[j // S])",  # the runtime mask
+        "jnp.logical_not(j % S >= group_max[R, j // S * G])",  # the runtime mask
     ):
         assert line in src
     # Steps that run: per layer 2 QKV blocks, the cache blocks before each length (0, 1, 2 and 2 of 2), 2 of
     # W_o, 2 of the FFN; then 2 vocab blocks.
-    count = jax.jit(lowered.entry.__globals__["decode_megakernel_steps"])(lengths)[2][0]
+    count = jax.jit(lowered.entry.__globals__["decode_megakernel_steps"])(group_lengths(lengths))[2][0]
     assert int(count) == 2 * (2 + (0 + 1 + 2 + 2) + 2 + 2) + 2
-    empty = jax.jit(lowered.entry.__globals__["decode_megakernel_steps"])(jnp.zeros(4, I32))[2][0]
+    steps = lowered.entry.__globals__["decode_megakernel_steps"]
+    empty = jax.jit(steps)(group_lengths(jnp.zeros(4, I32)))[2][0]
     assert int(empty) == 2 * (2 + 1 + 2 + 2) + 2  # all caches empty: one empty attention step per layer
+
+
+@pytest.mark.parametrize("group", [2, 4])
+def test_attention_steps_over_groups_of_sequences(group):
+    """A step over `group` sequences reads each up to the group's longest cache (masked past its own)."""
+    tokens, k_cache, v_cache, lengths, params = _step_inputs(4, [0, 1, 130, 250], 256)
+    inputs = kernel_inputs(tokens, k_cache, v_cache, lengths, params)
+    tiles = MegaTiles(block_d=128, block_kv=128, block_a=256, block_f=256, block_v=256, group=group)
+    logits, _ = run_checking_races(decode_megakernel, *inputs, tiles)
+    _close(logits, numpy_step(tokens, k_cache, v_cache, lengths, params, CONFIG)[0])
+    lowered = decode_megakernel.lower(*inputs, tiles)
+    count = jax.jit(lowered.entry.__globals__["decode_megakernel_steps"])(group_lengths(lengths))[2][0]
+    blocks = {2: 1 + 2, 4: 2}[group]  # each group's blocks up to its longest cache
+    assert int(count) == 2 * (2 + blocks + 2 + 2) + 2
 
 
 def test_empty_caches_attend_to_the_new_token_only():
@@ -225,8 +242,9 @@ def _specs(layers, d, heads, kv_heads, ffn, vocab, batch, max_len):
         "w_vocab": (d, vocab),
     }
     rope = spec(batch, HEAD_DIM)
-    cache = spec(layers, batch * max_len, kvd, dtype=B16)
-    head = (spec(batch, d, dtype=B16), rope, rope, spec(batch, dtype=I32), cache, cache)
+    cache = spec(layers, batch, max_len, kvd, dtype=B16)
+    lengths = (spec(batch, dtype=I32), spec(len(GROUPS), batch, dtype=I32), spec(batch, 1, 1, dtype=I32))
+    head = (spec(batch, d, dtype=B16), rope, rope, *lengths, cache, cache)
     return head + tuple(spec(*shapes[name], dtype=B16) for name in WEIGHTS)
 
 
@@ -235,8 +253,8 @@ def _specs(layers, d, heads, kv_heads, ffn, vocab, batch, max_len):
     [
         (16, 1, 4096, None),
         (16, 8, 4096, None),
-        (8, 64, 4096, None),
-        (8, 32, 4096, MegaTiles(block_d=512, block_kv=512, block_a=1024, block_f=1024, block_v=2048)),
+        (8, 64, 4096, MegaTiles(group=8)),
+        (8, 32, 4096, MegaTiles(block_d=512, block_kv=512, block_a=1024, block_f=1024, block_v=2048, group=2)),
     ],
 )
 def test_megakernel_lowers_for_v5e(layers, batch, max_len, tiles):
