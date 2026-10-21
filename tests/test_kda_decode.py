@@ -70,10 +70,14 @@ def test_kda_decode_matches_float64_and_vllms_kernel(monkeypatch, options):
     assert float(jnp.abs(ours[0][1]).max()) == 0.0  # the padded entry's output: zeros
     for mine, vllms in zip(ours, theirs, strict=True):
         np.testing.assert_allclose(f64(mine), f64(vllms), rtol=8e-3 if mine.dtype == jnp.bfloat16 else 1e-6, atol=1e-7)
-    # With vLLM's tiles (all heads at once) the same arithmetic in the same order gives the same bits.
+    # With vLLM's tiles (all heads at once) the same arithmetic in the same order gives the same bits. (On
+    # a v5e, at any tiles. The interpreter's f32 matmuls of transposed states may sum in another order.)
     whole = step_kernel(**options)(*step_args(*args_of(inputs)), KdaTiles(heads=HEADS))
     for mine, vllms in zip(whole, theirs, strict=True):
-        np.testing.assert_array_equal(np.asarray(mine), np.asarray(vllms))
+        if options.get("state_transposed"):
+            np.testing.assert_allclose(f64(mine), f64(vllms), rtol=8e-3 if mine.dtype == jnp.bfloat16 else 1e-6)
+        else:
+            np.testing.assert_array_equal(np.asarray(mine), np.asarray(vllms))
 
 
 def test_kda_decode_in_the_interpreter_checking_races():
@@ -124,3 +128,14 @@ def test_kda_decode_lowers_for_a_v5e_at_kimi_linears_shapes(batch):
         lowered = kda_decode_step.lower(*specs, KdaTiles(heads=heads))
         assert lowered.steps == batch * HEADS // heads
         assert "tpu_custom_call" in lower_for_v5e(lowered, *specs)
+
+
+@pytest.mark.tpu
+@pytest.mark.parametrize("options", [{}, {"state_transposed": True}, {"lower_bound": -5.0}])
+@pytest.mark.parametrize("heads", [16, 32])
+def test_kda_decode_is_bit_for_bit_vllms_on_a_v5e(options, heads):
+    inputs = inputs_with_padding(batch=8)
+    ours = step_kernel(**options)(*step_args(*args_of(inputs)), KdaTiles(heads=heads))
+    theirs = decode_kda(*args_of(inputs), **options)
+    for mine, vllms in zip(ours, theirs, strict=True):
+        np.testing.assert_array_equal(np.asarray(mine), np.asarray(vllms))

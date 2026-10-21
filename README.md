@@ -74,6 +74,8 @@ ops instead.
 | `for layer in range(L):` around reduction loops (a repeat loop) | the phases' steps once per layer, the next layer's weights fetched while this one runs |
 | `out = out.at[i : i + C, :].set(y)` in a reduction loop's body | a tile stored per step, its copy overlapping the next steps |
 | `a = a.at[k].set(v)` on a carried value | a store into that part of its VMEM buffer |
+| `new = pool` (an output allocated as an input) | the input's buffer, updated in place (`input_output_aliases`) |
+| `new = new.at[slot[b], :, :].set(s)` | a store at a window chosen when the kernel runs (a scatter) |
 
 Generated code is what runs: `kernel.source(...)` is exactly the module autokernel executes.
 
@@ -297,6 +299,12 @@ def f(x, y, tiles=Tiles()):                   # the input arrays; optionally las
   (`v : v + step`, or `v` for a loop of step 1), covering the dim exactly; other dims are stored whole
   (`:`). Masked-out tiles keep the allocation's value (`jnp.zeros`, `jnp.full(..., -jnp.inf)`), written by
   DMAs that overlap the compute.
+- **Outputs updated in place**: an output allocated as an input (`new_state = state`) is that input's
+  buffer (donate it under `jax.jit` and nothing is copied): what no tile stores keeps the input's values.
+  Only such an output may be stored at a window an index array chooses, `new_state.at[slots[b], h : h + T,
+  :, :].set(s)` (a paged cache or state pool), the parallel loop reading the index array placing it. Tiles
+  must not read windows other tiles store: which one a read sees isn't defined (nor which of two stores to
+  one window lands, as in JAX's scatter).
 - **Tile code** is assignments, augmented assignments and `with jax.named_scope(name):` blocks; use
   `jnp.where` instead of `if`. Values carried from one reduction step to the next (`acc`) are found
   automatically and kept in VMEM, so each keeps one type, the one the loop body gives it: start it with
@@ -402,12 +410,22 @@ inputs of that shape, from first principles:
 2. **Trace** it: run it under the JAX profiler. Its device time ranks it, and its trace regions say what
    limits it (below).
 3. **Change the schedule** the way the bottleneck says, keeping what's faster: exposed input copies → more
-   input buffers, then the neighbouring tiles that move fewer bytes; exposed output copies → more output
-   buffers; per-step overhead → the neighbouring tiles with fewer, bigger steps; compute-bound → every
-   neighbour, fewest steps first. A neighbour moves one field one step along its choices.
+   input buffers (and, for a kernel whose tiles take one step, copies in bursts: below), then the
+   neighbouring tiles that move fewer bytes; exposed output copies → more output buffers; per-step
+   overhead → the neighbouring tiles with fewer, bigger steps; compute-bound → every neighbour, fewest
+   steps first. A neighbour moves one field one step along its choices.
 
 It climbs from the defaults until nothing proposed is faster (at most 12 candidates), and remembers the
-result for inputs of that shape. Passing a tunable skips tuning; off a TPU the defaults are used. Tuning
+result for inputs of that shape. A kernel that updates inputs in place is timed in place (its inputs
+donated, each call's outputs the next one's inputs), as a decode loop runs it.
+
+**Copies in bursts.** A v5e's HBM loses time turning around between reads and writes: streaming a pool
+through VMEM and back in 1 MiB copies moved 640-650 GB/s however deep the pipeline (reads alone: 731 GB/s,
+writes alone: 639), and XLA's own elementwise pass 673. A kernel whose tiles take one step can move its
+copies in bursts instead (`Pipeline.bursts(g)`): the next g steps' inputs are fetched while this burst
+computes, and the burst's outputs go out once they are in, so the copies in flight all read or all write.
+In bursts of 8-16 MiB the same stream moved 677-683 GB/s. The tuner tries bursts when such a kernel is
+copy-bound. Passing a tunable skips tuning; off a TPU the defaults are used. Tuning
 also works when the first call is traced (`jax.jit(matmul)(x, y)`): it runs on a thread of its own.
 
 On a v5e (bf16; device time of the chosen schedule; `benchmarks/`):

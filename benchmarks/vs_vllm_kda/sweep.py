@@ -8,6 +8,7 @@ first; only the kernel's own op is counted), against vLLM's kernel the same two 
 from __future__ import annotations
 
 import argparse
+import functools
 import sys
 import tempfile
 from pathlib import Path
@@ -17,7 +18,7 @@ sys.path[:0] = [str(HERE), str(HERE.parent.parent / "examples")]
 
 import jax
 import jax.numpy as jnp
-from kda_decode import ARGS, KdaTiles, args_of, kda_decode_step, make_inputs, step_args
+from kda_decode import ARGS, KdaTiles, args_of, make_inputs, step_args, step_kernel
 from vllm_torchtpu.kernels.kimi_k3.decode_kda import decode_kda
 
 from autokernel import Config, Pipeline, profiling
@@ -65,23 +66,28 @@ def kernel_us(fn, args, donated, name, calls=5):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch", default="64,256")
+    parser.add_argument("--transposed", action="store_true", help="pools of (d_v, d_k) states, as vLLM's")
+    parser.add_argument("--donated-only", action="store_true")
     opts = parser.parse_args()
+    theirs = functools.partial(decode_kda, state_transposed=opts.transposed)
+    kernel = step_kernel(state_transposed=opts.transposed)
+    modes = (True,) if opts.donated_only else (True, False)
     for batch in map(int, opts.batch.split(",")):
         inputs = make_inputs(batch)
         args = args_of(inputs)
-        for donated in (True, False):
-            k, t = kernel_us(decode_kda, args, donated, "kda_decode_fused_conv_recurrent")
+        for donated in modes:
+            k, t = kernel_us(theirs, args, donated, "kda_decode_fused_conv_recurrent")
             print(f"B {batch:3} vllm {'donated' if donated else 'copied '}: kernel {k:8.1f} us, all ops {t:8.1f} us")
-        sig = kda_decode_step.signature(*step_args(*args))
+        sig = kernel.signature(*step_args(*args))
         for heads, pipeline in SCHEDULES:
             config = Config(KdaTiles(heads=heads), pipeline)
             try:
-                lowered = kda_decode_step.lowered(sig, config)
+                lowered = kernel.lowered(sig, config)
             except Exception as e:
                 print(f"B {batch:3} {heads} {pipeline}: {e}")
                 continue
             fn = lambda *a, lowered=lowered: lowered.entry(*step_args(*a))  # noqa: E731
-            for donated in (True, False):
+            for donated in modes:
                 k, t = kernel_us(fn, args, donated, "kda_decode_step")
                 print(
                     f"B {batch:3} heads {heads} {pipeline!s:28} {'donated' if donated else 'copied '}: "

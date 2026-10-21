@@ -1,7 +1,37 @@
 """Kimi Delta Attention (Kimi Linear's linear attention), one decode step: one token per sequence, the
-recurrent and short-convolution states in paged pools, updated in place.
+recurrent and short-convolution states in paged pools, updated in place. The same function as vLLM
+TorchTPU's fused `decode_kda` kernel (vllm-torchtpu v0.29.0, kernels/kimi_k3/decode_kda.py; vendored in
+benchmarks/vs_vllm_kda), with the same inputs and outputs, and bit for bit the same results on a v5e.
 
-WORK IN PROGRESS: inputs, the float64 reference and the plain-JAX path.
+Per sequence b, in its slot state_indices[b] of each pool (slot 0: the null block, for padding):
+
+    the 4-tap causal conv + SiLU of the token's q, k, v over the slot's last 3 inputs (zeros on a
+    sequence's first step, has_initial_state[b] == 0), rounded to bf16; q, k L2-normalized, q * d_k**-0.5;
+    per key channel the decay a = exp(-exp(A_log) softplus(g + dt_bias)) (or exp(lb * sigmoid(...)));
+    S' = Diag(a) S;  u = beta (v - S'^T k);  S'' = S' + k u^T;  o = S''^T q   (per head, S: d_k x d_v f32)
+
+and the slot's state and conv tail written back (a null entry: zeros out, its slot as it was).
+
+**The kernel** (`kda_decode_step`) is one loop nest, a tile per (sequence, block of heads): it reads the
+sequence's slots through the index array (`state[state_indices[b], h : h + TH, :, :]`) and stores them back
+into the pools updated in place (`new_state = state`, `new_state.at[state_indices[b], ...].set(...)`):
+autokernel aliases the pools (input_output_aliases) and copies only the slots the batch owns. The
+arithmetic is vLLM's, in its order (the two matrix-vector products are MXU matmuls with the decayed and the
+updated state as the weights, at the MXU's default precision for f32): the same bits. vLLM's pools keep
+each head's state transposed, (d_v, d_k) (`state_transposed`): its kernel swaps every state on the way in
+and out, which doubles the compute; this one reads the transposed states as transposed MXU weights instead
+(`delta_rule_transposed`), the same products in the same order.
+
+**Why it is faster.** The step is bound by HBM: 2 MiB of f32 state per sequence read and written (Kimi
+Linear: 32 heads of 128), the compute (~2 us per sequence) hidden under the copies. A v5e's HBM moves
+640-650 GB/s of interleaved reads and writes; vLLM's grid pipeline gets 80% of the 819 GB/s peak. autokernel
+moves this kernel's copies in bursts (tuned: 32-head tiles, bursts of 8 sequences): the next burst's
+slots are read while this burst computes, then its slots are written, so reads and writes don't
+interleave, and the tiles reach 84-85%. At batch 1 (one sequence: no pipeline to fill) 16-head tiles
+overlap the second half's copies with the first's compute.
+
+`reference` is the step in float64 NumPy; `xla_decode` the step in plain JAX (hybrid_layers.py's
+`delta_step`), the decode path hybrid_models.py's Kimi-Linear-like model uses.
 """
 
 from __future__ import annotations
@@ -121,6 +151,20 @@ def delta_rule(q, k, v, a, beta, s):
     return out[:, 0, :], new
 
 
+def delta_rule_transposed(q, k, v, a, beta, t):
+    """`delta_rule` on states kept as S^T (TH, d_v, d_k), as vLLM's pools keep them, without transposing
+    them: S'^T = S^T Diag(a), u = beta (v - S'^T k), S''^T = S'^T + u k^T, o = S''^T q. The matmuls read
+    S'^T and S''^T as transposed weights (contracting their last dim): the MXU holds the same S' and S'' as
+    in `delta_rule`, so the products and their sums are the same."""
+    transposed = (((2,), (2,)), ((0,), (0,)))
+    decayed = t * a[:, None, :]
+    read = jax.lax.dot_general(k[:, None, :], decayed, transposed, preferred_element_type=jnp.float32)
+    u = beta[:, :, None] * (v[:, None, :] - read)  # (TH, 1, d_v)
+    new = decayed + columns(u[:, 0, :]) * k[:, None, :]
+    out = jax.lax.dot_general(q[:, None, :], new, transposed, preferred_element_type=jnp.float32)
+    return out[:, 0, :], new
+
+
 def make_kda_decode_step(lower_bound: float | None = None, state_transposed: bool = False) -> autokernel.Kernel:
     """The step as one loop nest, a tile per (sequence, block of heads), for vLLM's options: the gate's lower
     bound (None: the softplus form), and pools whose slots hold each head's state as (d_v, d_k)."""
@@ -165,11 +209,8 @@ def make_kda_decode_step(lower_bound: float | None = None, state_transposed: boo
                     g[b, h : h + TH, :].astype(jnp.float32), dt_bias[h : h + TH, :], a_log[h : h + TH, :], lower_bound
                 )
                 stored = state[state_indices[b], h : h + TH, :, :]
-                s = jnp.swapaxes(stored, 1, 2) if state_transposed else stored
-                o, s = delta_rule(
-                    q, k, conv[2], a, beta[b, h : h + TH, :].astype(jnp.float32), jnp.where(carry, s, 0.0)
-                )
-                s = jnp.swapaxes(s, 1, 2) if state_transposed else s
+                step = delta_rule_transposed if state_transposed else delta_rule
+                o, s = step(q, k, conv[2], a, beta[b, h : h + TH, :].astype(jnp.float32), jnp.where(carry, stored, 0.0))
                 tail = jnp.concatenate([prev[1:], x[None]]).astype(conv_dtype)
                 out = out.at[b, h : h + TH, :].set(jnp.where(valid, o, 0.0).astype(dtype))
                 new_conv = new_conv.at[state_indices[b], :, :, h : h + TH, :].set(jnp.where(valid, tail, stored_conv))
