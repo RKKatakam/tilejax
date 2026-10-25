@@ -342,7 +342,9 @@ def tune(kernel: Kernel, signature: Signature, arrays: Sequence[Any] | None = No
     docstring)."""
     start = kernel.default_config(signature)
     kernel.lowered(signature, start)  # the default schedule builds, before anything runs
-    if not _can_time():
+    # (A kernel gathering across chips runs only inside jax.shard_map, on all of them at once: not yet timed
+    # here, it runs its default schedule.)
+    if not _can_time() or kernel.nest.all_gathers:
         return Tuning(Trial(start))
 
     def run() -> Tuning:

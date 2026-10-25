@@ -24,6 +24,10 @@ An output allocated as an input (`new = pool`) is that input updated in place: t
 it stores into the input's buffer, and everything else keeps the input's values. Only such an output may be
 stored at windows index arrays choose (`new = new.at[slot[b], :, :].set(...)`, a scatter): what no tile
 stores is the input's.
+
+An input gathered across the chips of a mesh axis (`xs = autokernel.all_gather(x, "x")`) is planned as
+an input of its gathered shape, `x`'s rows times the axis's chips; its rows travel a ring of the chips while
+the kernel runs (`Ring`), so its tiles must take whole rows of one chip's: the outermost parallel loop's.
 """
 
 from __future__ import annotations
@@ -46,7 +50,7 @@ import numpy as np
 from jax._src import core as jax_core
 from jax._src import source_info_util
 
-from . import mxu, packing, ragged, v5e
+from . import collective, mxu, packing, ragged, v5e
 from .errors import KernelError
 from .parse import Loop, Nest
 from .tilecode import as_store, assigned, element_reads, first_reads, flatten, reads
@@ -61,6 +65,7 @@ __all__ = [
     "Plan",
     "Range",
     "Repeat",
+    "Ring",
     "Tile",
     "Window",
     "make_plan",
@@ -218,6 +223,22 @@ class Carried:
 
 
 @dataclass(frozen=True)
+class Ring:
+    """An input all-gathered across the `size` chips of a mesh axis (`xs = autokernel.all_gather(x, axis)`),
+    its rows passed around a ring of them as the kernel runs. The outermost parallel loop, `loop`, walks the
+    rows a chip's shard at a time (`shard_blocks` of its blocks each), this chip's own first: the tiles of ring
+    step r read the shard of chip (me - r) mod size, which arrived while ring step r - 1 ran."""
+
+    name: str  # the gathered array: a param, whose HBM buffer the kernel fills
+    source: str  # the input it gathers: this chip's shard
+    axis: str
+    size: int  # the axis's chips
+    rows: int  # rows of one chip's shard
+    loop: str
+    shard_blocks: int
+
+
+@dataclass(frozen=True)
 class Plan:
     """A loop nest resolved for one input signature."""
 
@@ -251,6 +272,7 @@ class Plan:
     unpacked: frozenset[str]  # outputs stored from words (`out.at[...].set(autokernel.unpairs(words, dtype))`)
     tile_ops: int  # operations in a tile's code traced as plain JAX (each phase body twice): its size
     env: dict[str, Any]  # the function's module and closure values, with the prologue's names over them
+    rings: tuple[Ring, ...] = ()  # the inputs gathered across chips
 
     @property
     def single_step(self) -> bool:
@@ -357,6 +379,7 @@ class _Planner:
         self._check_element_bounds()
         phases, segments, repeats = self._phases(reductions, repeat_loops)
         operands, reads_ = self._operands(phases, segments, repeats)
+        rings = self._rings(parallel, operands, aliased)
         packed = self._packed(reads_)
         packed_names = self._packed_names(packed)
         stored_by = {name: self._storing_phase(name, phases) for name in self.nest.outputs}
@@ -404,6 +427,7 @@ class _Planner:
             unpacked=unpacked,
             tile_ops=types.ops,
             env=self.env,
+            rings=rings,
         )
 
     # ------------------------------------------------------------------ the prologue and outputs
@@ -411,8 +435,14 @@ class _Planner:
     def _prologue(self) -> dict[str, tuple[tuple[int, ...], np.dtype, Any]]:
         """Run the prologue on the inputs' shapes; each output's (shape, dtype, fill)."""
         allocation_of = {id(stmt): name for name, stmt in self.nest.allocations.items()}
+        gathered = {id(g.node) for g in self.nest.all_gathers}
         outputs = {}
         for stmt in self.nest.prologue:
+            if id(stmt) in gathered:  # (the gathered array is an input of its gathered shape already)
+                func = stmt.value.func  # type: ignore[attr-defined]
+                if self.eval(func) is not collective.all_gather:
+                    raise self.error("gather an input across chips with autokernel.all_gather", func)
+                continue
             name = allocation_of.get(id(stmt))
             if name is not None:
                 outputs[name] = self._allocation(name, stmt.value)  # type: ignore[attr-defined]
@@ -458,6 +488,8 @@ class _Planner:
             aliased[name] = self.nest.params.index(value.id) if is_input else None  # type: ignore[attr-defined]
             if not is_input:
                 continue
+            if value.id not in self.nest.inputs:  # type: ignore[attr-defined]
+                raise self.error(f"`{value.id}` is gathered across chips: an output can't update it in place", value)  # type: ignore[attr-defined]
             if value.id in self.indices:  # type: ignore[attr-defined]
                 raise self.error(
                     f"output `{name}` updates `{value.id}` in place, but `{value.id}` is an index array (in SMEM)",  # type: ignore[attr-defined]
@@ -793,6 +825,54 @@ class _Planner:
                 by_key[key] = operands[operands.index(operand)] = replace(operand, in_body=True)
         return tuple(operands), by_key
 
+    def _rings(
+        self, parallel: tuple[Range, ...], operands: tuple[Operand, ...], aliased: Mapping[str, int | None]
+    ) -> tuple[Ring, ...]:
+        """The inputs gathered across chips, once their tiles are known to take whole rows of one chip's shard
+        from the outermost parallel loop, which walks every tile (no mask skips one)."""
+        nest = self.nest
+        rings = []
+        for gather in nest.all_gathers:
+            node, name, source = gather.node, gather.name, gather.source
+            shape = self.inputs[nest.params.index(name)].shape
+            if source in self.indices:
+                raise self.error(f"`{source}` is an index array (in SMEM): gather an input read as tiles", node)
+            if nest.params.index(source) in aliased.values():
+                raise self.error(f"`{source}` is gathered across chips: it can't be updated in place too", node)
+            reads_ = [op for op in operands if op.tile.array == name]
+            if not reads_:
+                raise self.error(f"`{name}` is gathered across chips, but no tile reads it", node)
+            masked = next((loop.mask for loop in nest.parallel if loop.mask is not None), None)
+            if masked is not None:
+                raise self.error(
+                    f"a kernel gathering `{name}` across chips computes every tile: its parallel loops can't be masked",
+                    masked,
+                )
+            r, rows = parallel[0], self.inputs[nest.params.index(source)].shape[0]
+            for op in reads_:
+                window = op.tile.windows[0]
+                rows_ = (window.loop, window.offset, window.size, window.index, window.rows)
+                if rows_ != (r.var, 0, r.step, None, None):
+                    raise self.error(
+                        f"{op.tile.text}: tiles of `{name}`, gathered across chips, take its rows "
+                        f"`{r.var} : {r.var} + {r.step}` of the outermost parallel loop (they arrive a shard at once)",
+                        node,
+                    )
+            if r.bounds is not None or r.start != 0 or r.count * r.step != shape[0]:
+                raise self.error(
+                    f"the outermost parallel loop, `{r.var}`, walks all of `{name}`'s {shape[0]} rows from 0, gathered "
+                    "across chips",
+                    nest.parallel[0].node,
+                )
+            if rows % r.step:
+                raise self.error(
+                    f"`{r.var}` steps by {r.step}, which must divide one chip's {rows} rows of `{name}`",
+                    nest.parallel[0].node,
+                )
+            size = shape[0] // rows
+            rings.append(Ring(name, source, gather.axis, size, rows, r.var, rows // r.step))
+        return tuple(rings)
+
     def _packed(self, reads_: Mapping[str, Operand]) -> dict[tuple[int, int], str]:
         """The calls of `autokernel.pairs` in tile code, each on a tile read of a 16-bit (..., 2, d) window."""
         found = {}
@@ -878,6 +958,8 @@ class _Planner:
             mine = [n for n in elements if n.value.id == name]  # type: ignore[attr-defined]
             if not mine:
                 continue
+            if p >= len(nest.inputs):
+                raise self.error(f"`{name}` is gathered across chips: kernel code reads tiles of it", mine[0])
             ids = {id(n) for n in mine}
             tiles = [
                 n

@@ -15,7 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.experimental.pallas import tpu as pltpu
 
-from . import codegen, v5e
+from . import codegen, collective, v5e
 from .errors import KernelError
 from .parse import Nest, parse
 from .pipeline import Pipeline, default_pipeline, vmem_bytes
@@ -144,18 +144,61 @@ class Kernel:
 
     def verify(self, *args: Any, rtol: float | None = None, atol: float | None = None) -> float:
         """Run the kernel and its reference; raise AssertionError unless they agree (within tolerances for the
-        dtypes, or `rtol` and `atol`). Returns the largest absolute difference."""
+        dtypes, or `rtol` and `atol`). Returns the largest absolute difference.
+
+        A kernel gathering across chips takes its inputs as global arrays, sharded over the mesh the way its
+        chips see them (`jax.device_put(x, NamedSharding(mesh, spec))`): each chip's outputs are compared."""
         arrays, tunable = self._split(args)
-        if self.nest.tunable:
-            arrays = (*arrays, tunable if tunable is not None else self.lower(*arrays).config.tunable)
-        got, want = self(*arrays), self.reference(*arrays)
+        if self.nest.all_gathers:
+            got, want, dtypes = self._sharded_run(arrays, tunable)
+        else:
+            if self.nest.tunable:
+                arrays = (*arrays, tunable if tunable is not None else self.lower(*arrays).config.tunable)
+            got, want = self(*arrays), self.reference(*arrays)
+            dtypes = tuple(dtype for _, dtype in self.signature(*arrays[: len(self.nest.inputs)]))
         got, want = (got, want) if isinstance(got, tuple) else ((got,), (want,))
-        dtypes = tuple(dtype for _, dtype in self.signature(*arrays[: len(self.nest.params)]))
         errors = [
             compare(f"{self.nest.name} output {name!r}", g, w, rtol, atol, dtypes)
             for name, g, w in zip(self.nest.outputs, got, want, strict=True)
         ]
         return max(errors)
+
+    def _sharded_run(self, arrays: tuple[Any, ...], tunable: Any) -> tuple[Any, Any, tuple[np.dtype, ...]]:
+        """The kernel's and its reference's outputs on every chip (stacked, one row per chip), from global
+        arrays sharded over one mesh; and the inputs' dtypes."""
+        shardings = [getattr(x, "sharding", None) for x in arrays]
+        if (
+            not all(isinstance(s, jax.sharding.NamedSharding) for s in shardings)
+            or len(
+                {s.mesh for s in shardings}  # type: ignore[union-attr]
+            )
+            != 1
+        ):
+            raise KernelError(
+                f"{self.nest.name} gathers across chips: verify it on global arrays sharded over one mesh "
+                "(jax.device_put(x, NamedSharding(mesh, spec)))"
+            )
+        mesh = shardings[0].mesh  # type: ignore[union-attr]
+        extra = (tunable,) if tunable is not None else ()
+
+        def both(*xs: Any) -> Any:
+            if self.nest.tunable and not extra:  # (the schedule the kernel would run with)
+                xs = (*xs, self.lower(*xs).config.tunable)
+            else:
+                xs = (*xs, *extra)
+            per_chip = functools.partial(jax.tree.map, lambda v: v[None])  # a leading dim, a row per chip
+            return per_chip(self(*xs)), per_chip(self.reference(*xs))
+
+        stacked = jax.sharding.PartitionSpec(tuple(mesh.axis_names))
+        run = jax.shard_map(
+            both,
+            mesh=mesh,
+            in_specs=tuple(s.spec for s in shardings),  # type: ignore[union-attr]
+            out_specs=stacked,
+            check_vma=False,
+        )
+        got, want = jax.jit(run)(*arrays)
+        return got, want, tuple(np.dtype(x.dtype) for x in arrays)
 
     def tuning(self, *arrays: Any) -> Tuning:
         """The schedule for inputs like these: tuned on the TPU when first asked (see tune.py), the
@@ -168,12 +211,17 @@ class Kernel:
     # ------------------------------------------------------------------ building (used by tune.py too)
 
     def signature(self, *arrays: Any) -> Signature:
-        """What the kernel is built for: the inputs' shapes and dtypes."""
+        """What the kernel is built for: the inputs' shapes and dtypes (then each gathered array's: its
+        input's rows times the chips of the mesh axis it is gathered over, in the mesh it is called under)."""
         signature = []
-        for name, x in zip(self.nest.params, arrays, strict=True):
+        for name, x in zip(self.nest.inputs, arrays, strict=True):
             if not (hasattr(x, "shape") and hasattr(x, "dtype")) or not tuple(x.shape):
                 raise KernelError(f"{self.nest.name}: input `{name}` must be an array, got {type(x).__name__}")
             signature.append((tuple(x.shape), np.dtype(x.dtype)))
+        for gather in self.nest.all_gathers:
+            (rows, *rest), dtype = signature[self.nest.inputs.index(gather.source)]
+            chips = collective.axis_size(gather.axis, self.nest.name)
+            signature.append(((rows * chips, *rest), dtype))
         return tuple(signature)
 
     def default_config(self, signature: Signature) -> Config:
@@ -219,7 +267,7 @@ class Kernel:
 
     def _split(self, args: tuple[Any, ...]) -> tuple[tuple[Any, ...], Any]:
         """The input arrays, and the tunable if one was passed."""
-        n = len(self.nest.params)
+        n = len(self.nest.inputs)
         if self.nest.tunable and len(args) == n + 1:
             tunable = args[-1]
             if type(tunable) is not type(self.default_tunable):
@@ -231,7 +279,7 @@ class Kernel:
         if len(args) != n:
             more = f", then optionally `{self.nest.tunable}`" if self.nest.tunable else ""
             raise KernelError(
-                f"{self.nest.name} takes {n} input arrays ({', '.join(self.nest.params)}){more}; got {len(args)}"
+                f"{self.nest.name} takes {n} input arrays ({', '.join(self.nest.inputs)}){more}; got {len(args)}"
             )
         return args, None
 

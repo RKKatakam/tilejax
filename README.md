@@ -43,8 +43,10 @@ The function is plain JAX and is the specification: `matmul.fn(x, y)` runs it as
 thing a kernel does differently from plain JAX is `@`, which accumulates in f32 (i32 for integers) as the
 MXU does, instead of rounding `bf16 @ bf16` to bf16; `verify` uses the same rule.
 
-autokernel targets **one chip, the TPU v5e**. Without a TPU, kernels run in the Pallas TPU interpreter
-with their default schedules, so you can develop and test them anywhere.
+autokernel targets **one chip, the TPU v5e**, and the chips of a v5e slice for one collective: an input
+gathered across chips, overlapped with the kernel's compute ([across chips](#across-chips-a-collective-matmul)).
+Without a TPU, kernels run in the Pallas TPU interpreter with their default schedules (on a simulated mesh
+of CPU devices for collectives), so you can develop and test them anywhere.
 
 ## How it works
 
@@ -643,6 +645,11 @@ def f(x, y, tiles=Tiles()):                   # the input arrays; optionally las
   n[0] * F, be)`: routing inside a kernel. It is computed in code after a reduction loop (the kernel learns
   it at the loop's last step, copies it into SMEM, then starts the inputs of the steps that read it) and
   read by later loops in the same iteration of its repeat loop, if it is in one. Masks can't read it.
+- **Inputs gathered across chips**: `xs = autokernel.all_gather(x, "x")`, a prologue statement of its own,
+  is every chip's `x` along mesh axis `"x"`, stacked along the first dim (`jax.lax.all_gather(x, "x",
+  tiled=True)`); tiles read it as `xs[i : i + T, ...]`, `i` the outermost parallel loop walking all of its
+  rows by T, which divides one chip's rows. No mask may skip a tile. The kernel runs inside `jax.shard_map`
+  ([across chips](#across-chips-a-collective-matmul)).
 - **Constants** the tile code reads (module globals, closure values, prologue names) are read when a kernel
   is first built for an input shape, as `jax.jit` does, and written into the generated source: numbers,
   strings, dtypes, tuples, modules, and functions (imported, or their source copied).
@@ -698,6 +705,54 @@ scale commutes with the matmul, `rmsnorm(x) @ w = (1 / rms(x)) * ((x * gamma) @ 
 over the model dimension accumulates `(x * gamma) @ w` on the MXU and each row's sum of squares, and the
 tile is scaled once at the end. The normalized activations never go to HBM; tuned, it is 1.08–1.16×
 faster than XLA's `rmsnorm(x) @ w` on large inputs, and even with it on 512 rows.
+
+### Across chips: a collective matmul
+
+In a tensor-parallel layer each chip holds some rows of the activations and some columns of the weights,
+and needs every chip's rows times its own columns. XLA gathers the rows first, then multiplies: the MXU
+waits while they cross the ICI. In autokernel the gather is a line of the prologue
+([examples/collective_matmul.py](examples/collective_matmul.py)):
+
+```python
+@autokernel.kernel
+def all_gather_matmul(x, w, tiles=CollectiveTiles()):   # x: this chip's rows; w: its columns
+    xs = autokernel.all_gather(x, "x")                  # every chip's rows, in the order of mesh axis "x"
+    M, K = xs.shape
+    ...
+    for i in range(0, M, tm):                           # the loops of a matmul, reading xs like any input
+        for j in range(0, N, tn):
+            ...
+                acc += xs[i : i + tm, k : k + tk] @ w[k : k + tk, j : j + tn]
+    ...
+
+run = jax.jit(jax.shard_map(all_gather_matmul, mesh=mesh, in_specs=(P("x", None), P(None, "x")),
+                            out_specs=P(None, "x"), check_vma=False))
+```
+
+Run as plain JAX inside `jax.shard_map`, the function means `jax.lax.all_gather(x) @ w`, and it is the
+kernel's reference, as always. The kernel overlaps the two. `xs` is an HBM buffer it fills itself:
+
+| Generated kernel | |
+| --- | --- |
+| at the start | meet both neighbours on the ring (a barrier: they write into this chip's `xs` from now on); copy this chip's rows in and send them to the next chip |
+| the tiles' order | the outermost loop walks the rows a chip's shard at a time, this chip's own first: ring step r reads chip (me - r)'s rows |
+| before a copy reads a shard | wait for it to arrive (one DMA semaphore per ring step), and forward it to the next chip at once |
+| at the end | every shard arrived and went on; wait for this chip's sends |
+
+So the rows a ring step needs arrive while the ring step before it computes; the step loop, its
+multi-buffered copies and its tunable are the matmul's own. On the mesh of a v5e slice, a ring runs along
+one axis (a 2 × 4 mesh's rows are rings of 4).
+
+**Status: simulated, not yet measured.** On CPU, the tests run it on 8, 4, 2 and 1 simulated chips (and a
+2 × 4 mesh), f32 and bf16, in the Pallas TPU interpreter with its race detector and uninitialized memory as
+NaN, and cross-lower it to Mosaic for a v5e-8. (The interpreter found the one race a first version had: one
+receive semaphore for every ring step let a chip a step ahead satisfy its neighbour's wait with the next
+shard's bytes.) `benchmarks/collective_matmul.py` times it on a v5e-8 against XLA's all-gather and matmul,
+and against the matmul alone with the rows already gathered (no communication): the floor. Kernels that
+gather aren't tuned yet: they run their default tunable, or the one you pass.
+
+`kernel.verify(x, w)` takes global arrays sharded the way the chips see them
+(`jax.device_put(x, NamedSharding(mesh, P("x", None)))`) and compares every chip's outputs.
 
 ## Tuning: test, trace, change the schedule
 
@@ -794,6 +849,7 @@ or XProf.
 | `kernel.verify(*args, rtol=None, atol=None)` | run both and compare; the largest difference |
 | `autokernel.profile(kernel, *args)` | a `KernelProfile` from the device trace |
 | `autokernel.enable_profiling()` | have libtpu record trace regions (if autokernel was imported after JAX started) |
+| `autokernel.all_gather(x, axis)` | in a prologue: every chip's `x` along a mesh axis, gathered over a ring while the kernel computes |
 
 ## Development
 
@@ -822,6 +878,7 @@ src/autokernel/
   mxu.py        what `@` means, for kernels and references alike
   reference.py  the function as plain JAX
   api.py        @autokernel.kernel, Kernel, Lowered, verify
+  collective.py autokernel.all_gather: an input gathered across chips
   profiling.py  trace regions -> KernelProfile
   tilecode.py   names tile code reads and assigns; output stores
   v5e.py        the chip: memories and layout rules
@@ -830,7 +887,8 @@ examples/       matmul, causal matmul, causal attention (+ JAX splash), RMSNorm 
                 a whole attention block, a whole transformer; Qwen3 (GQA, QK-norm, RoPE, sliding window,
                 gated attention, SwiGLU), MLA, MoE, KV-cache decoding (paged too), linear attention
                 (Gated DeltaNet, KDA), whole Qwen3 / Qwen3-MoE / DeepSeek-V3 / Kimi-K2 / Qwen3-Next /
-                Kimi-Linear-like models, a decode step in one kernel; Gemma 4 E2B with its real weights
+                Kimi-Linear-like models, a decode step in one kernel; Gemma 4 E2B with its real weights;
+                a collective matmul across chips
 benchmarks/     timing and profiling scripts for a TPU v5e
 tests/
 ```

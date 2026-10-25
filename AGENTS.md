@@ -8,8 +8,11 @@ autokernel compiles one Python loop nest over tiles, written as plain JAX, into 
 kernel for a **TPU v5e**, and tunes its schedule on the hardware. The scope is deliberately small:
 
 - **One chip.** Everything assumes a TPU v5e (`v5e.py`): 128 MiB VMEM, 1 MiB SMEM, one TensorCore, Mosaic's
-  (8, 128) layout. Off a TPU, kernels run in the Pallas TPU interpreter. Don't add other chips.
-- **One loop nest per kernel.** No programs, fusion, vmap/grad rules or sharding.
+  (8, 128) layout. Off a TPU, kernels run in the Pallas TPU interpreter. Don't add other chips. The one
+  exception is a collective: an input gathered across the v5e chips of a mesh axis
+  (`autokernel.all_gather`, `collective.py`), its rows passed around a ring of them while the kernel
+  computes. Such a kernel runs inside `jax.shard_map`; off a TPU, on a simulated mesh of CPU devices.
+- **One loop nest per kernel.** No programs, fusion, vmap/grad rules or sharding (beyond that gather).
 - **One object to optimize over.** A kernel's only performance input is its tunable: the
   `@autokernel.tunable` default of its last parameter, a frozen pytree of `choice(...)` fields
   (`tunable.py`). The schedule autokernel searches is that tunable plus the buffering (`pipeline.py`).
@@ -63,6 +66,7 @@ tune.py: for each candidate Config (tunable, Pipeline, cursor): build -> run -> 
 | `tunable.py` | `@tunable`, `choice`, neighbours of a tunable | know about kernels |
 | `tune.py` | `Config`, `search`, `proposals` (bottleneck -> next schedules), testing candidates, `tune` | parse or plan |
 | `api.py` | `Kernel`: per-signature caching, tunable handling, `lower`/`source`/`reference`/`verify`/`tuning` | |
+| `collective.py` | `all_gather` (plain JAX: `jax.lax.all_gather`); a mesh axis's size from the mesh in context | know about kernels |
 | `profiling.py` | read device traces into `KernelProfile`; `measure` a lowered kernel | choose anything |
 | `tilecode.py` | name analysis of tile statements; recognising output stores | |
 
@@ -98,6 +102,18 @@ regions wrap the waits, the output wait and the tile code. In bursts (`Pipeline.
 kernels only), a burst's first step waits for the previous burst's output copies and starts the next
 burst's fetches; its last step waits for them and starts its own output copies (the first burst's steps
 wait for their own inputs, the last burst's copy their outputs out as they go).
+
+An input gathered across chips (`plan.Ring`, from a prologue's `xs = autokernel.all_gather(x, "x")`) is
+planned as an input of its gathered shape (api.py adds it to the signature, from the mesh's axis size) and
+is an extra pallas_call output, never returned: its HBM buffer. The kernel meets both ring neighbours at a
+barrier (`collective_id`), copies its own rows in and sends them on (straight from `x`); `blocks` maps the
+outermost loop's block to ring order (ring step r reads chip (me - r)'s shard, this chip's first); and an
+operand's copy function first calls `<xs>_arrive(r)`, which waits for each ring step's rows in order (one
+receive semaphore per ring step: a semaphore only counts bytes, so one shared by all steps let a chip a
+step ahead satisfy its neighbour's wait with the next shard's bytes, which the interpreter caught as NaNs)
+and forwards each to the next chip as it comes. The drain arrives at the last step and waits for the
+sends. A chip only ever waits for shards that started earlier around the ring, so there is no deadlock
+whatever the prefetch depth.
 
 A tile's reduction loops are its phases (`plan.Phase`); a reduction loop of one iteration is inlined into
 the code around it by plan.py (its variable bound by a synthetic assignment), so it takes no step and the
@@ -221,6 +237,16 @@ Each of these was found on hardware; don't undo them without measuring again.
 - Tuning is per input signature, not per lengths: a short-context batch with the same cache shape reuses a
   long one's tuning (the attention group size most). Benchmarks give short contexts caches of their own.
 
+## Collectives: found in simulation (not yet measured on hardware)
+
+- The Pallas TPU interpreter runs remote DMAs, semaphores and barriers across a simulated mesh of CPU
+  devices (`--xla_force_host_platform_device_count=8`, set in `tests/conftest.py` and the example); its
+  default `on_wait` DMA mode is what exposed the shared-semaphore race above (`eager` hid it).
+- `device_id={axis: index}` (`DeviceIdType.MESH`) addresses a chip along one axis of a 2-D mesh: rings stay
+  in their row.
+- Collective kernels aren't tuned: tuning runs candidates outside `jax.shard_map` (tune.py keeps the default
+  schedule for them). Tuning them is next, on a v5e-8, with `benchmarks/collective_matmul.py`.
+
 ## Commands
 
 ```bash
@@ -235,7 +261,8 @@ emission path runs in the interpreter with the race detector and cross-lowers to
 `test_index_arrays.py` (SMEM index arrays, runtime masks and windows), `test_in_place.py` (outputs updated in place,
 stores at index-array windows), `test_bursts.py` (copies in bursts), `test_repeat_loops.py`, `test_step_outputs.py` (outputs stored per step),
 `test_runtime_ranges.py` (runtime ranges and tiles, ragged rows, gathered windows, pairs), `test_computed_indices.py`
-(routing inside a kernel), `test_api.py`, `test_profiling.py` (synthetic traces), `test_tunable.py`, `test_tune.py` (the search and
+(routing inside a kernel), `test_collective.py` (an input gathered across simulated chips: the collective matmul
+with the race detector, cross-lowered for a v5e-8, and every rule), `test_api.py`, `test_profiling.py` (synthetic traces), `test_tunable.py`, `test_tune.py` (the search and
 proposals with synthetic profiles; tuning end to end with `tune._can_time` and `profiling.measure` faked,
 kernels really running in the interpreter), `test_examples.py`, `test_tpu.py` (`tpu` marker: real hardware
 only). `helpers.make_kernel(source, **globals)` builds a kernel from a source string, which
