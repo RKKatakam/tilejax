@@ -6,6 +6,12 @@
 - `kernel.source(...)` is the generated Pallas source; `kernel.verify(...)` checks the kernel against the
   loop nest run as plain JAX; `kernel.tuning(...)` is what tuning tried and chose.
 - `autokernel.profile(kernel, ...)` says where the time goes on a v5e, from `jax.named_scope` regions.
+- `autokernel.pairs(x[...])` in kernel code reads a 16-bit tile's pairs of rows as the 32-bit words a TPU
+  packs them into (`autokernel.unpairs` stores them back); `x[autokernel.rows(start, stop, n), ...]` reads
+  (and stores) rows chosen when the kernel runs, as many as are valid.
+- `xs = autokernel.all_gather(x, "x")` in a kernel's prologue is every chip's `x` along a mesh axis: the
+  kernel, run inside `jax.shard_map`, computes on the rows it has while the others arrive over a ring of the
+  chips (a collective matmul).
 """
 
 from __future__ import annotations
@@ -14,9 +20,12 @@ from typing import Any
 
 from . import profiling
 from .api import Kernel, Lowered, kernel
+from .collective import all_gather
 from .errors import KernelError
+from .packing import pairs, unpairs
 from .pipeline import Pipeline
 from .profiling import KernelProfile, enable_profiling
+from .ragged import rows
 from .tunable import choice, tunable
 from .tune import Config, Trial, Tuning
 
@@ -29,11 +38,15 @@ __all__ = [
     "Pipeline",
     "Trial",
     "Tuning",
+    "all_gather",
     "choice",
     "enable_profiling",
     "kernel",
+    "pairs",
     "profile",
+    "rows",
     "tunable",
+    "unpairs",
 ]
 
 __version__ = "0.9.0"

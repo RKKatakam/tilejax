@@ -43,8 +43,10 @@ The function is plain JAX and is the specification: `matmul.fn(x, y)` runs it as
 thing a kernel does differently from plain JAX is `@`, which accumulates in f32 (i32 for integers) as the
 MXU does, instead of rounding `bf16 @ bf16` to bf16; `verify` uses the same rule.
 
-autokernel targets **one chip, the TPU v5e**. Without a TPU, kernels run in the Pallas TPU interpreter
-with their default schedules, so you can develop and test them anywhere.
+autokernel targets **one chip, the TPU v5e**, and the chips of a v5e slice for one collective: an input
+gathered across chips, overlapped with the kernel's compute ([across chips](#across-chips-a-collective-matmul)).
+Without a TPU, kernels run in the Pallas TPU interpreter with their default schedules (on a simulated mesh
+of CPU devices for collectives), so you can develop and test them anywhere.
 
 ## How it works
 
@@ -74,6 +76,8 @@ ops instead.
 | `for layer in range(L):` around reduction loops (a repeat loop) | the phases' steps once per layer, the next layer's weights fetched while this one runs |
 | `out = out.at[i : i + C, :].set(y)` in a reduction loop's body | a tile stored per step, its copy overlapping the next steps |
 | `a = a.at[k].set(v)` on a carried value | a store into that part of its VMEM buffer |
+| `new = pool` (an output allocated as an input) | the input's buffer, updated in place (`input_output_aliases`) |
+| `new = new.at[slot[b], :, :].set(s)` | a store at a window chosen when the kernel runs (a scatter) |
 
 Generated code is what runs: `kernel.source(...)` is exactly the module autokernel executes.
 
@@ -122,11 +126,14 @@ Fake weights and inputs, small models that fit a 16 GB v5e; bf16; ms per call, w
 | Gated DeltaNet layer (projections, conv, gates, norm) | [linear_attention_layer.py](examples/linear_attention_layer.py) | plain JAX | **1.32–1.97×** |
 | MoE experts, prefill (128 / 64 experts) | [moe.py](examples/moe.py) | megablox at its best tiling, `ragged_dot` | **1.29–1.45×** |
 | MoE, decode batches | [moe.py](examples/moe.py) | megablox, `ragged_dot` | parity (bandwidth bound, ~700 GB/s) |
-| GQA decode attention over a KV cache (ragged lengths) | [decode.py](examples/decode.py) | paged / ragged-paged attention, XLA | **0.97–1.40×** (up to 711 GB/s) |
-| Absorbed MLA decode attention | [decode.py](examples/decode.py) | XLA | **1.3–23×** (0.65× at B32 H16) |
-| Decode step, dense GQA model | [decode_model.py](examples/decode_model.py) | plain JAX + the best JAX decode kernel | **1.17–1.45×** |
+| GQA decode attention over a KV cache (ragged lengths) | [decode.py](examples/decode.py) | paged / ragged-paged attention, XLA | **1.11–1.50×** (up to 727 GB/s) |
+| Absorbed MLA decode attention | [decode.py](examples/decode.py) | XLA | **1.2–23×** (0.68× at B32 H16) |
+| Decode step, dense GQA model | [decode_model.py](examples/decode_model.py) | plain JAX + the best JAX decode kernel | **1.18–1.47×** |
 | A stack of FFN layers in one kernel (repeat loop) | [layer_stack.py](examples/layer_stack.py) | XLA / a kernel per layer | **1.02–1.22×** / 1.01–1.07× (744 GB/s) |
-| Whole decode step in one kernel (cross-layer prefetch) | [decode_megakernel.py](examples/decode_megakernel.py) | XLA / per-layer kernels | **1.03–1.45×** / 1.07× (up to 90% of HBM bandwidth) |
+| KDA decode step (Kimi Linear), paged states updated in place | [kda_decode.py](examples/kda_decode.py) | vLLM TorchTPU's fused `decode_kda` | **1.00–1.44×**, bit-identical (up to 695 GB/s) |
+| Whole decode step in one kernel (cross-layer prefetch) | [decode_megakernel.py](examples/decode_megakernel.py) | XLA / per-layer kernels | **1.03–1.53×** / **1.04–1.38×** (up to 91% of HBM bandwidth) |
+| MoE layers decoding in one kernel, the routing inside it | [moe_megakernel.py](examples/moe_megakernel.py) | moe.py's layer per layer (XLA routing + `moe_decode`) | **1.02–1.32×** (680–750 GB/s) |
+| A whole MoE decode step in one kernel | [moe_decode_megakernel.py](examples/moe_decode_megakernel.py) | kernels per layer, XLA routing between them | **1.00–1.16×** |
 
 **Whole models**, tokens to logits (prefill) and one token per sequence per step over a KV cache
 (decode), built only from autokernel kernels plus plain-JAX glue (embedding lookups, routing sorts, cache
@@ -159,6 +166,154 @@ features they needed came from them:
 - *Outputs stored per step*: chunked linear attention stores each chunk's outputs from the step that
   computes them, carrying only the recurrent state.
 - *Per-tile windows fetched once*: MoE tiles of one expert read its weights once.
+- *Computed index arrays* (below, "Megakernels"): a MoE layer's routing computed inside the kernel picks
+  which experts' weights later steps read, so a whole MoE stack is one kernel.
+
+### Megakernels: what Inferact's TPU megakernels showed us
+
+Inferact's [tpu-megakernels](https://github.com/Inferact/tpu-megakernels) run Kimi K3 and Qwen3.8 decode as
+one hand-written Pallas kernel per step. Read against autokernel, three of their single-chip techniques
+were missing: routing decided inside the kernel, one VMEM pool shared by every weight, and few, big steps.
+Each is now in the compiler, measured on a v5e (raw logs: [decode](benchmarks/results/decode_megakernel_v5e.txt),
+[MoE](benchmarks/results/moe_megakernel_v5e.txt)):
+
+**Fewer, bigger, cheaper steps** (the decode megakernel, `benchmarks/decode_megakernel.py`, ms per step):
+
+| Model (layers, d, H/Hkv, ffn, vocab) | B | mean context | before | after | per-layer kernels | XLA |
+| --- | --- | --- | --- | --- | --- | --- |
+| 16, 2048, 16/8, 6144, 32k | 1 | 1024 | 2.493 | **2.485** | 2.635 | 2.565 |
+| 16, 2048, 16/8, 6144, 32k | 8 | 512 | 2.802 | **2.701** | 2.854 | 3.181 |
+| 16, 2048, 16/8, 6144, 32k | 8 | 2048 | 3.718 | **3.576** | 3.769 | 5.364 |
+| 8, 2048, 16/8, 6144, 32k | 8 | 4096 | 2.581 | **2.488** | 2.584 | 3.817 |
+| 8, 2048, 16/8, 6144, 32k | 32 | 1024 | 3.085 | **2.848** | 3.008 | 4.207 |
+| 8, 2048, 16/8, 6144, 32k | 64 | 512 | 3.330 | **2.917** | 3.215 | 4.287 |
+| 8, 2048, 16/8, 6144, 32k | 64 | 32 | | **1.616** | 2.236 | 2.170 |
+
+- **Only the valid cache rows are copied.** The profile showed every shape copy-bound, and at batch 64 a
+  fifth of the attention's copies were rows past each sequence's length, a 256-row block per step. The
+  attention reads `autokernel.rows(...)` windows now: along a tiled dim a ragged copy is rounded up to whole
+  tiles (16 rows for bf16), its start and size annotated for Mosaic. Batch 64 × 512 went 3.33 -> 2.97 ms,
+  at ~747 GB/s of the bytes it must read.
+- **An attention step takes a group of sequences** (`MegaTiles.group`, tuned): a step reads G sequences'
+  blocks up to the group's longest cache. At short contexts the per-step cost dominates: 64 sequences of
+  ~32 positions, 1760 -> 1446 µs with groups of 8 (tuned on those lengths). Past ~512 positions reading the
+  shorter sequences up to the longest costs more than the steps saved, and the tuner keeps G = 1.
+- **Cheaper steps.** A step decodes two steps' table codes: their fields are now packed with power-of-two
+  radices (shifts and masks, not integer divisions), and each slot index is computed once a step. A
+  phase's inputs are waited for, and its slots bound, in the phase's own branch, streamed inputs after the
+  code before the phase (it runs while they arrive): neutral on these kernels (within 0.2%), and what
+  routing inside a kernel needs.
+- **Steps found as the kernel runs.** A kernel with runtime masks walked SMEM step tables that XLA made just
+  before it (an argsort over every step that could run). Its cursor (the one routing inside a kernel needs)
+  can walk them instead, skipping the blocks a mask skips as it moves: decode kernels gain (GQA decode at
+  B32 x 1k 0.258 -> 0.209 ms, B64 x 1k 0.485 -> 0.401, the decode megakernel 0.4-2%, `moe_decode` ~1%),
+  grouped matmuls whose masks skip most experts lose (`gmm_swiglu`/`gmm_down` 9-60%, 128-row expert groups
+  22%). So it is a schedule choice: tuning tries the other way first, timing a call with the ops its entry
+  function runs before the kernel (XLA's tables were free when only the kernel was timed). Tuned, every GQA
+  decode shape and the megakernel from batch 8 at 2k context up find their steps as they run
+  ([decode.py's log](benchmarks/results/decode_v5e.txt)).
+- **Not a win here:** deeper pipelines. The queue is not drained at phase boundaries (the code between
+  phases is 44 µs of 3.1 ms at batch 64): 3 -> 4 -> 6 input slots gave 3126 -> 3101 -> 3085 µs. So copies
+  are still fetched a fixed number of steps ahead, not a number of bytes.
+
+**One ring for windows of one shape** (`pipeline.rings`). A step only uses its own slot of a ring (the
+step's index modulo its depth), so windows that different phases stream share a ring when their tile
+shapes and dtypes match: VMEM for the decode megakernel 50.2 -> 44.2 MiB (B1), for Gemma 4's 53.7 -> 42.5
+MiB (B1; its sliding and full layers' weights and caches share), room the tuner can spend on bigger
+blocks.
+
+**Routing inside the kernel** (computed index arrays, `examples/moe_megakernel.py`): each MoE layer's
+router is a phase, its top-k and the list of chosen experts are computed at the router's last step, and
+the experts' phase is bounded by and reads through that list. Two Qwen3-30B-A3B layers (128 experts of 768,
+top-8), ms per call under `jax.jit`:
+
+| tokens | one kernel, routing inside | moe.py per layer (XLA routing + `moe_decode`) | speedup | one kernel GB/s |
+| --- | --- | --- | --- | --- |
+| 1 | **0.225** | 0.297 | 1.32× | 680 |
+| 4 | **0.724** | 0.758 | 1.05× | 733 |
+| 8 | **1.326** | 1.362 | 1.03× | 742 |
+| 32 | **2.823** | 2.875 | 1.02× | 750 |
+| 64 | **3.179** | 3.233 | 1.02× | 749 |
+
+From 4 tokens both read the chosen experts near the HBM limit, and one kernel saves the routing's XLA ops,
+a launch and a pipeline fill per layer. A token reads only 8 experts a layer, so those dominate at 1 token.
+
+**A whole MoE decode step in one kernel** (`examples/moe_decode_megakernel.py`): decode_megakernel.py's
+step with that MoE layer in place of the dense FFN, every layer and the LM head (the attention's masked
+steps found by the in-kernel cursor, which skips the blocks a mask skips as it moves). Two Qwen3-30B-A3B
+layers (32 query heads, 4 kv heads, 128 experts of 768, top-8, vocab 32k), contexts ~1k, ms per decode step
+(`benchmarks/moe_decode_megakernel.py`):
+
+| batch | one kernel | kernels per layer (QKV, attention, W_o, XLA routing, `moe_decode`) | speedup |
+| --- | --- | --- | --- |
+| 1 | **0.546** | 0.633 | 1.16× |
+| 8 | **1.704** | 1.747 | 1.03× |
+| 32 | 3.458 | 3.443 | 1.00× |
+
+(Its logits can differ from the per-layer step's where a token's router scores are near a tie: the one
+kernel keeps the residual in f32 between layers, the per-layer kernels round it to bf16.)
+
+### MoE layers at full width: autokernel vs `ragged_dot` and megablox
+
+One MoE layer of a real model, at its real width, with random weights. bf16, ms per call under `jax.jit`.
+
+**What's compared:**
+
+- **autokernel:** `expert_ffn_blocks` for prefill and the streaming `moe_decode` for decode.
+- **autokernel grouped matmuls:** our megablox-style `gmm_swiglu` + `gmm_down`.
+- **`jax.lax.ragged_dot`:** XLA's grouped matmul.
+- **megablox `gmm`:** JAX's Pallas kernel, at the best of eight tilings (64 to 1024 rows).
+
+**Fairness:** every method is timed twice. Once at XLA's default scoped VMEM limit, and once with
+`--xla_tpu_scoped_vmem_limit_kib` raised to 115 MiB. Megablox's `gmm` takes no limit of its own, and its
+256-row and larger tilings only compile with the higher one. Each method is reported at its better run.
+autokernel's kernels set their own limit either way.
+
+**Columns:**
+
+- **Experts:** the routed experts on already-dispatched rows.
+- **Layer:** RMSNorm, router, dispatch, experts, combine and residual.
+- **GB/s:** the fewest bytes the experts must move (each chosen expert's weights once, rows in and out)
+  divided by the time.
+
+Reproduce with `benchmarks/moe.py --config <name> --profile [--scoped-vmem-mib 115]`.
+
+**Qwen3-235B-A22B** (d_model 4096, 128 experts, top-8, 1536 hidden units each; 4.8 GB of experts):
+
+| Tokens | Experts: autokernel | `ragged_dot` | megablox | Layer: autokernel | `ragged_dot` | megablox | Layer speedup |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 4096 (prefill) | **10.35** (119.5 TFLOP/s) | 15.00 (82.5) | 16.86 (73.4) | **14.78** | 19.92 | 21.74 | **1.35×** |
+| 64 (decode) | **6.40** (750 GB/s) | 6.70 (717) | 6.88 (698) | **6.41** | 6.66 | 6.55 | 1.02× |
+| 8 (decode) | **2.54** (744 GB/s) | 2.60 (727) | 2.62 (720) | **2.55** | 2.61 | 2.56 | 1.01× |
+
+The decode rows were measured at the default limit only.
+
+**Profiles at 4096 tokens** (default limit, from `autokernel.profile` trace regions):
+
+| Kernel | Steps | Compute | Exposed DMA waits | Output waits | Overhead | Device time |
+| --- | --- | --- | --- | --- | --- | --- |
+| `expert_ffn_blocks`, 384-row tiles | 853 | 9.86 ms | 0.09 ms | 0.24 ms | 0.10 ms | 10.31 ms |
+| `gmm_swiglu`, 256 × 2048 tiles | 254 | 8.57 ms | 0.40 ms | | 0.02 ms | 9.02 ms |
+
+At 4096 tokens each expert gets ~256 rows, and the fused kernel is MXU-bound. Every weight it fetches
+is hidden behind compute.
+
+**Where megablox loses:**
+
+- **Weight reads:** its 128-row tiles at the default limit reread an expert's weights for every 128 rows.
+  At 819 GB/s that caps it near 105 TFLOP/s.
+- **Straddling tiles:** a tile spanning two experts is computed once for each.
+- **Unfused SwiGLU:** the gate/up output, 32k rows × 3072, goes to HBM and back through an XLA SwiGLU.
+
+The higher VMEM limit fixes the first: 256-row tiles, 20.45 → 16.86 ms. The other two remain.
+
+**Decode:** a few tokens touch most experts once, and every method reads those weights at 85–92% of the
+v5e's 819 GB/s, so they run at parity. The streaming `moe_decode` (a repeat loop over the chosen experts,
+each one's weights in blocks of hidden units, the next one fetched while this one runs) is what makes a
+full-width expert fit at all: Mixtral's experts are 352 MB each.
+
+Qwen3-Next-80B, Mixtral 8x7B and DeepSeek-V3 width (64 of its 256 experts), and 16384-token prefill, are
+being measured; raw rows in `benchmarks/results/moe_full_width_v5e.jsonl`.
 
 ## A real model against vLLM: Gemma 4 E2B
 
@@ -198,6 +353,194 @@ attention takes a step per sequence, so from batch 8 up the per-layer kernels ar
 
 **Tuning** changed these by under 1% at every batch, so the table is at the default tiles.
 
+## KDA decode against vLLM TorchTPU's kernel
+
+[kda_decode.py](examples/kda_decode.py) is Kimi Linear's KDA (Kimi Delta Attention) decode step as one
+loop nest: one token per sequence, the recurrent and short-convolution states in paged pools updated in
+place. It computes the same function as vLLM TorchTPU's fused `decode_kda` kernel (vllm-torchtpu v0.29.0,
+vendored unmodified in [benchmarks/vs_vllm_kda](benchmarks/vs_vllm_kda)), with the same inputs and outputs:
+
+- the state pools gathered by `state_indices`, with slot 0 a null block (zeros out, the slot untouched);
+- `has_initial_state` (a sequence's first step starts from zero states);
+- the 4-tap conv + SiLU, L2-normalized q and k, the per-channel decay, and the delta rule;
+- vLLM's options: transposed (d_v, d_k) state pools and the gate's lower bound.
+
+**Correctness.** The arithmetic is vLLM's, in its order, and the outputs, conv states and states are
+**bit for bit the same** on a v5e, for every batch, both layouts and both tile sizes
+(`test_kda_decode.py`, `benchmarks/vs_vllm_kda/run.py`). Against float64 NumPy, both kernels' states differ by
+~4e-5 (the median head; the MXU rounds f32 operands to bf16, as XLA's default does).
+
+**Workload.** Kimi Linear 48B's KDA layers (32 heads of 128, a 4-tap conv; bf16 activations, f32 state):
+
+- a pool of 2 × batch + 1 slots, each sequence in a random real slot;
+- a tenth of the sequences on their first step;
+- both pools donated, as a decode loop runs the step.
+
+**Measurement.**
+
+- Device time: the time per call the profiler shows ops on the TPU (the kernel and the ABI's small
+  reshapes, which both pay).
+- Wall time: the median over 5 repeats of the mean of 20 back-to-back calls (batch 1-8 are host-bound).
+- GB/s: the bytes a step must move (each sequence's state and conv slots read and written, its inputs and
+  output) over the device time. A v5e has 819 GB/s.
+
+Device µs per step, the [raw log](benchmarks/results/kda_decode_vs_vllm_v5e.txt); reproduce with
+`benchmarks/vs_vllm_kda/run.py [--transposed]`:
+
+| Batch | vLLM | autokernel | speedup | GB/s vLLM / autokernel | wall µs vLLM / autokernel | plain JAX (XLA) |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 10.7 | **8.5** | 1.26× | 420 / 528 | 48.7 / 48.5 | 18.0 |
+| 8 | 55.0 | 55.2 | 1.00× | 640 / 638 | 66.7 / 66.4 | 189.0 |
+| 32 | 215.5 | **206.5** | 1.04× | 651 / 680 | 231.7 / 221.5 | 717.0 |
+| 64 | 429.3 | **408.4** | 1.05× | 654 / 687 | 447.5 / 424.3 | 2232.6 |
+| 128 | 856.2 | **811.6** | 1.05× | 655 / 691 | 876.2 / 830.3 | 4462.7 |
+| 256 | 1706.4 | **1615.3** | 1.06× | 658 / 695 | 1729.4 / 1635.8 | 8915.7 |
+
+With vLLM's own (d_v, d_k) state layout (`--transposed`):
+
+| Batch | vLLM | autokernel | speedup | GB/s vLLM / autokernel |
+| --- | --- | --- | --- | --- |
+| 1 | 12.4 | **8.6** | 1.44× | 363 / 520 |
+| 8 | 58.6 | **54.8** | 1.07× | 601 / 642 |
+| 32 | 218.7 | **205.8** | 1.06× | 642 / 682 |
+| 64 | 432.7 | **408.5** | 1.06× | 649 / 687 |
+| 128 | 858.9 | **810.9** | 1.06× | 653 / 692 |
+| 256 | 1711.2 | **1617.8** | 1.06× | 656 / 694 |
+
+**What limits each.** Per sequence the step moves 4 MiB of f32 state (read and written), and computes for
+~2 µs, under the copies. So both kernels are bound by HBM:
+
+- **vLLM's grid pipeline** reads the next sequence's slots while it writes the last one's. Interleaved
+  reads and writes are what a v5e's HBM is slowest at: a pure VMEM round trip of 1 MiB copies moves
+  640-650 GB/s however it is pipelined. vLLM's kernel runs at 80% of 819 GB/s.
+- **autokernel's kernel** moves its copies in bursts of 8 sequences, picked by the tuner from the profile
+  (`Pipeline.bursts`, above): the next burst's slots are read while this burst computes, then this burst's
+  are written. It runs at 84-85%; alternating 8-16 MiB bursts of a pure round trip reach 677-683 GB/s.
+- **Batch 1** has nothing to pipeline across. The tuned 16-head tiles overlap one half's copies with the
+  other's compute.
+- **Batch 8** is too short for bursts to pay for their fill and drain: parity.
+- **Transposed pools.** vLLM's kernel swaps every state into (d_k, d_v) and back, which doubles its compute.
+  autokernel reads the transposed states as transposed MXU weights instead: the same products, summed in
+  the same order.
+
+The plain-JAX step (gather, conv, `delta_step`, scatter: hybrid_models.py's Kimi-Linear decode path) runs at
+15-31% of the bandwidth, 2-5× slower, and its states differ from float64 by ~3e-3 on a v5e.
+
+**What autokernel needed:**
+
+- *Outputs updated in place* (`new_state = state`: input_output_aliases);
+- *stores at windows an index array chooses* (`new_state.at[state_indices[b], h : h + TH, :, :]`);
+- *copies in bursts*, a pipeline choice for single-step kernels;
+- kernels updating inputs in place are now also timed in place when tuning (donated): undonated, XLA copies
+  the pool first, and 16-head tiles ran up to 5% faster on the fresh copy than they do in place.
+
+## Ragged paged attention against vLLM TorchTPU's RPA v3
+
+[ragged_paged_attention.py](examples/ragged_paged_attention.py) is vLLM's attention over a paged KV cache for a
+whole batch of sequences at once, with decodes, prefills and prefill chunks mixed. It has the same inputs and
+outputs as vLLM TorchTPU's `ragged_paged_attention` (RPA v3, vllm-torchtpu v0.29.0, vendored unmodified in
+[benchmarks/vs_vllm_rpa](benchmarks/vs_vllm_rpa)):
+
+- q (T, H, D), k and v (T, Hkv, D): every sequence's new tokens, concatenated;
+- a cache of pages (pages, page_size, Hkv, 2, D), each head's key and value side by side;
+- kv_lens, page_indices, cu_q_lens and distribution;
+- the step writes the new tokens' keys and values into the cache, in place, and attends causally.
+
+It is three loop nests, each a plain-JAX function of tiles:
+
+- `rpa_write`: the new keys and values into their pages, a tile per run of a sequence's tokens in one page;
+- `rpa_decode`: a tile per decoding sequence, a step per page of its cache;
+- `rpa_prefill`: a tile per 256 queries of a sequence, a step per 4 pages up to its last query.
+
+**Correctness.** The updated caches are exact for both kernels. Against float64 NumPy, autokernel's outputs
+are 1.7-8.6x closer than RPA's on every workload checked (e.g. decode 128 × 1k: 0.0010 vs 0.0046; prefill
+4 × 1024: 0.0097 vs 0.021). autokernel accumulates in f32; RPA accumulates in bf16.
+
+**Which vLLM.** vLLM TorchTPU's runner passes `distribution = [decodes, decodes, sequences]` and no
+`chunk_prefill_size` (tpu-inference: `runner/persistent_batch_manager.py`, `runner/tpu_runner.py`). So in
+serving, every sequence with more than one new token runs RPA's MIXED kernel: that is `vllm` below. RPA's
+PREFILL case (a static query length) is measured too, as `vllm-prefill`, wherever every prefill has the same
+length. It is ~11 µs slower than MIXED on every workload, because it launches the PREFILL kernel and then
+an empty MIXED one.
+
+**Workload and measurement.**
+
+- Model: Llama 3 8B's attention: 32 query heads, 8 kv heads of 128, bf16, pages of 128 positions,
+  sequences of up to 8192.
+- Decode cache lengths: ragged, half to 1.5x the mean; "8k" means every sequence is at 8192.
+- Each method is jitted with the cache donated and fed back, and with fresh q, k and v donated, as a model
+  step runs it. autokernel is tuned on each workload first.
+- Device time: the ops the profiler shows on the TPU per step: the kernels and all their XLA glue.
+
+Device µs per step on a TPU v5e. The [raw log](benchmarks/results/rpa_vs_vllm_v5e.txt) has each method's
+largest ops and the float64 checks. Reproduce with `benchmarks/vs_vllm_rpa/run.py [--check]`, and plot with
+`uv run --with matplotlib python benchmarks/vs_vllm_rpa/plot.py`:
+
+![autokernel's speedup over vLLM's RPA v3 per workload](benchmarks/results/rpa_vs_vllm_v5e.png)
+
+Decode, one new token per sequence (batch × mean context):
+
+| Batch | 512 | 1k | 2k | 4k | all at 8k |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 15.0 → **11.0** (1.36×) | 17.7 → **13.8** (1.28×) | 17.4 → **13.8** (1.26×) | 25.6 → **22.1** (1.16×) | 55.2 → **51.2** (1.08×) |
+| 8 | 55.8 → **37.7** (1.48×) | 64.1 → 64.7 (0.99×) | 98.6 → 104.6 (0.94×) | 167.7 → 173.2 (0.97×) | 365.6 → 369.9 (0.99×) |
+| 32 | 203.3 → **116.9** (1.74×) | 217.6 → **202.2** (1.08×) | 362.4 → 380.6 (0.95×) | 811.8 → **799.7** (1.02×) | 1431.2 → 1441.1 (0.99×) |
+| 128 | 799.7 → **446.4** (1.79×) | 860.8 → **799.0** (1.08×) | 1513.4 → 1581.2 (0.96×) | 3121.7 → **3047.4** (1.02×) | |
+
+(vLLM → autokernel. Batch 128 at 8k would be an 8.6 GB cache, with its copy.)
+
+Prefill, chunked prefill and mixed batches:
+
+| Workload | vLLM (MIXED) | vLLM (PREFILL) | autokernel | speedup |
+| --- | --- | --- | --- | --- |
+| 1 prompt of 512 | 93.7 | 104.8 | **74.3** | 1.26× |
+| 1 prompt of 1024 | 208.8 | 220.2 | **166.6** | 1.25× |
+| 1 prompt of 2048 | 533.5 | 544.5 | **437.2** | 1.22× |
+| 1 prompt of 4096 | 1580.5 | 1591.3 | **1333.5** | 1.19× |
+| 1 prompt of 8192 | 5265.8 | 5276.9 | **4551.5** | 1.16× |
+| 4 prompts of 1024 | 784.9 | 795.9 | **641.8** | 1.22× |
+| 8 prompts of 512 | 650.6 | 661.4 | **525.1** | 1.24× |
+| 16 prompts of 256 | 649.8 | 660.6 | **434.4** | 1.50× |
+| 256 tokens after 4k | 168.6 | 169.6 | **148.7** | 1.13× |
+| 512 tokens after 4k | 328.5 | 339.8 | **283.5** | 1.16× |
+| 512 tokens after 8k | 593.8 | 605.1 | **520.6** | 1.14× |
+| 1024 tokens after 8k | 1137.3 | 1148.6 | **997.2** | 1.14× |
+| 32 decodes + 2 chunks of 512 | 806.7 | 817.4 | **768.5** | 1.05× |
+| 64 decodes + 1 chunk of 1024 | 1307.4 | 1318.6 | **1259.8** | 1.04× |
+| 128 decodes + 4 chunks of 256 | 1231.6 | 1242.2 | **1123.6** | 1.10× |
+
+(The speedup is over vLLM's faster case, MIXED.)
+
+**Where the time goes.**
+
+- **Short-context decode** (1.3-1.8×): RPA's decode kernel spends a fixed cost per sequence. autokernel's
+  finds each sequence's pages as it runs (a cursor over runtime loop bounds), with no step tables.
+- **Long-context decode** (0.94-1.02×): both read the cache at 710-750 GB/s of the v5e's 819. autokernel loses
+  4-6% at a mean of 2k contexts: its write kernel takes a step per sequence, which RPA fuses into its
+  attention kernel.
+- **Prefill**: most of autokernel's lead is glue. RPA's `prepare_inputs` and `prepare_outputs` reshuffle q's
+  heads and the output's on the way in and out. That is ~270 µs of XLA copies at 4096 tokens, which vLLM pays
+  in serving too. The kernels alone are closer, and RPA's prefill kernel is faster on short prompts:
+
+| Kernel only, µs | 1 × 512 | 1 × 2048 | 1 × 4096 | 1 × 8192 | 4 × 1024 | 16 × 256 | 512 after 8k |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| RPA (attention + KV write) | **48.3** | **372.2** | **1264.8** | 4641.4 | **469.3** | **334.5** | 548.3 |
+| autokernel `rpa_prefill` + `rpa_write` | 69.8 | 432.6 | 1329.6 | **4547.7** | 618.5 | 418.6 | **516.1** |
+
+Its compute is the softmax over (8 heads, 1024 query rows, 512 keys) per step. Probes of the tile code
+(`probe_prefill_variants.py`) found the mask and the score scaling free. Masking only the diagonal steps
+(`lax.cond`) and going head by head were 1.5-2× slower.
+
+**What autokernel needed:**
+
+- *runtime loop bounds* (`for p in range((kv_lens[s] + ps - 1) // ps)`), stepped by a cursor as the kernel
+  runs;
+- *a runtime count of tiles* (`for k in range(n_tiles[0])`);
+- *ragged row windows* (`q[autokernel.rows(start, stop, 256), :, :]`): copies of as many rows as are valid;
+- *windows gathered through index-array slices* (several pages per step);
+- *a 16-bit tile's pairs of rows as 32-bit words* (`autokernel.pairs`, `autokernel.unpairs`): RPA's cache
+  holds each key and value in one word, split with shifts.
+
 ## Writing kernels
 
 ```python
@@ -226,7 +569,19 @@ def f(x, y, tiles=Tiles()):                   # the input arrays; optionally las
 - **Inputs are read as tiles.** Each index is `v : v + size` or `v` for a loop variable `v`, `:`, a constant
   slice (`8:16`) or a constant int. Integer indices come before sliced dims (`q[b, h, i : i + T, :]`).
   Tiles follow the TPU layout: the last dim a multiple of 128, the second-to-last a multiple of 8 (16 for
-  bf16, 32 for 8-bit), each unless it is the whole dim.
+  bf16, 32 for 8-bit), each unless it is the whole dim. A slice may also start at an expression of loop
+  variables, `e : e + size` (`k_cache[layer : layer + 1, j // S * G : j // S * G + G, ...]`).
+- **Ragged rows**: `x[autokernel.rows(start, stop, n), ...]` reads n rows from `start` (bounds that may read
+  index arrays) of which only those before `stop` are copied; a store there writes only those (an output
+  updated in place). Along one of an array's last two dims a read copies whole tiles (`start` a multiple
+  of 8 rows for 32 bits, 16 for 16, 128 lanes; the rows past `stop` are unspecified) and stores can't be
+  ragged. One `rows` per tile, right after the integer indices (NumPy's indexing would reorder it otherwise).
+- **Gathered windows**: an index array's slice as an index, `pages[page_table[b, p : p + n], :, :]`, gathers n
+  windows (n copies) into one tile.
+- **Pairs of rows as words**: `autokernel.pairs(x[...])` reads a 16-bit tile whose second-to-last dim is 2
+  (a page holding each head's key and value side by side) as the uint32 words a TPU packs them into, row 0
+  in the low halves: the kernel reads its VMEM slot as words, no shuffles. `pairs(...)[..., g, :]` is a
+  strided load of every `g`-th row; `out.at[...].set(autokernel.unpairs(words, dtype))` stores words back.
 - **Outputs stored per step**: a reduction loop's body (outside repeat loops) may store an output, a tile
   per step, placed by the parallel loops and the reduction loop's variable (`out = out.at[i : i + C, :].set(y)`
   in a scan over chunks `i`, with the state carried): each step's tile goes to HBM while the next steps run.
@@ -235,6 +590,12 @@ def f(x, y, tiles=Tiles()):                   # the input arrays; optionally las
   (`v : v + step`, or `v` for a loop of step 1), covering the dim exactly; other dims are stored whole
   (`:`). Masked-out tiles keep the allocation's value (`jnp.zeros`, `jnp.full(..., -jnp.inf)`), written by
   DMAs that overlap the compute.
+- **Outputs updated in place**: an output allocated as an input (`new_state = state`) is that input's
+  buffer (donate it under `jax.jit` and nothing is copied): what no tile stores keeps the input's values.
+  Only such an output may be stored at a window an index array chooses, `new_state.at[slots[b], h : h + T,
+  :, :].set(s)` (a paged cache or state pool), the parallel loop reading the index array placing it. Tiles
+  must not read windows other tiles store: which one a read sees isn't defined (nor which of two stores to
+  one window lands, as in JAX's scatter).
 - **Tile code** is assignments, augmented assignments and `with jax.named_scope(name):` blocks; use
   `jnp.where` instead of `if`. Values carried from one reduction step to the next (`acc`) are found
   automatically and kept in VMEM, so each keeps one type, the one the loop body gives it: start it with
@@ -272,6 +633,23 @@ def f(x, y, tiles=Tiles()):                   # the input arrays; optionally las
   kernel loops over only the steps that run: a KV-cache read stops at each sequence's length, a grouped
   matmul visits only the experts whose tokens meet a tile. The function itself branches on array values
   there, so it runs as plain JAX eagerly (not under `jax.jit`); the kernel runs anywhere.
+- **Runtime ranges**: a reduction loop's bounds may read index arrays (`for p in range(0, lengths[b], 128)`,
+  `range(n[0])`), as may the bounds of a kernel's one parallel loop (`for k in range(n_tiles[0])`: tiles
+  counted as the kernel runs; its outputs are inputs updated in place). Such a kernel finds its steps as
+  it runs, with a cursor in SMEM, no tables: a loop with no blocks takes one empty step, a loop with
+  runtime bounds can't be masked (put the condition in the bounds), and the cursor skips the blocks other
+  loops' masks skip as it moves. Repeat loops may hold runtime ranges. A kernel whose runtime masks allow
+  either finds its steps from tables or with the cursor, whichever tuning measures faster.
+- **Computed index arrays**: a value the tile code computes (int32, one or two dims) may place later loops'
+  windows and bound them, `w_gate[layer, chosen[c // F], :, c % F : c % F + be]` with `for c in range(0,
+  n[0] * F, be)`: routing inside a kernel. It is computed in code after a reduction loop (the kernel learns
+  it at the loop's last step, copies it into SMEM, then starts the inputs of the steps that read it) and
+  read by later loops in the same iteration of its repeat loop, if it is in one. Masks can't read it.
+- **Inputs gathered across chips**: `xs = autokernel.all_gather(x, "x")`, a prologue statement of its own,
+  is every chip's `x` along mesh axis `"x"`, stacked along the first dim (`jax.lax.all_gather(x, "x",
+  tiled=True)`); tiles read it as `xs[i : i + T, ...]`, `i` the outermost parallel loop walking all of its
+  rows by T, which divides one chip's rows. No mask may skip a tile. The kernel runs inside `jax.shard_map`
+  ([across chips](#across-chips-a-collective-matmul)).
 - **Constants** the tile code reads (module globals, closure values, prologue names) are read when a kernel
   is first built for an input shape, as `jax.jit` does, and written into the generated source: numbers,
   strings, dtypes, tuples, modules, and functions (imported, or their source copied).
@@ -328,6 +706,54 @@ over the model dimension accumulates `(x * gamma) @ w` on the MXU and each row's
 tile is scaled once at the end. The normalized activations never go to HBM; tuned, it is 1.08–1.16×
 faster than XLA's `rmsnorm(x) @ w` on large inputs, and even with it on 512 rows.
 
+### Across chips: a collective matmul
+
+In a tensor-parallel layer each chip holds some rows of the activations and some columns of the weights,
+and needs every chip's rows times its own columns. XLA gathers the rows first, then multiplies: the MXU
+waits while they cross the ICI. In autokernel the gather is a line of the prologue
+([examples/collective_matmul.py](examples/collective_matmul.py)):
+
+```python
+@autokernel.kernel
+def all_gather_matmul(x, w, tiles=CollectiveTiles()):   # x: this chip's rows; w: its columns
+    xs = autokernel.all_gather(x, "x")                  # every chip's rows, in the order of mesh axis "x"
+    M, K = xs.shape
+    ...
+    for i in range(0, M, tm):                           # the loops of a matmul, reading xs like any input
+        for j in range(0, N, tn):
+            ...
+                acc += xs[i : i + tm, k : k + tk] @ w[k : k + tk, j : j + tn]
+    ...
+
+run = jax.jit(jax.shard_map(all_gather_matmul, mesh=mesh, in_specs=(P("x", None), P(None, "x")),
+                            out_specs=P(None, "x"), check_vma=False))
+```
+
+Run as plain JAX inside `jax.shard_map`, the function means `jax.lax.all_gather(x) @ w`, and it is the
+kernel's reference, as always. The kernel overlaps the two. `xs` is an HBM buffer it fills itself:
+
+| Generated kernel | |
+| --- | --- |
+| at the start | meet both neighbours on the ring (a barrier: they write into this chip's `xs` from now on); copy this chip's rows in and send them to the next chip |
+| the tiles' order | the outermost loop walks the rows a chip's shard at a time, this chip's own first: ring step r reads chip (me - r)'s rows |
+| before a copy reads a shard | wait for it to arrive (one DMA semaphore per ring step), and forward it to the next chip at once |
+| at the end | every shard arrived and went on; wait for this chip's sends |
+
+So the rows a ring step needs arrive while the ring step before it computes; the step loop, its
+multi-buffered copies and its tunable are the matmul's own. On the mesh of a v5e slice, a ring runs along
+one axis (a 2 × 4 mesh's rows are rings of 4).
+
+**Status: simulated, not yet measured.** On CPU, the tests run it on 8, 4, 2 and 1 simulated chips (and a
+2 × 4 mesh), f32 and bf16, in the Pallas TPU interpreter with its race detector and uninitialized memory as
+NaN, and cross-lower it to Mosaic for a v5e-8. (The interpreter found the one race a first version had: one
+receive semaphore for every ring step let a chip a step ahead satisfy its neighbour's wait with the next
+shard's bytes.) `benchmarks/collective_matmul.py` times it on a v5e-8 against XLA's all-gather and matmul,
+and against the matmul alone with the rows already gathered (no communication): the floor. Kernels that
+gather aren't tuned yet: they run their default tunable, or the one you pass.
+
+`kernel.verify(x, w)` takes global arrays sharded the way the chips see them
+(`jax.device_put(x, NamedSharding(mesh, P("x", None)))`) and compares every chip's outputs.
+
 ## Tuning: test, trace, change the schedule
 
 A kernel's schedule is its tunable (the `@autokernel.tunable` default of its last parameter: block sizes,
@@ -340,12 +766,22 @@ inputs of that shape, from first principles:
 2. **Trace** it: run it under the JAX profiler. Its device time ranks it, and its trace regions say what
    limits it (below).
 3. **Change the schedule** the way the bottleneck says, keeping what's faster: exposed input copies → more
-   input buffers, then the neighbouring tiles that move fewer bytes; exposed output copies → more output
-   buffers; per-step overhead → the neighbouring tiles with fewer, bigger steps; compute-bound → every
-   neighbour, fewest steps first. A neighbour moves one field one step along its choices.
+   input buffers (and, for a kernel whose tiles take one step, copies in bursts: below), then the
+   neighbouring tiles that move fewer bytes; exposed output copies → more output buffers; per-step
+   overhead → the neighbouring tiles with fewer, bigger steps; compute-bound → every neighbour, fewest
+   steps first. A neighbour moves one field one step along its choices.
 
 It climbs from the defaults until nothing proposed is faster (at most 12 candidates), and remembers the
-result for inputs of that shape. Passing a tunable skips tuning; off a TPU the defaults are used. Tuning
+result for inputs of that shape. A kernel that updates inputs in place is timed in place (its inputs
+donated, each call's outputs the next one's inputs), as a decode loop runs it.
+
+**Copies in bursts.** A v5e's HBM loses time turning around between reads and writes: streaming a pool
+through VMEM and back in 1 MiB copies moved 640-650 GB/s however deep the pipeline (reads alone: 731 GB/s,
+writes alone: 639), and XLA's own elementwise pass 673. A kernel whose tiles take one step can move its
+copies in bursts instead (`Pipeline.bursts(g)`): the next g steps' inputs are fetched while this burst
+computes, and the burst's outputs go out once they are in, so the copies in flight all read or all write.
+In bursts of 8-16 MiB the same stream moved 677-683 GB/s. The tuner tries bursts when such a kernel is
+copy-bound. Passing a tunable skips tuning; off a TPU the defaults are used. Tuning
 also works when the first call is traced (`jax.jit(matmul)(x, y)`): it runs on a thread of its own.
 
 On a v5e (bf16; device time of the chosen schedule; `benchmarks/`):
@@ -413,6 +849,7 @@ or XProf.
 | `kernel.verify(*args, rtol=None, atol=None)` | run both and compare; the largest difference |
 | `autokernel.profile(kernel, *args)` | a `KernelProfile` from the device trace |
 | `autokernel.enable_profiling()` | have libtpu record trace regions (if autokernel was imported after JAX started) |
+| `autokernel.all_gather(x, axis)` | in a prologue: every chip's `x` along a mesh axis, gathered over a ring while the kernel computes |
 
 ## Development
 
@@ -441,6 +878,7 @@ src/autokernel/
   mxu.py        what `@` means, for kernels and references alike
   reference.py  the function as plain JAX
   api.py        @autokernel.kernel, Kernel, Lowered, verify
+  collective.py autokernel.all_gather: an input gathered across chips
   profiling.py  trace regions -> KernelProfile
   tilecode.py   names tile code reads and assigns; output stores
   v5e.py        the chip: memories and layout rules
@@ -449,7 +887,8 @@ examples/       matmul, causal matmul, causal attention (+ JAX splash), RMSNorm 
                 a whole attention block, a whole transformer; Qwen3 (GQA, QK-norm, RoPE, sliding window,
                 gated attention, SwiGLU), MLA, MoE, KV-cache decoding (paged too), linear attention
                 (Gated DeltaNet, KDA), whole Qwen3 / Qwen3-MoE / DeepSeek-V3 / Kimi-K2 / Qwen3-Next /
-                Kimi-Linear-like models, a decode step in one kernel; Gemma 4 E2B with its real weights
+                Kimi-Linear-like models, a decode step in one kernel; Gemma 4 E2B with its real weights;
+                a collective matmul across chips
 benchmarks/     timing and profiling scripts for a TPU v5e
 tests/
 ```

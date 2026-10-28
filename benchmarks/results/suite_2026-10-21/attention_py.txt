@@ -1,0 +1,38 @@
+# TPU v5e (Colab), 2026-10-21, commit 080fc71: python benchmarks/attention.py  [complete]
+B=4 H=16 S=2048 D=128, ms
+  block_q x block_kv     splash autokernel  speedup  max diff
+  256 x 256               2.204      1.378    1.60x    0.0000
+  256 x 512               1.267      0.839    1.51x    0.0000
+  256 x 1024              1.098      0.903    1.22x    0.0000
+  512 x 256               1.444      1.024    1.41x    0.0000
+  512 x 512               0.941      0.706    1.33x    0.0000
+  512 x 1024              0.928      0.819    1.13x    0.0000
+  1024 x 256              1.129      0.912    1.24x    0.0000
+  1024 x 512              0.940      0.812    1.16x    0.0000
+  1024 x 1024             0.871      0.805    1.08x    0.0000
+  splash at its best 0.871; autokernel tuned 0.707 (1.23x)
+    chose AttentionBlocks(block_q=512, block_kv=512), 3 input / 2 output buffers
+     * AttentionBlocks(block_q=512, block_kv=512), 3 input / 2 output buffers        699.3 us  compute
+       AttentionBlocks(block_q=1024, block_kv=512), 3 input / 2 output buffers       803.2 us  compute
+       AttentionBlocks(block_q=512, block_kv=1024), 3 input / 2 output buffers       808.2 us  compute
+       AttentionBlocks(block_q=256, block_kv=512), 3 input / 2 output buffers        837.5 us  compute
+       AttentionBlocks(block_q=512, block_kv=256), 3 input / 2 output buffers       1027.5 us  compute
+B=1 H=16 S=4096 D=128, ms
+  block_q x block_kv     splash autokernel  speedup  max diff
+  256 x 256               1.878      1.250    1.50x    0.0000
+  256 x 512               1.055      0.703    1.50x    0.0000
+  256 x 1024              0.881      0.712    1.24x    0.0000
+  512 x 256               1.200      0.891    1.35x    0.0000
+  512 x 512               0.781      0.606    1.29x    0.0000
+  512 x 1024              0.736      0.659    1.12x    0.0000
+  1024 x 256              0.892      0.737    1.21x    0.0000
+  1024 x 512              0.744      0.654    1.14x    0.0000
+  1024 x 1024             0.694      0.649    1.07x    0.0000
+  splash at its best 0.694; autokernel tuned 0.608 (1.14x)
+    chose AttentionBlocks(block_q=512, block_kv=512), 3 input / 2 output buffers
+     * AttentionBlocks(block_q=512, block_kv=512), 3 input / 2 output buffers        593.6 us  compute
+       AttentionBlocks(block_q=1024, block_kv=512), 3 input / 2 output buffers       641.1 us  compute
+       AttentionBlocks(block_q=512, block_kv=1024), 3 input / 2 output buffers       646.2 us  compute
+       AttentionBlocks(block_q=256, block_kv=512), 3 input / 2 output buffers        701.1 us  compute
+       AttentionBlocks(block_q=512, block_kv=256), 3 input / 2 output buffers        885.1 us  compute
+[exit 0]

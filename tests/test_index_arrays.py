@@ -216,7 +216,10 @@ def test_runtime_masks_with_static_and_unmasked_phases():
     ("code", "message"),
     [
         ("a = ids[0] + ids[0:8, :].sum()", "read element by element (an index array, kept in SMEM) and as tiles"),
-        ("a = ids[ids[0, 0], 0]", "elements are indexed by loop variables and constants"),
+        (
+            "b = jnp.zeros((2,), jnp.int32)\n                a = ids[b[0], 0]",
+            "elements are indexed by loop variables, constants and other elements",
+        ),
         ("a = ids[0]", "index every one of ids's 2 dims"),
         ("a = ids[i // 128 + 8, 0]", "reads element 9 of a dim of 9 at i=128"),
     ],
@@ -285,11 +288,12 @@ def test_tuning_runs_on_the_callers_inputs(monkeypatch):
     cache, lengths = rand((4, 512, 128)), i32(0, 1, 300, 512)
     kernel = make_kernel(DECODE)
     np.testing.assert_allclose(f64(kernel(cache, lengths)), _decode(cache, lengths), rtol=1e-5, atol=1e-4)
-    assert (seen[0][1] == np.asarray(lengths)).all()  # the lengths given, not random ones
+    assert len(seen) == 2  # the steps found from tables, and as it runs (a runtime mask allows either)
+    assert all((inputs[1] == np.asarray(lengths)).all() for inputs in seen)  # the lengths given, not random ones
     traced = make_kernel(DECODE)
     jax.jit(traced)(cache, lengths)  # traced: tuned on random inputs of these shapes
-    assert len(seen) == 2 and seen[1][1].shape == (4,)
-    assert seen[1][1].min() >= 0 and seen[1][1].max() <= 512  # lengths up to the cache's size, as the loop goes
+    assert len(seen) == 4 and seen[2][1].shape == (4,)
+    assert seen[2][1].min() >= 0 and seen[2][1].max() <= 512  # lengths up to the cache's size, as the loop goes
 
 
 def test_an_element_named_first_cant_place_a_window():
@@ -305,3 +309,17 @@ def test_an_element_named_first_cant_place_a_window():
     )
     with pytest.raises(KernelError, match=r"written in place .* `row` is computed by the tile code"):
         kernel.lower(rand((4, 128, 128)), i32(0, 1))
+
+
+def test_runtime_masks_find_their_steps_either_way():
+    kernel = make_kernel(DECODE)
+    cache, lengths = rand((4, 512, 128)), i32(0, 1, 300, 512)
+    sig = kernel.signature(cache, lengths)
+    plan, tables = kernel.build(sig, None)
+    _, cursor = kernel.build(sig, None, cursor=True)
+    assert plan.either and not tables.cursor and cursor.cursor
+    assert kernel.build(sig, None, cursor=True)[1] is cursor  # (built once)
+    for config in (Config(None, Pipeline()), Config(None, Pipeline(), cursor=True)):
+        out = kernel.lowered(sig, config).run(cache, lengths)
+        np.testing.assert_allclose(f64(out), _decode(cache, lengths), rtol=1e-5, atol=1e-4)
+    assert str(Config(None, Pipeline(), cursor=True)).endswith("steps found as it runs")

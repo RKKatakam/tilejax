@@ -1,0 +1,80 @@
+# TPU v5e (Colab), 2026-10-21, commit 080fc71: python benchmarks/profile.py  [complete]
+== matmul 8192^3
+matmul (MatmulTiles(tm=256, tn=256, tk=256), 3 input / 2 output buffers): 13553.3 us per call over 5 calls
+  steps               34816     (0.39 us each)
+  compute            9281.6 us
+  input waits        2586.4 us  (+0.0 us filling the pipeline)
+  output waits        134.8 us
+  other              1550.5 us  (decoding steps, starting copies, draining)
+  bottleneck: dma
+  trace: /tmp/autokernel-matmul-fdv38_tw
+chose MatmulTiles(tm=2048, tn=1024, tk=512), 3 input / 2 output buffers
+   MatmulTiles(tm=512, tn=512, tk=512), 3 input / 2 output buffers              6347.0 us  compute
+   MatmulTiles(tm=1024, tn=512, tk=512), 3 input / 2 output buffers             6006.1 us  compute
+   MatmulTiles(tm=2048, tn=512, tk=512), 3 input / 2 output buffers             5836.5 us  compute
+ * MatmulTiles(tm=2048, tn=1024, tk=512), 3 input / 2 output buffers            5764.6 us  compute
+   MatmulTiles(tm=2048, tn=2048, tk=512), 3 input / 2 output buffers            5722.4 us  compute
+   MatmulTiles(tm=2048, tn=1024, tk=1024), 3 input / 2 output buffers           5720.6 us  compute
+   MatmulTiles(tm=1024, tn=1024, tk=512), 3 input / 2 output buffers            5857.6 us  compute
+   MatmulTiles(tm=2048, tn=1024, tk=256), 3 input / 2 output buffers            5838.9 us  compute
+matmul (MatmulTiles(tm=2048, tn=1024, tk=512), 3 input / 2 output buffers): 5764.7 us per call over 5 calls
+  steps                 576     (10.01 us each)
+  compute            5726.0 us
+  input waits           6.7 us  (+0.0 us filling the pipeline)
+  output waits          2.1 us
+  other                29.7 us  (decoding steps, starting copies, draining)
+  bottleneck: compute
+  trace: /tmp/autokernel-matmul-vnzxox1x
+
+== causal matmul 8192^3
+causal_matmul (MatmulTiles(tm=512, tn=512, tk=512), 3 input / 2 output buffers): 3491.1 us per call over 5 calls
+  steps                2448     (1.43 us each)
+  compute            3255.4 us
+  input waits         101.5 us  (+0.0 us filling the pipeline)
+  output waits          9.1 us
+  other               125.1 us  (decoding steps, starting copies, draining)
+  bottleneck: compute
+  trace: /tmp/autokernel-causal_matmul-zjis4d3b
+chose MatmulTiles(tm=512, tn=512, tk=1024), 4 input / 2 output buffers
+   MatmulTiles(tm=512, tn=512, tk=512), 3 input / 2 output buffers              3505.0 us  compute
+   MatmulTiles(tm=512, tn=512, tk=512), 4 input / 2 output buffers              3373.1 us  compute
+ * MatmulTiles(tm=512, tn=512, tk=1024), 4 input / 2 output buffers             3261.4 us  compute
+   MatmulTiles(tm=512, tn=512, tk=2048), 4 input / 2 output buffers             3253.9 us  compute
+   MatmulTiles(tm=1024, tn=512, tk=1024), 4 input / 2 output buffers            3291.9 us  compute
+   MatmulTiles(tm=512, tn=1024, tk=1024), 4 input / 2 output buffers            3303.7 us  compute
+   MatmulTiles(tm=256, tn=512, tk=1024), 4 input / 2 output buffers             4763.5 us  dma
+   MatmulTiles(tm=512, tn=256, tk=1024), 4 input / 2 output buffers             4760.9 us  dma
+causal_matmul (MatmulTiles(tm=512, tn=512, tk=1024), 4 input / 2 output buffers): 3252.7 us per call over 5 calls
+  steps                1360     (2.39 us each)
+  compute            3134.0 us
+  input waits          65.1 us  (+0.0 us filling the pipeline)
+  output waits          4.6 us
+  other                49.0 us  (decoding steps, starting copies, draining)
+  bottleneck: compute
+  trace: /tmp/autokernel-causal_matmul-h8fbwm91
+
+== attention 4x16x2048x128
+causal_attention (AttentionBlocks(block_q=512, block_kv=512), 3 input / 2 output buffers): 699.4 us per call over 5 calls
+  steps                1152     (0.61 us each)
+  compute             640.3 us
+  input waits          17.3 us  (+0.9 us filling the pipeline)
+  output waits          2.2 us
+  other                38.7 us  (decoding steps, starting copies, draining)
+  bottleneck: compute
+  trace: /tmp/autokernel-causal_attention-9jnascl0
+chose AttentionBlocks(block_q=512, block_kv=512), 3 input / 2 output buffers
+ * AttentionBlocks(block_q=512, block_kv=512), 3 input / 2 output buffers        699.2 us  compute
+   AttentionBlocks(block_q=1024, block_kv=512), 3 input / 2 output buffers       803.2 us  compute
+   AttentionBlocks(block_q=512, block_kv=1024), 3 input / 2 output buffers       808.3 us  compute
+   AttentionBlocks(block_q=256, block_kv=512), 3 input / 2 output buffers        836.7 us  compute
+   AttentionBlocks(block_q=512, block_kv=256), 3 input / 2 output buffers       1027.5 us  compute
+causal_attention (AttentionBlocks(block_q=512, block_kv=512), 3 input / 2 output buffers): 699.4 us per call over 5 calls
+  steps                1152     (0.61 us each)
+  compute             640.2 us
+  input waits          17.4 us  (+0.9 us filling the pipeline)
+  output waits          2.2 us
+  other                38.6 us  (decoding steps, starting copies, draining)
+  bottleneck: compute
+  trace: /tmp/autokernel-causal_attention-3m2j9x1k
+
+[exit 0]

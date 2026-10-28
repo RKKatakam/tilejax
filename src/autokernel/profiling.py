@@ -230,17 +230,36 @@ def _require_tpu() -> None:
 
 def measure(lowered: Lowered, inputs: Sequence[Any], runs: int) -> KernelProfile:
     """Run a generated kernel `runs` times under the JAX profiler (after a warm-up call) and summarize the
-    device trace; the trace stays in the profile's `logdir`."""
+    device trace; the trace stays in the profile's `logdir`.
+
+    A call is jitted, as it runs in a model, and its device time is all of its ops': the kernel, and what its
+    entry function runs before it (the step tables of runtime masks, which a cursor makes inside the kernel
+    instead). A kernel that updates inputs in place is timed in place, as a decode loop runs it: those
+    inputs donated, each call's outputs the next call's inputs. (Undonated, XLA copies such an input before
+    every call and the kernel runs on the fresh copy, which on a v5e was up to 5% faster than in place for
+    some schedules and not others.)"""
     name = lowered.plan.nest.name
-    jax.block_until_ready(lowered.run(*inputs))
+    aliases = {out.aliases: k for k, out in enumerate(lowered.plan.outputs) if out.aliases is not None}
+    run = jax.jit(lowered.run, donate_argnums=tuple(aliases))
+    args = [jax.numpy.copy(x) if i in aliases else x for i, x in enumerate(inputs)]  # (the caller's stay)
+
+    def call() -> Any:
+        out = run(*args)
+        for i, k in aliases.items():
+            args[i] = out[k] if isinstance(out, tuple) else out
+        return out
+
+    jax.block_until_ready(call())
     logdir = tempfile.mkdtemp(prefix=f"autokernel-{name}-")
     jax.profiler.start_trace(logdir)
     try:
         for _ in range(runs):
-            jax.block_until_ready(lowered.run(*inputs))
+            jax.block_until_ready(call())
     finally:
         jax.profiler.stop_trace()
-    result = summarize(device_events(logdir), name, lowered.config, lowered.plan.scopes)
+    events = device_events(logdir)
+    result = summarize(events, name, lowered.config, lowered.plan.scopes)
+    result.device_s = max(result.device_s, sum(e.seconds for e in events if e.line == OPS_LINE) / runs)
     result.logdir = logdir
     return result
 

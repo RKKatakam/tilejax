@@ -15,7 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.experimental.pallas import tpu as pltpu
 
-from . import codegen, v5e
+from . import codegen, collective, v5e
 from .errors import KernelError
 from .parse import Nest, parse
 from .pipeline import Pipeline, default_pipeline, vmem_bytes
@@ -144,18 +144,61 @@ class Kernel:
 
     def verify(self, *args: Any, rtol: float | None = None, atol: float | None = None) -> float:
         """Run the kernel and its reference; raise AssertionError unless they agree (within tolerances for the
-        dtypes, or `rtol` and `atol`). Returns the largest absolute difference."""
+        dtypes, or `rtol` and `atol`). Returns the largest absolute difference.
+
+        A kernel gathering across chips takes its inputs as global arrays, sharded over the mesh the way its
+        chips see them (`jax.device_put(x, NamedSharding(mesh, spec))`): each chip's outputs are compared."""
         arrays, tunable = self._split(args)
-        if self.nest.tunable:
-            arrays = (*arrays, tunable if tunable is not None else self.lower(*arrays).config.tunable)
-        got, want = self(*arrays), self.reference(*arrays)
+        if self.nest.all_gathers:
+            got, want, dtypes = self._sharded_run(arrays, tunable)
+        else:
+            if self.nest.tunable:
+                arrays = (*arrays, tunable if tunable is not None else self.lower(*arrays).config.tunable)
+            got, want = self(*arrays), self.reference(*arrays)
+            dtypes = tuple(dtype for _, dtype in self.signature(*arrays[: len(self.nest.inputs)]))
         got, want = (got, want) if isinstance(got, tuple) else ((got,), (want,))
-        dtypes = tuple(dtype for _, dtype in self.signature(*arrays[: len(self.nest.params)]))
         errors = [
             compare(f"{self.nest.name} output {name!r}", g, w, rtol, atol, dtypes)
             for name, g, w in zip(self.nest.outputs, got, want, strict=True)
         ]
         return max(errors)
+
+    def _sharded_run(self, arrays: tuple[Any, ...], tunable: Any) -> tuple[Any, Any, tuple[np.dtype, ...]]:
+        """The kernel's and its reference's outputs on every chip (stacked, one row per chip), from global
+        arrays sharded over one mesh; and the inputs' dtypes."""
+        shardings = [getattr(x, "sharding", None) for x in arrays]
+        if (
+            not all(isinstance(s, jax.sharding.NamedSharding) for s in shardings)
+            or len(
+                {s.mesh for s in shardings}  # type: ignore[union-attr]
+            )
+            != 1
+        ):
+            raise KernelError(
+                f"{self.nest.name} gathers across chips: verify it on global arrays sharded over one mesh "
+                "(jax.device_put(x, NamedSharding(mesh, spec)))"
+            )
+        mesh = shardings[0].mesh  # type: ignore[union-attr]
+        extra = (tunable,) if tunable is not None else ()
+
+        def both(*xs: Any) -> Any:
+            if self.nest.tunable and not extra:  # (the schedule the kernel would run with)
+                xs = (*xs, self.lower(*xs).config.tunable)
+            else:
+                xs = (*xs, *extra)
+            per_chip = functools.partial(jax.tree.map, lambda v: v[None])  # a leading dim, a row per chip
+            return per_chip(self(*xs)), per_chip(self.reference(*xs))
+
+        stacked = jax.sharding.PartitionSpec(tuple(mesh.axis_names))
+        run = jax.shard_map(
+            both,
+            mesh=mesh,
+            in_specs=tuple(s.spec for s in shardings),  # type: ignore[union-attr]
+            out_specs=stacked,
+            check_vma=False,
+        )
+        got, want = jax.jit(run)(*arrays)
+        return got, want, tuple(np.dtype(x.dtype) for x in arrays)
 
     def tuning(self, *arrays: Any) -> Tuning:
         """The schedule for inputs like these: tuned on the TPU when first asked (see tune.py), the
@@ -168,12 +211,17 @@ class Kernel:
     # ------------------------------------------------------------------ building (used by tune.py too)
 
     def signature(self, *arrays: Any) -> Signature:
-        """What the kernel is built for: the inputs' shapes and dtypes."""
+        """What the kernel is built for: the inputs' shapes and dtypes (then each gathered array's: its
+        input's rows times the chips of the mesh axis it is gathered over, in the mesh it is called under)."""
         signature = []
-        for name, x in zip(self.nest.params, arrays, strict=True):
+        for name, x in zip(self.nest.inputs, arrays, strict=True):
             if not (hasattr(x, "shape") and hasattr(x, "dtype")) or not tuple(x.shape):
                 raise KernelError(f"{self.nest.name}: input `{name}` must be an array, got {type(x).__name__}")
             signature.append((tuple(x.shape), np.dtype(x.dtype)))
+        for gather in self.nest.all_gathers:
+            (rows, *rest), dtype = signature[self.nest.inputs.index(gather.source)]
+            chips = collective.axis_size(gather.axis, self.nest.name)
+            signature.append(((rows * chips, *rest), dtype))
         return tuple(signature)
 
     def default_config(self, signature: Signature) -> Config:
@@ -190,8 +238,9 @@ class Kernel:
                 raise
             return found
 
-    def build(self, signature: Signature, tunable: Any) -> tuple[Plan, Schedule]:
-        """The plan and schedule for this signature and tunable."""
+    def build(self, signature: Signature, tunable: Any, cursor: bool = False) -> tuple[Plan, Schedule]:
+        """The plan and schedule for this signature and tunable (its steps found with a cursor if `cursor`
+        and its masks allow either way)."""
         key = (signature, tunable)
         if signature not in self._references:  # read the constants once per signature, with the plan
             self._references[signature] = make_reference(self.nest, self.fn)
@@ -199,13 +248,18 @@ class Kernel:
             specs = [jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in signature]
             plan = make_plan(self.nest, self.fn, specs, tunable)
             self._builds[key] = (plan, make_schedule(plan))
-        return self._builds[key]
+        plan, schedule = self._builds[key]
+        if cursor and plan.either:
+            if (*key, True) not in self._builds:
+                self._builds[(*key, True)] = (plan, make_schedule(plan, cursor=True))
+            return self._builds[(*key, True)]
+        return plan, schedule
 
     def lowered(self, signature: Signature, config: Config, trace: bool = False) -> Lowered:
         """The kernel for this signature and schedule (with trace regions, for profiling)."""
         key = (signature, config, trace)
         if key not in self._lowered:
-            plan, schedule = self.build(signature, config.tunable)
+            plan, schedule = self.build(signature, config.tunable, config.cursor)
             source, entry_name = codegen.generate(plan, schedule, config.pipeline, trace=trace)
             entry = _load(source, f"<autokernel {self.nest.name} #{next(_generated)}>", entry_name)
             self._lowered[key] = Lowered(plan, schedule, config, source, trace, entry)
@@ -213,7 +267,7 @@ class Kernel:
 
     def _split(self, args: tuple[Any, ...]) -> tuple[tuple[Any, ...], Any]:
         """The input arrays, and the tunable if one was passed."""
-        n = len(self.nest.params)
+        n = len(self.nest.inputs)
         if self.nest.tunable and len(args) == n + 1:
             tunable = args[-1]
             if type(tunable) is not type(self.default_tunable):
@@ -225,7 +279,7 @@ class Kernel:
         if len(args) != n:
             more = f", then optionally `{self.nest.tunable}`" if self.nest.tunable else ""
             raise KernelError(
-                f"{self.nest.name} takes {n} input arrays ({', '.join(self.nest.params)}){more}; got {len(args)}"
+                f"{self.nest.name} takes {n} input arrays ({', '.join(self.nest.inputs)}){more}; got {len(args)}"
             )
         return args, None
 
@@ -258,6 +312,11 @@ def _load(source: str, filename: str, entry: str) -> Callable[..., Any]:
     return namespace[entry]
 
 
+# Elements `compare` checks at a time: float64 copies of a whole output of several GB (an MoE layer's rows at
+# 16384 tokens) and their temporaries ran a TPU VM's host out of memory.
+COMPARE_CHUNK = 1 << 22
+
+
 def compare(
     what: str,
     got: Any,
@@ -270,7 +329,6 @@ def compare(
     `rtol` and `atol` (default: exact for integers, 1e-4 for f32, 2e-2 of the largest value for 16-bit, also
     for an f32 result computed from 16-bit inputs, the dtypes `inputs`: Mosaic and XLA may round its 16-bit
     intermediates one ulp apart)."""
-    g, w = np.asarray(got, np.float64), np.asarray(want, np.float64)
     dtype = np.dtype(want.dtype)
     narrow = any(jnp.issubdtype(d, jnp.floating) and np.dtype(d).itemsize <= 2 for d in inputs)
     if not jnp.issubdtype(dtype, jnp.inexact):
@@ -280,18 +338,27 @@ def compare(
     else:
         default = 1e-4
     rtol = default if rtol is None else rtol
+    got_all, want_all = np.asarray(got).reshape(-1), np.asarray(want).reshape(-1)
+    chunks = range(0, want_all.size, COMPARE_CHUNK)
     if atol is None:
         # 16-bit results round at every step: their error grows with the output's magnitude.
-        finite = np.abs(w[np.isfinite(w)])
-        scale = float(finite.max()) if default >= 2e-2 and finite.size else 1.0
-        atol = default * max(scale, 1.0)
-    same = (g == w) | (np.isnan(g) & np.isnan(w))
-    with np.errstate(invalid="ignore"):
-        error = float(np.max(np.abs(np.where(same, 0.0, g - w)), initial=0.0))
-    close = np.isclose(g, w, rtol=rtol, atol=atol, equal_nan=True)
-    if not close.all():
+        scale = 1.0
+        if default >= 2e-2:
+            for start in chunks:
+                w = want_all[start : start + COMPARE_CHUNK].astype(np.float64)
+                scale = max(scale, float(np.max(np.abs(w), where=np.isfinite(w), initial=0.0)))
+        atol = default * scale
+    error, differ = 0.0, 0
+    for start in chunks:
+        g = got_all[start : start + COMPARE_CHUNK].astype(np.float64)
+        w = want_all[start : start + COMPARE_CHUNK].astype(np.float64)
+        same = (g == w) | (np.isnan(g) & np.isnan(w))
+        with np.errstate(invalid="ignore"):
+            error = max(error, float(np.max(np.abs(np.where(same, 0.0, g - w)), initial=0.0)))
+        differ += int(np.sum(~np.isclose(g, w, rtol=rtol, atol=atol, equal_nan=True)))
+    if differ:
         raise AssertionError(
-            f"{what}: the kernel and its reference differ in {int((~close).sum())} of {g.size} elements "
+            f"{what}: the kernel and its reference differ in {differ} of {want_all.size} elements "
             f"(largest difference {error:.3g}; rtol={rtol}, atol={atol:.3g})"
         )
     return error

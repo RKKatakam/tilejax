@@ -1,0 +1,208 @@
+# TPU v5e (Colab), 2026-10-21, commit 080fc71: python benchmarks/mla.py  [complete]
+
+MlaConfig(d_model=2048, heads=16, q_rank=768, kv_rank=512), batch 1, seq 4096: ms (TFLOP/s)
+  baselines, whole block:
+    plain JAX (XLA)                             8.298 ms
+    splash 192 default                          6.297 ms
+    splash 192 512 x 512                        1.817 ms
+    splash 192 512 x 1024                       1.838 ms
+    splash 192 1024 x 512                       1.865 ms
+    splash 192 1024 x 1024                      1.808 ms
+    splash 256 (padded) default                 6.316 ms
+    splash 256 (padded) 512 x 512               1.837 ms
+    splash 256 (padded) 512 x 1024              1.845 ms
+    splash 256 (padded) 1024 x 512              1.870 ms
+    splash 256 (padded) 1024 x 1024             1.816 ms
+  best baseline (splash 192 1024 x 1024)    1.808 (  99.2)
+  autokernel, tuned    1.317 ( 136.2)
+  speedup 1.37x; max |autokernel - baseline| 0.0312
+  projections: XLA 0.592, autokernel 0.392 (1.51x)
+    splash 192 default                          5.157 ms
+    splash 192 512 x 512                        1.167 ms
+    splash 192 512 x 1024                       1.201 ms
+    splash 192 1024 x 512                       1.228 ms
+    splash 192 1024 x 1024                      1.182 ms
+    splash 256 (padded) default                 6.226 ms
+    splash 256 (padded) 512 x 512               1.159 ms
+    splash 256 (padded) 512 x 1024              1.136 ms
+    splash 256 (padded) 1024 x 512              1.163 ms
+    splash 256 (padded) 1024 x 1024             1.093 ms
+  attention + W_o + residual: splash 256 (padded) 1024 x 1024 1.093, autokernel 0.934 (1.17x; 128.7 TFLOP/s)
+  chosen: down      DownTiles(rows=512, block_d=512), 3 input / 2 output buffers
+          up q      MatmulTiles(tm=2048, tn=512, tk=1024), 3 input / 2 output buffers
+          up kv     MatmulTiles(tm=1024, tn=1024, tk=512), 3 input / 3 output buffers
+          attention AttentionTiles(block_q=512, block_kv=256), 3 input / 2 output buffers
+
+MlaConfig(d_model=2048, heads=16, q_rank=1536, kv_rank=512), batch 2, seq 4096: ms (TFLOP/s)
+  baselines, whole block:
+    plain JAX (XLA): skipped, its (B, H, S, S) scores exceed 1024 MiB
+    splash 192 default                         15.425 ms
+    splash 192 512 x 512                        4.451 ms
+    splash 192 512 x 1024                       4.404 ms
+    splash 192 1024 x 512                       4.451 ms
+    splash 192 1024 x 1024                      4.299 ms
+    splash 256 (padded) default                15.543 ms
+    splash 256 (padded) 512 x 512               4.544 ms
+    splash 256 (padded) 512 x 1024              4.476 ms
+    splash 256 (padded) 1024 x 512              4.528 ms
+    splash 256 (padded) 1024 x 1024             4.365 ms
+  best baseline (splash 192 1024 x 1024)    4.299 (  98.4)
+  autokernel, tuned    2.904 ( 145.7)
+  speedup 1.48x; max |autokernel - baseline| 0.0312
+  projections: XLA 1.587, autokernel 1.100 (1.44x)
+    splash 192 default                         13.295 ms
+    splash 192 512 x 512                        2.610 ms
+    splash 192 512 x 1024                       2.594 ms
+    splash 192 1024 x 512                       2.638 ms
+    splash 192 1024 x 1024                      2.501 ms
+    splash 256 (padded) default                14.037 ms
+    splash 256 (padded) 512 x 512               2.378 ms
+    splash 256 (padded) 512 x 1024              2.302 ms
+    splash 256 (padded) 1024 x 512              2.350 ms
+    splash 256 (padded) 1024 x 1024             2.187 ms
+  attention + W_o + residual: splash 256 (padded) 1024 x 1024 2.187, autokernel 1.838 (1.19x; 130.9 TFLOP/s)
+  chosen: down      DownTiles(rows=512, block_d=512), 3 input / 2 output buffers
+          up q      MatmulTiles(tm=2048, tn=512, tk=512), 3 input / 2 output buffers
+          up kv     MatmulTiles(tm=1024, tn=1024, tk=512), 3 input / 3 output buffers
+          attention AttentionTiles(block_q=512, block_kv=512), 4 input / 2 output buffers
+
+MlaConfig(d_model=2048, heads=16, q_rank=1536, kv_rank=512), batch 4, seq 2048: ms (TFLOP/s)
+  baselines, whole block:
+    plain JAX (XLA)                            13.044 ms
+    splash 192 default                          9.115 ms
+    splash 192 512 x 512                        3.582 ms
+    splash 192 512 x 1024                       3.650 ms
+    splash 192 1024 x 512                       3.653 ms
+    splash 192 1024 x 1024                      3.567 ms
+    splash 256 (padded) default                10.006 ms
+    splash 256 (padded) 512 x 512               3.851 ms
+    splash 256 (padded) 512 x 1024              3.882 ms
+    splash 256 (padded) 1024 x 512              3.920 ms
+    splash 256 (padded) 1024 x 1024             3.821 ms
+  best baseline (splash 192 1024 x 1024)    3.567 (  94.5)
+  autokernel, tuned    2.350 ( 143.5)
+  speedup 1.52x; max |autokernel - baseline| 0.0312
+  projections: XLA 1.594, autokernel 1.090 (1.46x)
+    splash 192 default                          7.146 ms
+    splash 192 512 x 512                        1.781 ms
+    splash 192 512 x 1024                       1.852 ms
+    splash 192 1024 x 512                       1.879 ms
+    splash 192 1024 x 1024                      1.808 ms
+    splash 256 (padded) default                 7.405 ms
+    splash 256 (padded) 512 x 512               1.528 ms
+    splash 256 (padded) 512 x 1024              1.555 ms
+    splash 256 (padded) 1024 x 512              1.582 ms
+    splash 256 (padded) 1024 x 1024             1.497 ms
+  attention + W_o + residual: splash 256 (padded) 1024 x 1024 1.497, autokernel 1.285 (1.16x; 120.3 TFLOP/s)
+  chosen: down      DownTiles(rows=512, block_d=512), 3 input / 2 output buffers
+          up q      MatmulTiles(tm=2048, tn=512, tk=512), 3 input / 2 output buffers
+          up kv     MatmulTiles(tm=1024, tn=1024, tk=512), 3 input / 3 output buffers
+          attention AttentionTiles(block_q=512, block_kv=256), 4 input / 2 output buffers
+
+MlaConfig(d_model=2048, heads=32, q_rank=1536, kv_rank=512), batch 1, seq 4096: ms (TFLOP/s)
+  baselines, whole block:
+    plain JAX (XLA): skipped, its (B, H, S, S) scores exceed 1024 MiB
+    splash 192 default                         14.502 ms
+    splash 192 512 x 512                        4.164 ms
+    splash 192 512 x 1024                       4.148 ms
+    splash 192 1024 x 512                       4.197 ms
+    splash 192 1024 x 1024                      4.063 ms
+    splash 256 (padded) default                14.622 ms
+    splash 256 (padded) 512 x 512               4.254 ms
+    splash 256 (padded) 512 x 1024              4.225 ms
+    splash 256 (padded) 1024 x 512              4.277 ms
+    splash 256 (padded) 1024 x 1024             4.139 ms
+  best baseline (splash 192 1024 x 1024)    4.063 (  95.4)
+  autokernel, tuned    2.705 ( 143.3)
+  speedup 1.50x; max |autokernel - baseline| 0.0312
+  projections: XLA 1.251, autokernel 0.926 (1.35x)
+    splash 192 default                         12.907 ms
+    splash 192 512 x 512                        2.560 ms
+    splash 192 512 x 1024                       2.550 ms
+    splash 192 1024 x 512                       2.602 ms
+    splash 192 1024 x 1024                      2.470 ms
+    splash 256 (padded) default                12.434 ms
+    splash 256 (padded) 512 x 512               2.292 ms
+    splash 256 (padded) 512 x 1024              2.252 ms
+    splash 256 (padded) 1024 x 512              2.301 ms
+    splash 256 (padded) 1024 x 1024             2.162 ms
+  attention + W_o + residual: splash 256 (padded) 1024 x 1024 2.162, autokernel 1.807 (1.20x; 133.1 TFLOP/s)
+  chosen: down      DownTiles(rows=512, block_d=512), 3 input / 2 output buffers
+          up q      MatmulTiles(tm=2048, tn=512, tk=512), 3 input / 2 output buffers
+          up kv     MatmulTiles(tm=1024, tn=1024, tk=512), bursts of 16 steps
+          attention AttentionTiles(block_q=512, block_kv=256), 3 input / 2 output buffers
+
+MlaConfig(d_model=4096, heads=32, q_rank=1536, kv_rank=512), batch 2, seq 2048: ms (TFLOP/s)
+  baselines, whole block:
+    plain JAX (XLA)                            13.658 ms
+    splash 192 default                         10.325 ms
+    splash 192 512 x 512                        4.034 ms
+    splash 192 512 x 1024                       4.072 ms
+    splash 192 1024 x 512                       4.094 ms
+    splash 192 1024 x 1024                      3.992 ms
+    splash 256 (padded) default                10.595 ms
+    splash 256 (padded) 512 x 512               4.275 ms
+    splash 256 (padded) 512 x 1024              4.310 ms
+    splash 256 (padded) 1024 x 512              4.332 ms
+    splash 256 (padded) 1024 x 1024             4.233 ms
+  best baseline (splash 192 1024 x 1024)    3.992 ( 101.7)
+  autokernel, tuned    2.707 ( 149.9)
+  speedup 1.47x; max |autokernel - baseline| 0.0312
+  projections: XLA 1.485, autokernel 1.111 (1.34x)
+    splash 192 default                          8.311 ms
+    splash 192 512 x 512                        2.181 ms
+    splash 192 512 x 1024                       2.220 ms
+    splash 192 1024 x 512                       2.254 ms
+    splash 192 1024 x 1024                      2.166 ms
+    splash 256 (padded) default                 7.758 ms
+    splash 256 (padded) 512 x 512               1.880 ms
+    splash 256 (padded) 512 x 1024              1.909 ms
+    splash 256 (padded) 1024 x 512              1.935 ms
+    splash 256 (padded) 1024 x 1024             1.852 ms
+  attention + W_o + residual: splash 256 (padded) 1024 x 1024 1.852, autokernel 1.634 (1.13x; 136.7 TFLOP/s)
+  chosen: down      DownTiles(rows=1024, block_d=512), 3 input / 2 output buffers
+          up q      MatmulTiles(tm=2048, tn=512, tk=512), 3 input / 2 output buffers
+          up kv     MatmulTiles(tm=1024, tn=1024, tk=512), bursts of 16 steps
+          attention AttentionTiles(block_q=512, block_kv=256), 4 input / 2 output buffers
+
+MlaConfig(d_model=4096, heads=64, q_rank=1536, kv_rank=512), batch 1, seq 2048: ms (TFLOP/s)
+  baselines, whole block:
+    plain JAX (XLA)                             9.806 ms
+    splash 192 default                          9.769 ms
+    splash 192 512 x 512                        4.287 ms
+    splash 192 512 x 1024                       4.336 ms
+    splash 192 1024 x 512                       4.358 ms
+    splash 192 1024 x 1024                      4.274 ms
+    splash 256 (padded) default                 9.997 ms
+    splash 256 (padded) 512 x 512               4.494 ms
+    splash 256 (padded) 512 x 1024              4.541 ms
+    splash 256 (padded) 1024 x 512              4.562 ms
+    splash 256 (padded) 1024 x 1024             4.478 ms
+  best baseline (splash 192 1024 x 1024)    4.274 (  86.7)
+  autokernel, tuned    2.658 ( 139.4)
+  speedup 1.61x; max |autokernel - baseline| 0.0312
+  projections: XLA 1.314, autokernel 0.880 (1.49x)
+    splash 192 default                          7.718 ms
+    splash 192 512 x 512                        2.267 ms
+    splash 192 512 x 1024                       2.293 ms
+    splash 192 1024 x 512                       2.316 ms
+    splash 192 1024 x 1024                      2.230 ms
+    splash 256 (padded) default                 6.976 ms
+    splash 256 (padded) 512 x 512               1.840 ms
+    splash 256 (padded) 512 x 1024              1.893 ms
+    splash 256 (padded) 1024 x 512              1.915 ms
+    splash 256 (padded) 1024 x 1024             1.841 ms
+  attention + W_o + residual: splash 256 (padded) 512 x 512 1.840, autokernel 1.824 (1.01x; 122.4 TFLOP/s)
+  chosen: down      DownTiles(rows=512, block_d=512), 3 input / 2 output buffers
+          up q      MatmulTiles(tm=2048, tn=512, tk=512), 3 input / 2 output buffers
+          up kv     MatmulTiles(tm=2048, tn=512, tk=512), 3 input / 2 output buffers
+          attention AttentionTiles(block_q=256, block_kv=256), 3 input / 2 output buffers
+
+B  S     D     H   Rq    best baseline (ms)                     autokernel  speedup  max diff  projections (XLA)  attention (splash)
+1  4096  2048  16  768      1.808 splash 192 1024 x 1024             1.317    1.37x    0.0312    0.392 (  0.592)    0.934 (  1.093)
+2  4096  2048  16  1536     4.299 splash 192 1024 x 1024             2.904    1.48x    0.0312    1.100 (  1.587)    1.838 (  2.187)
+4  2048  2048  16  1536     3.567 splash 192 1024 x 1024             2.350    1.52x    0.0312    1.090 (  1.594)    1.285 (  1.497)
+1  4096  2048  32  1536     4.063 splash 192 1024 x 1024             2.705    1.50x    0.0312    0.926 (  1.251)    1.807 (  2.162)
+2  2048  4096  32  1536     3.992 splash 192 1024 x 1024             2.707    1.47x    0.0312    1.111 (  1.485)    1.634 (  1.852)
+1  2048  4096  64  1536     4.274 splash 192 1024 x 1024             2.658    1.61x    0.0312    0.880 (  1.314)    1.824 (  1.840)
+[exit 0]

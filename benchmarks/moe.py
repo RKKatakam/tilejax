@@ -30,6 +30,8 @@ GB/s of the weights a token batch has to read (the experts it chose, and the sha
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -70,15 +72,28 @@ from moe import (
 )
 from timing import require_tpu, time_ms
 
+import autokernel
+
 RUNS = [  # config, token counts (decode: 8-64 tokens; prefill: 4096-16384)
     ("qwen3-30b-a3b", (8, 64, 4096, 16384)),
     ("deepseek-v2-lite", (8, 64, 4096, 16384)),
     ("deepseek-v3-small", (8, 64, 4096)),
     ("kimi-k2-small", (8, 64, 4096)),
 ]
+LARGE = [  # one layer of real models at full width (`--large`)
+    ("qwen3-235b-a22b", (8, 64, 4096, 16384)),
+    ("qwen3-next-80b-a3b", (8, 64, 4096, 16384)),
+    ("mixtral-8x7b", (8, 64, 4096, 16384)),
+    ("deepseek-v3-64e", (8, 64, 4096, 16384)),
+]
 SMALL = MoeConfig(256, 8, 2, 256, shared=1, scoring="sigmoid", n_group=4, topk_group=2, scale=2.5)
 DENSE_TOKENS = 64  # every expert on every token only for decode batches
-MEGABLOX_TILINGS = [(tm, cap) for tm in (128, 256, 512) for cap in (512, 2048)]  # rows, k and n blocks up to cap
+MEGABLOX_TILINGS = [(tm, cap) for tm in (128, 256, 512, 1024) for cap in (512, 2048)]  # rows, k and n blocks up to cap
+# XLA's scoped VMEM limit, which the baselines' kernels (megablox's `gmm` takes no limit of its own) and
+# fusions compile under; autokernel's kernels set theirs (0.9 x VMEM). `--scoped-vmem-mib` raises it so
+# megablox's bigger tilings fit: the fair comparison is each baseline at its best of both runs.
+SCOPED_VMEM_FLAG = "--xla_tpu_scoped_vmem_limit_kib"
+METHODS = ("autokernel", "autokernel_ragged", "ragged_dot", "megablox")
 PARTS = ("router", "dispatch", "gather", "experts", "regather", "finish")
 
 
@@ -230,10 +245,11 @@ def breakdown(x: jax.Array, params: dict[str, Any], config: MoeConfig, group: in
     return parts
 
 
-def run(config: MoeConfig, name: str, tokens: int) -> dict[str, Any]:
-    """Time one layer at one token count; print it, and return the summary row."""
+def run(config: MoeConfig, name: str, tokens: int, profile: bool = False) -> dict[str, Any]:
+    """Time one layer at one token count; print it, and return the summary row. autokernel's ways run first,
+    then the baselines', whose weights (gate and up side by side) replace the separate ones: a full-width
+    layer's weights twice over and its rows at 16384 tokens don't fit a v5e's 16 GB."""
     params = init_params(config)
-    bparams = baseline_params(params)
     x = jax.random.normal(jax.random.key(1), (tokens, config.d_model), jnp.bfloat16)
     d, e, f, k = config.d_model, config.experts, config.ffn, config.top_k
     prefill = tokens > DENSE_TOKENS
@@ -243,17 +259,20 @@ def run(config: MoeConfig, name: str, tokens: int) -> dict[str, Any]:
     chosen = len(np.unique(np.asarray(ids)))
     rows = ragged_rows(tokens * k)
     disp = dispatch(ids, e, 1, rows)
-    xs = gather(normed, disp.src)
 
     expert_flops = 6 * tokens * k * d * f
     layer_flops = expert_flops + 6 * tokens * d * config.shared_ffn + 2 * tokens * d * e
-    expert_bytes = 3 * chosen * d * f * 2
-    layer_bytes = expert_bytes + 3 * d * config.shared_ffn * 2
+    # The fewest bytes from and to HBM: each chosen expert's weights once, the rows in and out (and for the
+    # layer the shared experts' weights and the tokens in and out).
+    expert_bytes = 3 * chosen * d * f * 2 + 2 * tokens * k * d * 2
+    layer_bytes = expert_bytes + 3 * d * config.shared_ffn * 2 + 2 * tokens * d * 2
 
     def rate(ms: float, layer: bool) -> str:
-        if prefill:
-            return f"{(layer_flops if layer else expert_flops) / ms / 1e9:6.1f} TFLOP/s"
-        return f"{(layer_bytes if layer else expert_bytes) / ms / 1e6:6.0f} GB/s"
+        flops, moved = (layer_flops, layer_bytes) if layer else (expert_flops, expert_bytes)
+        return f"{flops / ms / 1e9:6.1f} TFLOP/s, {moved / ms / 1e6:5.0f} GB/s"
+
+    def show(label: str, ms: float, layer: bool) -> None:
+        print(f"  {'layer:' if layer else 'experts alone:':<15}{label:<34} {ms:8.3f}  ({rate(ms, layer)})")
 
     print(f"{name}: {config}, {tokens} tokens ({chosen} of {e} experts chosen, {tokens * k / e:.0f} rows each): ms")
 
@@ -264,18 +283,45 @@ def run(config: MoeConfig, name: str, tokens: int) -> dict[str, Any]:
     moe_layer_ragged(x, params, config)
     parts = breakdown(x, params, config, group)
 
-    def show(label: str, ms: float, layer: bool) -> None:
-        print(f"  {'layer:' if layer else 'experts alone:':<15}{label:<34} {ms:8.3f}  ({rate(ms, layer)})")
-
-    # The routed experts alone (for decode, autokernel's is the whole layer's kernel, shared experts included).
+    # autokernel: the routed experts alone (for decode, the whole layer's kernel, shared experts included),
+    # then the layer.
     if decode:
         kernel, inputs = decode_call(x, params, config)
     else:
         kernel, inputs, _ = experts_call(normed, ids, params, config, group)
     ours_experts = time_ms(jax.jit(kernel), *inputs, runs=10)
+    if profile:
+        print(autokernel.profile(kernel, *inputs))
+    print(f"  {kernel.nest.name}:", kernel.lower(*inputs).config)
+    del inputs
+    xs = gather(normed, disp.src)
     ragged = jax.jit(lambda xs, wg, wu, wd, s, n: gmm_down(gmm_swiglu(xs, wg, wu, s, n), wd, s, n))
     ragged_args = (xs, params["w_gate"], params["w_up"], params["w_down"], disp.starts, disp.ends)
     ours_ragged_experts = time_ms(ragged, *ragged_args, runs=10)
+    if profile:
+        print(autokernel.profile(gmm_swiglu, *ragged_args[:3], disp.starts, disp.ends))
+    print("  gmm_swiglu:", gmm_swiglu.lower(*ragged_args[:3], disp.starts, disp.ends).config)
+    h = jax.ShapeDtypeStruct((rows, f), jnp.bfloat16)
+    print("  gmm_down:  ", gmm_down.lower(h, params["w_down"], disp.starts, disp.ends).config)
+    del ragged_args
+    ours_fn = jax.jit(moe_layer, static_argnums=(2, 3))
+    ours = time_ms(ours_fn, x, params, config, group, runs=10)
+    ours_ragged_fn = jax.jit(moe_layer_ragged, static_argnums=2)
+    ours_ragged = time_ms(ours_ragged_fn, x, params, config, runs=10)
+    same = np.ones(tokens, bool) if decode else same_routing(x, params, config)
+    ours_out, ragged_out = ours_fn(x, params, config, group), ours_ragged_fn(x, params, config)
+    if not decode:
+        rows_back, w = jax.ShapeDtypeStruct((k, tokens, d), x.dtype), jax.ShapeDtypeStruct((k, tokens, 1), jnp.float32)
+        if config.shared:
+            s = params["shared"]
+            end = shared_combine.lower(x, params["norm"], s["w_gate"], s["w_up"], s["w_down"], rows_back, w)
+        else:
+            end = combine_rows.lower(x, rows_back, w)
+        print(f"  {end.plan.nest.name}:", end.config)
+
+    # The baselines, on their weights (the separate gate and up weights freed).
+    bparams = {name: value for name, value in baseline_params(params).items() if name not in ("w_gate", "w_up")}
+    del params
     experts = jax.jit(baseline_experts, static_argnums=(3, 4, 5))
     ragged_dot_experts = time_ms(experts, xs, bparams, disp.counts, config, "ragged_dot", None, runs=10)
     tilings = megablox_tilings(config, rows)
@@ -283,24 +329,18 @@ def run(config: MoeConfig, name: str, tokens: int) -> dict[str, Any]:
         (_time_or_inf(experts, xs, bparams, disp.counts, config, "megablox", tiling, runs=10), label)
         for label, tiling in tilings
     )
-    show(f"autokernel {kernel.nest.name}" + ("" if decode else f" ({group})"), ours_experts, False)
-    show("autokernel ragged", ours_ragged_experts, False)
-    show("ragged_dot", ragged_dot_experts, False)
-    show(f"megablox ({megablox_name})", megablox_experts, False)
-
-    # The whole layer.
-    ours_fn = jax.jit(moe_layer, static_argnums=(2, 3))
-    ours = time_ms(ours_fn, x, params, config, group, runs=10)
-    ours_ragged_fn = jax.jit(moe_layer_ragged, static_argnums=2)
-    ours_ragged = time_ms(ours_ragged_fn, x, params, config, runs=10)
+    del xs
     ragged_dot_fn = baseline(config)
     ragged_dot = time_ms(ragged_dot_fn, x, bparams, runs=10)
     megablox = min(_time_or_inf(baseline(config, "megablox", t), x, bparams, runs=10) for _, t in tilings)
     dense = time_ms(baseline(config, "dense"), x, bparams, runs=10) if not prefill else float("nan")
     want = ragged_dot_fn(x, bparams)
-    same = np.ones(tokens, bool) if decode else same_routing(x, params, config)
-    ours_out, ragged_out = ours_fn(x, params, config, group), ours_ragged_fn(x, params, config)
     diffs = (max_diff(ours_out, want, same), max_diff(ragged_out, want, same))
+
+    show(f"autokernel {kernel.nest.name}" + ("" if decode else f" ({group})"), ours_experts, False)
+    show("autokernel ragged", ours_ragged_experts, False)
+    show("ragged_dot", ragged_dot_experts, False)
+    show(f"megablox ({megablox_name})", megablox_experts, False)
     show(f"autokernel ({kernel.nest.name})", ours, True)
     show("autokernel ragged", ours_ragged, True)
     show("ragged_dot", ragged_dot, True)
@@ -314,18 +354,21 @@ def run(config: MoeConfig, name: str, tokens: int) -> dict[str, Any]:
         f"autokernel {diffs[0]:.4f}, ragged {diffs[1]:.4f} (outputs up to {float(jnp.max(jnp.abs(want))):.2f}; "
         f"over the {same.sum()} of {tokens} tokens routed as XLA's router does)"
     )
-    h = jax.ShapeDtypeStruct((rows, f), jnp.bfloat16)
-    print(f"  {kernel.nest.name}:", kernel.lower(*inputs).config)
-    print("  gmm_swiglu:", gmm_swiglu.lower(*ragged_args[:3], disp.starts, disp.ends).config)
-    print("  gmm_down:  ", gmm_down.lower(h, params["w_down"], disp.starts, disp.ends).config)
-    if not decode:
-        rows_back, w = jax.ShapeDtypeStruct((k, tokens, d), x.dtype), jax.ShapeDtypeStruct((k, tokens, 1), jnp.float32)
-        if config.shared:
-            s = params["shared"]
-            end = shared_combine.lower(x, params["norm"], s["w_gate"], s["w_up"], s["w_down"], rows_back, w)
-        else:
-            end = combine_rows.lower(x, rows_back, w)
-        print(f"  {end.plan.nest.name}:", end.config)
+    row = {
+        "name": name,
+        "config": str(config),
+        "tokens": tokens,
+        "group": group,
+        "experts_ms": dict(
+            zip(METHODS, (ours_experts, ours_ragged_experts, ragged_dot_experts, megablox_experts), strict=True)
+        ),
+        "layer_ms": dict(zip((*METHODS, "dense"), (ours, ours_ragged, ragged_dot, megablox, dense), strict=True)),
+        "expert_bytes": expert_bytes,
+        "expert_flops": expert_flops,
+        "parts_ms": parts,
+        "scoped_vmem": SCOPED_VMEM_FLAG in os.environ.get("LIBTPU_INIT_ARGS", ""),
+    }
+    print(json.dumps({"moe": row}), flush=True)
     return {
         "name": name,
         "tokens": tokens,
@@ -342,18 +385,25 @@ def main() -> None:
     parser.add_argument("--config", action="append", choices=sorted(CONFIGS), help="a layer (repeatable)")
     parser.add_argument("--tokens", action="append", type=int, help="a token count (repeatable)")
     parser.add_argument("--small", action="store_true", help="a tiny layer, runs anywhere")
+    parser.add_argument("--large", action="store_true", help="layers of real models at full width")
+    parser.add_argument("--profile", action="store_true", help="print the experts' kernels' profiles")
+    parser.add_argument("--scoped-vmem-mib", type=int, help="XLA's scoped VMEM limit for the baselines (MiB)")
     args = parser.parse_args()
     if args.small:
         runs = [("small", SMALL, tuple(args.tokens or (8, 512)))]
     else:
+        if args.scoped_vmem_mib:  # (before anything starts JAX's TPU backend: libtpu reads its flags once)
+            flag = f"{SCOPED_VMEM_FLAG}={args.scoped_vmem_mib * 1024}"
+            os.environ["LIBTPU_INIT_ARGS"] = f"{os.environ.get('LIBTPU_INIT_ARGS', '')} {flag}".strip()
         require_tpu()
-        names = args.config or [name for name, _ in RUNS]
-        default = dict(RUNS)
+        table = LARGE if args.large else RUNS
+        names = args.config or [name for name, _ in table]
+        default = dict(RUNS + LARGE)
         runs = [(name, CONFIGS[name], tuple(args.tokens or default[name])) for name in names]
     summary = []
     for name, config, token_counts in runs:
         for tokens in token_counts:
-            summary.append(run(config, name, tokens))
+            summary.append(run(config, name, tokens, args.profile))
             print()
     print(
         "layer              tokens group | experts: ours    ragged  ragged_dot megablox | "

@@ -109,7 +109,7 @@ def test_full_with_keyword_fill():
 @pytest.mark.parametrize(
     ("prologue", "message"),
     [
-        ("out = x", "allocate output `out` with jnp.zeros"),
+        ("out = x.T", "allocate output `out` with jnp.zeros"),
         ("out = jnp.ones((256, 256))", "allocate output `out` with jnp.zeros"),
         ("out = jnp.zeros((256, 256), 'nope')", "allocate output `out` with jnp.zeros"),
         ("out = jnp.full((256, 256), jnp.ones(()))", "filled with a scalar constant"),

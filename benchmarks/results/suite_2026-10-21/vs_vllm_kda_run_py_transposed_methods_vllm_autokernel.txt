@@ -1,0 +1,137 @@
+# TPU v5e (Colab), 2026-10-21, commit 080fc71: python benchmarks/vs_vllm_kda/run.py --transposed --methods vllm,autokernel  [complete]
+jax 0.11.2 on TPU v5 lite; methods ['vllm', 'autokernel']; options {'state_transposed': True}
+batch 1: 4.5 MB per step, pool of 3 slots
+  vllm       out_vs_f64 2.53e-05  conv_vs_f64 0  state_vs_f64 3.67e-08  state_vs_f64_median_head 1.28e-08
+    ops: kda_decode_fused_conv_recurrent.1 10.9 us, %reduce = bf16[12288]{0:T(1024)(128)(2,1)S(1)} reduce(bf16[1,12288]{1,0:T(2,128)(2,1)} %mixed_qkv.1, bf16[]{:T(256)} %constant), dimensions={0}, to_apply=%mixed_qkv.1.reduce_sub_computation 0.6 us, %copy.2.beta_ref = bf16[1,32,1]{2,1,0:T(8,128)(2,1)S(1)} copy(bf16[1,32,1]{1,2,0:T(2,128)(2,1)} %bitcast.5) 0.5 us, %copy.3.a_log_ref = f32[32,1]{1,0:T(8,128)S(1)} copy(f32[32,1]{0,1:T(1,128)} %bitcast.4) 0.4 us
+  vllm       wall      66.2 us  device      12.4 us   362.7 GB/s (44% of 819)
+  chose KdaTiles(heads=16), 3 input / 2 output buffers
+   * KdaTiles(heads=16), 3 input / 2 output buffers                                  8.4 us  dma
+     KdaTiles(heads=16), 4 input / 2 output buffers                                  8.6 us  dma
+     KdaTiles(heads=16), bursts of 16 steps                                         11.1 us  overhead
+     KdaTiles(heads=16), bursts of 8 steps                                           9.3 us  overhead
+     KdaTiles(heads=16), bursts of 4 steps                                           8.7 us  overhead
+     KdaTiles(heads=32), 3 input / 2 output buffers                                  9.3 us  overhead
+  autokernel out_vs_f64 2.53e-05  conv_vs_f64 0  state_vs_f64 3.67e-08  state_vs_f64_median_head 1.28e-08  out_vs_vllm 0  conv_vs_vllm 0  state_vs_vllm 0  identical 1
+    ops: kda_decode_step.1 7.5 us, %reduce = bf16[12288]{0:T(1024)(128)(2,1)S(1)} reduce(bf16[1,12288]{1,0:T(2,128)(2,1)} %mixed_qkv.1, bf16[]{:T(256)} %constant), dimensions={0}, to_apply=%mixed_qkv.1.reduce_sub_computation 0.6 us, %copy.2.beta_hbm = bf16[1,32,1]{2,1,0:T(8,128)(2,1)S(1)} copy(bf16[1,32,1]{1,2,0:T(2,128)(2,1)} %bitcast.5) 0.5 us, %copy.3.a_log_hbm = f32[32,1]{1,0:T(8,128)S(1)} copy(f32[32,1]{0,1:T(1,128)} %bitcast.4) 0.4 us
+  kda_decode_step (KdaTiles(heads=16), 3 input / 2 output buffers): 8.4 us per call over 5 calls
+    steps                   2     (4.21 us each)
+    compute               1.9 us
+    input waits           1.7 us  (+1.9 us filling the pipeline)
+    output waits          0.0 us
+    other                 3.0 us  (decoding steps, starting copies, draining)
+    bottleneck: dma
+    trace: /tmp/autokernel-kda_decode_step-6_sdst0m
+  autokernel wall      49.3 us  device       9.0 us   499.0 GB/s (61% of 819)
+batch 8: 35.2 MB per step, pool of 17 slots
+  vllm       out_vs_f64 5.37e-05  conv_vs_f64 0  state_vs_f64 0.000177  state_vs_f64_median_head 4.29e-05
+    ops: kda_decode_fused_conv_recurrent.1 56.6 us, %copy.5 = bf16[1,8,96,128]{3,2,1,0:T(8,128)(2,1)S(1)} copy(bf16[1,8,96,128]{3,1,2,0:T(8,128)(2,1)} %bitcast.5) 0.7 us, %copy.3.beta_ref = bf16[8,32,1]{2,1,0:T(8,128)(2,1)S(1)} copy(bf16[8,32,1]{1,0,2:T(8,128)(2,1)} %bitcast.7) 0.5 us, %copy.4.a_log_ref = f32[32,1]{1,0:T(8,128)S(1)} copy(f32[32,1]{0,1:T(1,128)} %bitcast.8) 0.5 us
+  vllm       wall      71.7 us  device      58.3 us   603.0 GB/s (74% of 819)
+  chose KdaTiles(heads=32), bursts of 4 steps
+     KdaTiles(heads=16), 3 input / 2 output buffers                                 57.0 us  dma
+     KdaTiles(heads=16), 4 input / 2 output buffers                                 57.3 us  dma
+     KdaTiles(heads=16), bursts of 16 steps                                         56.9 us  dma
+     KdaTiles(heads=16), bursts of 8 steps                                          55.3 us  dma
+     KdaTiles(heads=16), bursts of 4 steps                                          55.5 us  dma
+   * KdaTiles(heads=32), bursts of 4 steps                                          54.2 us  dma
+     KdaTiles(heads=32), bursts of 8 steps                                          56.4 us  dma
+     KdaTiles(heads=32), bursts of 2 steps                                          54.9 us  dma
+  autokernel out_vs_f64 5.37e-05  conv_vs_f64 0  state_vs_f64 0.000177  state_vs_f64_median_head 4.29e-05  out_vs_vllm 0  conv_vs_vllm 0  state_vs_vllm 0  identical 1
+    ops: kda_decode_step.1 52.9 us, %copy.5 = bf16[1,8,96,128]{3,2,1,0:T(8,128)(2,1)S(1)} copy(bf16[1,8,96,128]{3,1,2,0:T(8,128)(2,1)} %bitcast.5) 0.7 us, %copy.3.beta_hbm = bf16[8,32,1]{2,1,0:T(8,128)(2,1)S(1)} copy(bf16[8,32,1]{1,0,2:T(8,128)(2,1)} %bitcast.7) 0.5 us, %copy.4.a_log_hbm = f32[32,1]{1,0:T(8,128)S(1)} copy(f32[32,1]{0,1:T(1,128)} %bitcast.8) 0.5 us
+  kda_decode_step (KdaTiles(heads=32), bursts of 4 steps): 54.3 us per call over 5 calls
+    steps                   8     (6.78 us each)
+    compute              11.7 us
+    input waits          14.4 us  (+3.0 us filling the pipeline)
+    output waits         13.4 us
+    other                11.8 us  (decoding steps, starting copies, draining)
+    bottleneck: dma
+    trace: /tmp/autokernel-kda_decode_step-celud7o3
+  autokernel wall      70.3 us  device      54.7 us   643.2 GB/s (79% of 819)
+batch 32: 140.4 MB per step, pool of 65 slots
+  vllm       out_vs_f64 5.51e-05  conv_vs_f64 0  state_vs_f64 0.00018  state_vs_f64_median_head 3.71e-05
+    ops: kda_decode_fused_conv_recurrent.1 215.5 us, %copy.5 = bf16[4,8,96,128]{3,2,1,0:T(8,128)(2,1)S(1)} copy(bf16[4,8,96,128]{3,1,2,0:T(8,128)(2,1)} %bitcast.5) 1.7 us, %copy.3.beta_ref = bf16[32,32,1]{2,1,0:T(8,128)(2,1)S(1)} copy(bf16[32,32,1]{1,0,2:T(8,128)(2,1)} %bitcast.7) 0.8 us, %copy.4.a_log_ref = f32[32,1]{1,0:T(8,128)S(1)} copy(f32[32,1]{0,1:T(1,128)} %bitcast.8) 0.4 us
+  vllm       wall     235.2 us  device     218.4 us   642.6 GB/s (78% of 819)
+  chose KdaTiles(heads=32), bursts of 8 steps
+     KdaTiles(heads=16), 3 input / 2 output buffers                                221.5 us  dma
+     KdaTiles(heads=16), 4 input / 2 output buffers                                221.4 us  dma
+     KdaTiles(heads=16), bursts of 16 steps                                        211.3 us  dma
+     KdaTiles(heads=16), bursts of 8 steps                                         211.5 us  dma
+   * KdaTiles(heads=32), bursts of 8 steps                                         205.2 us  dma
+     KdaTiles(heads=32), bursts of 4 steps                                         206.9 us  dma
+  autokernel out_vs_f64 5.51e-05  conv_vs_f64 0  state_vs_f64 0.00018  state_vs_f64_median_head 3.71e-05  out_vs_vllm 0  conv_vs_vllm 0  state_vs_vllm 0  identical 1
+    ops: kda_decode_step.1 202.9 us, %copy.5 = bf16[4,8,96,128]{3,2,1,0:T(8,128)(2,1)S(1)} copy(bf16[4,8,96,128]{3,1,2,0:T(8,128)(2,1)} %bitcast.5) 1.7 us, %copy.3.beta_hbm = bf16[32,32,1]{2,1,0:T(8,128)(2,1)S(1)} copy(bf16[32,32,1]{1,0,2:T(8,128)(2,1)} %bitcast.7) 0.8 us, %copy.4.a_log_hbm = f32[32,1]{1,0:T(8,128)S(1)} copy(f32[32,1]{0,1:T(1,128)} %bitcast.8) 0.4 us
+  kda_decode_step (KdaTiles(heads=32), bursts of 8 steps): 205.2 us per call over 5 calls
+    steps                  32     (6.41 us each)
+    compute              46.8 us
+    input waits          55.0 us  (+2.6 us filling the pipeline)
+    output waits         79.2 us
+    other                21.7 us  (decoding steps, starting copies, draining)
+    bottleneck: dma
+    trace: /tmp/autokernel-kda_decode_step-l538x5mh
+  autokernel wall     221.7 us  device     205.8 us   682.1 GB/s (83% of 819)
+batch 64: 280.6 MB per step, pool of 129 slots
+  vllm       out_vs_f64 6.03e-05  conv_vs_f64 0  state_vs_f64 0.00019  state_vs_f64_median_head 2.95e-05
+    ops: kda_decode_fused_conv_recurrent.1 427.2 us, %copy.6 = bf16[8,8,96,128]{3,2,1,0:T(8,128)(2,1)S(1)} copy(bf16[8,8,96,128]{3,1,2,0:T(8,128)(2,1)} %bitcast.5) 3.0 us, %copy.4.beta_ref = bf16[64,32,1]{2,1,0:T(8,128)(2,1)S(1)} copy(bf16[64,32,1]{0,1,2:T(8,128)(2,1)} %bitcast.7) 2.1 us, %copy.5.a_log_ref = f32[32,1]{1,0:T(8,128)S(1)} copy(f32[32,1]{0,1:T(1,128)} %bitcast.8) 0.4 us
+  vllm       wall     451.2 us  device     432.8 us   648.4 GB/s (79% of 819)
+  chose KdaTiles(heads=32), bursts of 8 steps
+     KdaTiles(heads=16), 3 input / 2 output buffers                                441.5 us  dma
+     KdaTiles(heads=16), 4 input / 2 output buffers                                441.6 us  dma
+     KdaTiles(heads=16), bursts of 16 steps                                        418.1 us  dma
+     KdaTiles(heads=16), bursts of 8 steps                                         420.8 us  dma
+   * KdaTiles(heads=32), bursts of 8 steps                                         407.8 us  dma
+     KdaTiles(heads=32), bursts of 4 steps                                         411.2 us  dma
+  autokernel out_vs_f64 6.03e-05  conv_vs_f64 0  state_vs_f64 0.00019  state_vs_f64_median_head 2.95e-05  out_vs_vllm 0  conv_vs_vllm 0  state_vs_vllm 0  identical 1
+    ops: kda_decode_step.1 402.4 us, %copy.6 = bf16[8,8,96,128]{3,2,1,0:T(8,128)(2,1)S(1)} copy(bf16[8,8,96,128]{3,1,2,0:T(8,128)(2,1)} %bitcast.5) 3.2 us, %copy.4.beta_hbm = bf16[64,32,1]{2,1,0:T(8,128)(2,1)S(1)} copy(bf16[64,32,1]{0,1,2:T(8,128)(2,1)} %bitcast.7) 2.1 us, %copy.5.a_log_hbm = f32[32,1]{1,0:T(8,128)S(1)} copy(f32[32,1]{0,1:T(1,128)} %bitcast.8) 0.4 us
+  kda_decode_step (KdaTiles(heads=32), bursts of 8 steps): 407.7 us per call over 5 calls
+    steps                  64     (6.37 us each)
+    compute              93.5 us
+    input waits         100.9 us  (+2.6 us filling the pipeline)
+    output waits        184.9 us
+    other                25.8 us  (decoding steps, starting copies, draining)
+    bottleneck: dma
+    trace: /tmp/autokernel-kda_decode_step-6spwdukk
+  autokernel wall     423.5 us  device     408.1 us   687.5 GB/s (84% of 819)
+batch 128: 561.1 MB per step, pool of 257 slots
+  vllm       out_vs_f64 0.000106  conv_vs_f64 0  state_vs_f64 0.00025  state_vs_f64_median_head 3.19e-05
+    ops: kda_decode_fused_conv_recurrent.1 849.7 us, %copy.6 = bf16[16,8,96,128]{3,2,1,0:T(8,128)(2,1)S(1)} copy(bf16[16,8,96,128]{3,1,2,0:T(8,128)(2,1)} %bitcast.5) 5.2 us, %copy.4.beta_ref = bf16[128,32,1]{2,1,0:T(8,128)(2,1)S(1)} copy(bf16[128,32,1]{0,1,2:T(8,128)(2,1)} %bitcast.7) 3.7 us, %copy.5.a_log_ref = f32[32,1]{1,0:T(8,128)S(1)} copy(f32[32,1]{0,1:T(1,128)} %bitcast.8) 0.4 us
+  vllm       wall     877.2 us  device     859.0 us   653.2 GB/s (80% of 819)
+  chose KdaTiles(heads=32), bursts of 8 steps
+     KdaTiles(heads=16), 3 input / 2 output buffers                                880.6 us  dma
+     KdaTiles(heads=16), 4 input / 2 output buffers                                880.4 us  dma
+     KdaTiles(heads=16), bursts of 16 steps                                        830.3 us  dma
+     KdaTiles(heads=16), bursts of 8 steps                                         837.2 us  dma
+   * KdaTiles(heads=32), bursts of 8 steps                                         810.7 us  dma
+     KdaTiles(heads=32), bursts of 4 steps                                         818.5 us  dma
+  autokernel out_vs_f64 0.000106  conv_vs_f64 0  state_vs_f64 0.00025  state_vs_f64_median_head 3.19e-05  out_vs_vllm 0  conv_vs_vllm 0  state_vs_vllm 0  identical 1
+    ops: kda_decode_step.1 802.1 us, %copy.6 = bf16[16,8,96,128]{3,2,1,0:T(8,128)(2,1)S(1)} copy(bf16[16,8,96,128]{3,1,2,0:T(8,128)(2,1)} %bitcast.5) 5.1 us, %copy.4.beta_hbm = bf16[128,32,1]{2,1,0:T(8,128)(2,1)S(1)} copy(bf16[128,32,1]{0,1,2:T(8,128)(2,1)} %bitcast.7) 3.6 us, %copy.5.a_log_hbm = f32[32,1]{1,0:T(8,128)S(1)} copy(f32[32,1]{0,1:T(1,128)} %bitcast.8) 0.4 us
+  kda_decode_step (KdaTiles(heads=32), bursts of 8 steps): 810.7 us per call over 5 calls
+    steps                 128     (6.33 us each)
+    compute             187.1 us
+    input waits         192.8 us  (+2.5 us filling the pipeline)
+    output waits        395.9 us
+    other                32.4 us  (decoding steps, starting copies, draining)
+    bottleneck: dma
+    trace: /tmp/autokernel-kda_decode_step-zioc5qo9
+  autokernel wall     831.0 us  device     811.3 us   691.6 GB/s (84% of 819)
+batch 256: 1122.1 MB per step, pool of 513 slots
+  vllm       out_vs_f64 5.92e-05  conv_vs_f64 0  state_vs_f64 0.000217  state_vs_f64_median_head 3.92e-05
+    ops: kda_decode_fused_conv_recurrent.1 1692.9 us, %copy.6 = bf16[32,8,96,128]{3,2,1,0:T(8,128)(2,1)S(1)} copy(bf16[32,8,96,128]{3,1,2,0:T(8,128)(2,1)} %bitcast.5) 9.6 us, %copy.4.beta_ref = bf16[256,32,1]{2,1,0:T(8,128)(2,1)S(1)} copy(bf16[256,32,1]{0,1,2:T(8,128)(2,1)} %bitcast.7) 6.9 us, %slice-done.3 = bf16[64,32,128]{2,1,0:T(8,128)(2,1)S(1)} async-done(((bf16[256,32,128]{2,1,0:T(8,128)(2,1)}), bf16[64,32,128]{2,1,0:T(8,128)(2,1)S(1)}, s32[]{:S(2)}) %slice-start.3) 0.6 us, %copy.5.a_log_ref = f32[32,1]{1,0:T(8,128)S(1)} copy(f32[32,1]{0,1:T(1,128)} %bitcast.8) 0.5 us, %slice-done.2 = bf16[64,32,128]{2,1,0:T(8,128)(2,1)S(1)} async-done(((bf16[256,32,128]{2,1,0:T(8,128)(2,1)}), bf16[64,32,128]{2,1,0:T(8,128)(2,1)S(1)}, s32[]{:S(2)}) %slice-start.2) 0.4 us
+  vllm       wall    1727.5 us  device    1711.2 us   655.7 GB/s (80% of 819)
+  chose KdaTiles(heads=32), bursts of 8 steps
+     KdaTiles(heads=16), 3 input / 2 output buffers                               1761.4 us  dma
+     KdaTiles(heads=16), 4 input / 2 output buffers                               1761.4 us  dma
+     KdaTiles(heads=16), bursts of 16 steps                                       1655.9 us  dma
+     KdaTiles(heads=16), bursts of 8 steps                                        1672.1 us  dma
+   * KdaTiles(heads=32), bursts of 8 steps                                        1617.6 us  dma
+     KdaTiles(heads=32), bursts of 4 steps                                        1633.6 us  dma
+  autokernel out_vs_f64 5.92e-05  conv_vs_f64 0  state_vs_f64 0.000217  state_vs_f64_median_head 3.92e-05  out_vs_vllm 0  conv_vs_vllm 0  state_vs_vllm 0  identical 1
+    ops: kda_decode_step.1 1599.0 us, %copy.6 = bf16[32,8,96,128]{3,2,1,0:T(8,128)(2,1)S(1)} copy(bf16[32,8,96,128]{3,1,2,0:T(8,128)(2,1)} %bitcast.5) 9.5 us, %copy.4.beta_hbm = bf16[256,32,1]{2,1,0:T(8,128)(2,1)S(1)} copy(bf16[256,32,1]{0,1,2:T(8,128)(2,1)} %bitcast.7) 6.9 us, %slice-done.3 = bf16[64,32,128]{2,1,0:T(8,128)(2,1)S(1)} async-done(((bf16[256,32,128]{2,1,0:T(8,128)(2,1)}), bf16[64,32,128]{2,1,0:T(8,128)(2,1)S(1)}, s32[]{:S(2)}) %slice-start.3) 0.8 us, %slice-done.2 = bf16[64,32,128]{2,1,0:T(8,128)(2,1)S(1)} async-done(((bf16[256,32,128]{2,1,0:T(8,128)(2,1)}), bf16[64,32,128]{2,1,0:T(8,128)(2,1)S(1)}, s32[]{:S(2)}) %slice-start.2) 0.5 us, %copy.5.a_log_hbm = f32[32,1]{1,0:T(8,128)S(1)} copy(f32[32,1]{0,1:T(1,128)} %bitcast.8) 0.4 us
+  kda_decode_step (KdaTiles(heads=32), bursts of 8 steps): 1618.7 us per call over 5 calls
+    steps                 256     (6.32 us each)
+    compute             374.1 us
+    input waits         376.6 us  (+2.6 us filling the pipeline)
+    output waits        819.2 us
+    other                46.2 us  (decoding steps, starting copies, draining)
+    bottleneck: dma
+    trace: /tmp/autokernel-kda_decode_step-jrraxzpa
+  autokernel wall    1636.8 us  device    1617.3 us   693.8 GB/s (85% of 819)
+[exit 0]

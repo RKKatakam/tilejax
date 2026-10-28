@@ -1,0 +1,192 @@
+9.log:B   1 vllm donated: kernel      9.2 us, all ops     10.8 us
+9.log:B   1 vllm copied : kernel      9.1 us, all ops     29.1 us
+9.log:B   1 heads 16 3 input / 2 output buffers   donated: kernel      7.0 us, all ops      8.5 us
+9.log:B   1 heads 16 3 input / 2 output buffers   copied : kernel      7.1 us, all ops     27.1 us
+9.log:B   1 heads 32 3 input / 2 output buffers   donated: kernel      8.8 us, all ops     10.3 us
+9.log:B   1 heads 32 3 input / 2 output buffers   copied : kernel      8.9 us, all ops     28.9 us
+9.log:B   1 heads 16 bursts of 2 steps            donated: kernel      7.9 us, all ops      9.5 us
+9.log:B   1 heads 16 bursts of 2 steps            copied : kernel      7.0 us, all ops     27.0 us
+9.log:B   1 heads 16 bursts of 4 steps            donated: kernel      8.2 us, all ops      9.7 us
+9.log:B   1 heads 16 bursts of 4 steps            copied : kernel      7.5 us, all ops     27.4 us
+9.log:B   1 heads 16 bursts of 8 steps            donated: kernel      8.4 us, all ops      9.9 us
+9.log:B   1 heads 16 bursts of 8 steps            copied : kernel      8.4 us, all ops     28.4 us
+9.log:B   1 heads 16 bursts of 16 steps           donated: kernel     10.6 us, all ops     12.0 us
+9.log:B   1 heads 16 bursts of 16 steps           copied : kernel     10.1 us, all ops     30.0 us
+9.log:B   1 32 bursts of 1 steps: expected an indented block after function definition on line 105 (<autokernel kda_decode_step #6>, line 106)
+9.log:B   1 32 bursts of 2 steps: expected an indented block after function definition on line 108 (<autokernel kda_decode_step #7>, line 109)
+9.log:B   1 32 bursts of 4 steps: expected an indented block after function definition on line 114 (<autokernel kda_decode_step #8>, line 115)
+9.log:B   1 32 bursts of 8 steps: expected an indented block after function definition on line 126 (<autokernel kda_decode_step #9>, line 127)
+9.log:B   1 32 bursts of 16 steps: expected an indented block after function definition on line 150 (<autokernel kda_decode_step #10>, line 151)
+9.log:B   8 vllm donated: kernel     53.5 us, all ops     55.2 us
+9.log:B   8 vllm copied : kernel     52.7 us, all ops    163.7 us
+9.log:B   8 heads 16 3 input / 2 output buffers   donated: kernel     56.0 us, all ops     57.7 us
+9.log:B   8 heads 16 3 input / 2 output buffers   copied : kernel     53.5 us, all ops    164.5 us
+9.log:B   8 heads 32 3 input / 2 output buffers   donated: kernel     53.8 us, all ops     55.5 us
+9.log:B   8 heads 32 3 input / 2 output buffers   copied : kernel     53.3 us, all ops    164.4 us
+9.log:B   8 heads 16 bursts of 2 steps            donated: kernel     56.2 us, all ops     57.9 us
+9.log:B   8 heads 16 bursts of 2 steps            copied : kernel     54.8 us, all ops    165.7 us
+9.log:B   8 heads 16 bursts of 4 steps            donated: kernel     54.5 us, all ops     56.2 us
+9.log:B   8 heads 16 bursts of 4 steps            copied : kernel     53.0 us, all ops    163.8 us
+9.log:B   8 heads 16 bursts of 8 steps            donated: kernel     54.3 us, all ops     56.1 us
+9.log:B   8 heads 16 bursts of 8 steps            copied : kernel     52.9 us, all ops    163.8 us
+9.log:B   8 heads 16 bursts of 16 steps           donated: kernel     56.0 us, all ops     57.6 us
+9.log:B   8 heads 16 bursts of 16 steps           copied : kernel     56.6 us, all ops    167.6 us
+9.log:B   8 heads 32 bursts of 1 steps            donated: kernel     56.4 us, all ops     58.2 us
+9.log:B   8 heads 32 bursts of 1 steps            copied : kernel     55.4 us, all ops    166.5 us
+9.log:B   8 heads 32 bursts of 2 steps            donated: kernel     54.1 us, all ops     55.9 us
+9.log:B   8 heads 32 bursts of 2 steps            copied : kernel     53.7 us, all ops    164.6 us
+9.log:B   8 heads 32 bursts of 4 steps            donated: kernel     53.6 us, all ops     55.3 us
+9.log:B   8 heads 32 bursts of 4 steps            copied : kernel     53.0 us, all ops    164.0 us
+9.log:B   8 heads 32 bursts of 8 steps            donated: kernel     54.8 us, all ops     56.6 us
+9.log:B   8 heads 32 bursts of 8 steps            copied : kernel     54.0 us, all ops    165.0 us
+9.log:B   8 heads 32 bursts of 16 steps           donated: kernel     55.7 us, all ops     57.4 us
+9.log:B   8 heads 32 bursts of 16 steps           copied : kernel     55.1 us, all ops    166.0 us
+9.log:B  32 vllm donated: kernel    212.6 us, all ops    215.5 us
+9.log:B  32 vllm copied : kernel    211.2 us, all ops    636.4 us
+9.log:B  32 heads 16 3 input / 2 output buffers   donated: kernel    219.5 us, all ops    222.5 us
+9.log:B  32 heads 16 3 input / 2 output buffers   copied : kernel    211.8 us, all ops    636.9 us
+9.log:B  32 heads 32 3 input / 2 output buffers   donated: kernel    213.1 us, all ops    216.1 us
+9.log:B  32 heads 32 3 input / 2 output buffers   copied : kernel    211.7 us, all ops    637.0 us
+9.log:B  32 heads 16 bursts of 2 steps            donated: kernel    220.5 us, all ops    223.4 us
+9.log:B  32 heads 16 bursts of 2 steps            copied : kernel    215.1 us, all ops    640.3 us
+9.log:B  32 heads 16 bursts of 4 steps            donated: kernel    212.4 us, all ops    215.4 us
+9.log:B  32 heads 16 bursts of 4 steps            copied : kernel    206.4 us, all ops    631.6 us
+9.log:B  32 heads 16 bursts of 8 steps            donated: kernel    209.4 us, all ops    212.3 us
+9.log:B  32 heads 16 bursts of 8 steps            copied : kernel    203.8 us, all ops    629.2 us
+9.log:B  32 heads 16 bursts of 16 steps           donated: kernel    209.1 us, all ops    212.1 us
+9.log:B  32 heads 16 bursts of 16 steps           copied : kernel    203.5 us, all ops    628.6 us
+9.log:B  32 heads 32 bursts of 1 steps            donated: kernel    217.7 us, all ops    220.6 us
+9.log:B  32 heads 32 bursts of 1 steps            copied : kernel    216.1 us, all ops    641.4 us
+9.log:B  32 heads 32 bursts of 2 steps            donated: kernel    209.0 us, all ops    212.0 us
+9.log:B  32 heads 32 bursts of 2 steps            copied : kernel    207.6 us, all ops    632.5 us
+9.log:B  32 heads 32 bursts of 4 steps            donated: kernel    205.1 us, all ops    208.1 us
+9.log:B  32 heads 32 bursts of 4 steps            copied : kernel    204.1 us, all ops    629.1 us
+9.log:B  32 heads 32 bursts of 8 steps            donated: kernel    203.7 us, all ops    206.6 us
+9.log:B  32 heads 32 bursts of 8 steps            copied : kernel    202.4 us, all ops    627.4 us
+9.log:B  32 heads 32 bursts of 16 steps           donated: kernel    203.7 us, all ops    206.6 us
+9.log:B  32 heads 32 bursts of 16 steps           copied : kernel    202.4 us, all ops    627.6 us
+9.log:B  64 vllm donated: kernel    424.4 us, all ops    430.0 us
+9.log:B  64 vllm copied : kernel    422.6 us, all ops   1267.3 us
+9.log:B  64 heads 16 3 input / 2 output buffers   donated: kernel    436.2 us, all ops    441.8 us
+9.log:B  64 heads 16 3 input / 2 output buffers   copied : kernel    422.6 us, all ops   1267.2 us
+9.log:B  64 heads 32 3 input / 2 output buffers   donated: kernel    425.6 us, all ops    431.1 us
+9.log:B  64 heads 32 3 input / 2 output buffers   copied : kernel    422.5 us, all ops   1267.5 us
+9.log:B  64 heads 16 bursts of 2 steps            donated: kernel    438.0 us, all ops    443.5 us
+9.log:B  64 heads 16 bursts of 2 steps            copied : kernel    429.5 us, all ops   1274.1 us
+9.log:B  64 heads 16 bursts of 4 steps            donated: kernel    422.7 us, all ops    428.4 us
+9.log:B  64 heads 16 bursts of 4 steps            copied : kernel    412.0 us, all ops   1257.2 us
+9.log:B  64 heads 16 bursts of 8 steps            donated: kernel    415.5 us, all ops    421.2 us
+9.log:B  64 heads 16 bursts of 8 steps            copied : kernel    404.8 us, all ops   1249.6 us
+9.log:B  64 heads 16 bursts of 16 steps           donated: kernel    413.1 us, all ops    418.6 us
+9.log:B  64 heads 16 bursts of 16 steps           copied : kernel    402.5 us, all ops   1247.1 us
+9.log:B  64 heads 32 bursts of 1 steps            donated: kernel    431.8 us, all ops    437.4 us
+9.log:B  64 heads 32 bursts of 1 steps            copied : kernel    430.3 us, all ops   1275.2 us
+9.log:B  64 heads 32 bursts of 2 steps            donated: kernel    414.7 us, all ops    420.3 us
+9.log:B  64 heads 32 bursts of 2 steps            copied : kernel    413.3 us, all ops   1258.1 us
+9.log:B  64 heads 32 bursts of 4 steps            donated: kernel    407.5 us, all ops    413.1 us
+9.log:B  64 heads 32 bursts of 4 steps            copied : kernel    405.5 us, all ops   1250.7 us
+9.log:B  64 heads 32 bursts of 8 steps            donated: kernel    403.5 us, all ops    409.0 us
+9.log:B  64 heads 32 bursts of 8 steps            copied : kernel    401.5 us, all ops   1246.5 us
+9.log:B  64 heads 32 bursts of 16 steps           donated: kernel    402.5 us, all ops    408.0 us
+9.log:B  64 heads 32 bursts of 16 steps           copied : kernel    400.4 us, all ops   1245.4 us
+9.log:B 128 vllm donated: kernel    848.3 us, all ops    857.5 us
+9.log:B 128 vllm copied : kernel    844.2 us, all ops   2536.2 us
+9.log:B 128 heads 16 3 input / 2 output buffers   donated: kernel    871.2 us, all ops    880.3 us
+9.log:B 128 heads 16 3 input / 2 output buffers   copied : kernel    844.6 us, all ops   2537.7 us
+9.log:B 128 heads 32 3 input / 2 output buffers   donated: kernel    848.5 us, all ops    857.7 us
+9.log:B 128 heads 32 3 input / 2 output buffers   copied : kernel    844.7 us, all ops   2537.9 us
+9.log:B 128 heads 16 bursts of 2 steps            donated: kernel    876.4 us, all ops    885.6 us
+9.log:B 128 heads 16 bursts of 2 steps            copied : kernel    857.8 us, all ops   2551.6 us
+9.log:B 128 heads 16 bursts of 4 steps            donated: kernel    845.5 us, all ops    854.6 us
+9.log:B 128 heads 16 bursts of 4 steps            copied : kernel    822.6 us, all ops   2516.3 us
+9.log:B 128 heads 16 bursts of 8 steps            donated: kernel    829.9 us, all ops    839.0 us
+9.log:B 128 heads 16 bursts of 8 steps            copied : kernel    807.4 us, all ops   2500.6 us
+9.log:B 128 heads 16 bursts of 16 steps           donated: kernel    823.4 us, all ops    832.5 us
+9.log:B 128 heads 16 bursts of 16 steps           copied : kernel    800.6 us, all ops   2493.7 us
+9.log:B 128 heads 32 bursts of 1 steps            donated: kernel    862.0 us, all ops    871.2 us
+9.log:B 128 heads 32 bursts of 1 steps            copied : kernel    858.4 us, all ops   2552.5 us
+9.log:B 128 heads 32 bursts of 2 steps            donated: kernel    828.6 us, all ops    837.9 us
+9.log:B 128 heads 32 bursts of 2 steps            copied : kernel    823.9 us, all ops   2517.5 us
+9.log:B 128 heads 32 bursts of 4 steps            donated: kernel    812.4 us, all ops    821.7 us
+9.log:B 128 heads 32 bursts of 4 steps            copied : kernel    807.7 us, all ops   2500.8 us
+9.log:B 128 heads 32 bursts of 8 steps            donated: kernel    804.1 us, all ops    813.3 us
+9.log:B 128 heads 32 bursts of 8 steps            copied : kernel    800.0 us, all ops   2493.3 us
+9.log:B 128 heads 32 bursts of 16 steps           donated: kernel    800.4 us, all ops    809.8 us
+9.log:B 128 heads 32 bursts of 16 steps           copied : kernel    797.6 us, all ops   2490.5 us
+9.log:B 256 vllm donated: kernel   1688.3 us, all ops   1706.5 us
+9.log:B 256 vllm copied : kernel   1688.1 us, all ops   4958.1 us
+9.log:B 256 heads 16 3 input / 2 output buffers   donated: kernel   1688.1 us, all ops   1706.4 us
+9.log:B 256 heads 16 3 input / 2 output buffers   copied : kernel   1686.8 us, all ops   4956.8 us
+9.log:B 256 heads 32 3 input / 2 output buffers   donated: kernel   1688.6 us, all ops   1706.9 us
+9.log:B 256 heads 32 3 input / 2 output buffers   copied : kernel   1688.2 us, all ops   4958.0 us
+9.log:B 256 heads 16 bursts of 2 steps            donated: kernel   1715.5 us, all ops   1733.8 us
+9.log:B 256 heads 16 bursts of 2 steps            copied : kernel   1713.6 us, all ops   4983.8 us
+9.log:B 256 heads 16 bursts of 4 steps            donated: kernel   1644.7 us, all ops   1663.0 us
+9.log:B 256 heads 16 bursts of 4 steps            copied : kernel   1643.2 us, all ops   4913.2 us
+9.log:B 256 heads 16 bursts of 8 steps            donated: kernel   1612.5 us, all ops   1630.8 us
+9.log:B 256 heads 16 bursts of 8 steps            copied : kernel   1612.0 us, all ops   4882.0 us
+9.log:B 256 heads 16 bursts of 16 steps           donated: kernel   1597.4 us, all ops   1615.7 us
+9.log:B 256 heads 16 bursts of 16 steps           copied : kernel   1595.6 us, all ops   4865.8 us
+9.log:B 256 heads 32 bursts of 1 steps            donated: kernel   1716.0 us, all ops   1734.4 us
+9.log:B 256 heads 32 bursts of 1 steps            copied : kernel   1714.6 us, all ops   4985.3 us
+9.log:B 256 heads 32 bursts of 2 steps            donated: kernel   1646.5 us, all ops   1664.9 us
+9.log:B 256 heads 32 bursts of 2 steps            copied : kernel   1646.1 us, all ops   4916.4 us
+9.log:B 256 heads 32 bursts of 4 steps            donated: kernel   1614.4 us, all ops   1632.7 us
+9.log:B 256 heads 32 bursts of 4 steps            copied : kernel   1614.3 us, all ops   4884.6 us
+9.log:B 256 heads 32 bursts of 8 steps            donated: kernel   1598.7 us, all ops   1617.0 us
+9.log:B 256 heads 32 bursts of 8 steps            copied : kernel   1597.0 us, all ops   4866.8 us
+9.log:B 256 heads 32 bursts of 16 steps           donated: kernel   1589.8 us, all ops   1608.1 us
+9.log:B 256 heads 32 bursts of 16 steps           copied : kernel   1589.2 us, all ops   4859.6 us
+6.log:$ cd /content/ak && PYTHONPATH=/content/ak/src PYTHONUNBUFFERED=1 python benchmarks/vs_vllm_kda/probe_burst.py
+6.log:XLA x * 2: 673 GB/s (1595 us)
+6.log:overlap groups of  1 MiB:   559 GB/s (  1922 us)
+6.log:burst   groups of  1 MiB:   590 GB/s (  1820 us)
+6.log:overlap groups of  2 MiB:   599 GB/s (  1792 us)
+6.log:burst   groups of  2 MiB:   637 GB/s (  1685 us)
+6.log:overlap groups of  4 MiB:   622 GB/s (  1726 us)
+6.log:burst   groups of  4 MiB:   665 GB/s (  1615 us)
+6.log:overlap groups of  8 MiB:   635 GB/s (  1691 us)
+6.log:burst   groups of  8 MiB:   677 GB/s (  1586 us)
+6.log:overlap groups of 16 MiB:   640 GB/s (  1679 us)
+6.log:burst   groups of 16 MiB:   682 GB/s (  1574 us)
+6.log:overlap groups of  1 MiB + compute:   561 GB/s (  1915 us)
+6.log:burst   groups of  1 MiB + compute:   592 GB/s (  1815 us)
+6.log:overlap groups of  2 MiB + compute:   603 GB/s (  1780 us)
+6.log:burst   groups of  2 MiB + compute:   638 GB/s (  1684 us)
+6.log:overlap groups of  4 MiB + compute:   636 GB/s (  1688 us)
+6.log:burst   groups of  4 MiB + compute:   664 GB/s (  1617 us)
+6.log:overlap groups of  8 MiB + compute:   645 GB/s (  1665 us)
+6.log:burst   groups of  8 MiB + compute:   675 GB/s (  1590 us)
+6.log:overlap groups of 16 MiB + compute:   650 GB/s (  1652 us)
+6.log:burst   groups of 16 MiB + compute:   683 GB/s (  1571 us)
+6.log:2 MiB, groups of 1, overlap: 62.0 us
+6.log:2 MiB, groups of 1, burst: 57.1 us
+6.log:2 MiB, groups of 2, burst: 60.2 us
+6.log:8 MiB, groups of 1, overlap: 57.7 us
+6.log:8 MiB, groups of 1, burst: 57.3 us
+6.log:8 MiB, groups of 8, burst: 59.3 us
+6.log:  vllm       wall      65.8 us  device      55.3 us   635.8 GB/s (78% of 819)
+6.log:  autokernel16 wall      69.4 us  device      57.8 us   608.7 GB/s (74% of 819)
+6.log:  autokernel32 wall      66.7 us  device      55.4 us   635.3 GB/s (78% of 819)
+6.log:  vllm       wall     874.0 us  device     856.0 us   655.5 GB/s (80% of 819)
+6.log:  autokernel16 wall     894.8 us  device     877.9 us   639.2 GB/s (78% of 819)
+6.log:  autokernel32 wall     872.4 us  device     856.6 us   655.1 GB/s (80% of 819)
+5.log:XLA elementwise x * 2 (read + write): 674 GB/s (1593 us)
+5.log:read  chunk  1024 KiB, 3 reads / 2 writes in flight, split 1:    731 GB/s (    734 us)
+5.log:write chunk  1024 KiB, 3 reads / 2 writes in flight, split 1:    639 GB/s (    840 us)
+5.log:copy  chunk  1024 KiB, 3 reads / 2 writes in flight, split 1:    645 GB/s (   1665 us)
+5.log:copy  chunk  1024 KiB, 4 reads / 4 writes in flight, split 1:    646 GB/s (   1663 us)
+5.log:copy  chunk  1024 KiB, 3 reads / 2 writes in flight, split 2:    647 GB/s (   1659 us)
+5.log:copy  chunk  1024 KiB, 3 reads / 2 writes in flight, split 4:    647 GB/s (   1659 us)
+5.log:copy  chunk  1024 KiB, 4 reads / 4 writes in flight, split 4:    648 GB/s (   1658 us)
+5.log:copy  chunk   512 KiB, 4 reads / 4 writes in flight, split 1:    646 GB/s (   1662 us)
+5.log:copy  chunk   512 KiB, 6 reads / 6 writes in flight, split 1:    646 GB/s (   1661 us)
+5.log:copy  chunk  2048 KiB, 3 reads / 2 writes in flight, split 1:    649 GB/s (   1656 us)
+5.log:copy  chunk  2048 KiB, 3 reads / 3 writes in flight, split 2:    649 GB/s (   1655 us)
+5.log:copy  chunk   256 KiB, 8 reads / 8 writes in flight, split 1:    646 GB/s (   1663 us)
+5.log:  vllm       wall      49.8 us  device      10.8 us   417.9 GB/s (51% of 819)
+5.log:  autokernel wall      62.4 us  device       8.4 us   532.8 GB/s (65% of 819)
+5.log:  vllm       wall     449.0 us  device     430.4 us   651.9 GB/s (80% of 819)
+5.log:  autokernel wall     459.7 us  device     441.8 us   635.2 GB/s (78% of 819)
+5.log:  vllm       wall     877.0 us  device     856.6 us   655.0 GB/s (80% of 819)
+5.log:  autokernel wall     897.2 us  device     879.8 us   637.8 GB/s (78% of 819)

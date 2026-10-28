@@ -7,8 +7,9 @@ synthetic events."""
 import os
 
 import jax
+import numpy as np
 import pytest
-from helpers import rand
+from helpers import make_kernel, rand
 from matmul import MatmulTiles, matmul
 
 import autokernel
@@ -141,3 +142,30 @@ def test_importing_autokernel_turns_trace_regions_on(monkeypatch):
     monkeypatch.setattr(profiling, "_backend_started", lambda: False)
     importlib.reload(autokernel)
     assert profiling.regions_enabled()
+
+
+@pytest.mark.cpu
+def test_a_calls_device_time_counts_the_ops_before_its_kernel(fake_tpu):
+    x, y = rand((256, 256)), rand((256, 256), 1)
+    events = trace(calls=1)  # the kernel 53 us, then another op of 50 us (the call's step tables, say)
+    fake_tpu.append(events)
+    p = autokernel.profile(matmul, x, y, MatmulTiles(tm=128, tn=128, tk=128), runs=1)
+    assert p.device_s == pytest.approx(103 * US)
+
+
+@pytest.mark.cpu
+def test_kernels_updating_inputs_in_place_are_timed_in_place(fake_tpu):
+    kernel = make_kernel(
+        """
+        def f(x):
+            new = x
+            for i in range(0, 256, 128):
+                new = new.at[i : i + 128, :].set(x[i : i + 128, :] + 1)
+            return new
+        """
+    )
+    x = rand((256, 128))
+    fake_tpu.append(trace("f"))
+    p = autokernel.profile(kernel, x, runs=2)  # the warm-up call and two more, each on the last one's output
+    assert p.calls == 2
+    np.testing.assert_array_equal(np.asarray(x), np.asarray(rand((256, 128))))  # (a copy of it was donated)

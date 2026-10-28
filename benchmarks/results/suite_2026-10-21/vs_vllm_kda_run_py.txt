@@ -1,0 +1,151 @@
+# TPU v5e (Colab), 2026-10-21, commit 080fc71: python benchmarks/vs_vllm_kda/run.py  [complete]
+jax 0.11.2 on TPU v5 lite; methods ['vllm', 'autokernel', 'xla']; options {}
+batch 1: 4.5 MB per step, pool of 3 slots
+  vllm       out_vs_f64 2.53e-05  conv_vs_f64 0  state_vs_f64 3.67e-08  state_vs_f64_median_head 1.28e-08
+    ops: kda_decode_fused_conv_recurrent.1 9.1 us, %reduce = bf16[12288]{0:T(1024)(128)(2,1)S(1)} reduce(bf16[1,12288]{1,0:T(2,128)(2,1)} %mixed_qkv.1, bf16[]{:T(256)} %constant), dimensions={0}, to_apply=%mixed_qkv.1.reduce_sub_computation 0.6 us, %copy.2.beta_ref = bf16[1,32,1]{2,1,0:T(8,128)(2,1)S(1)} copy(bf16[1,32,1]{1,2,0:T(2,128)(2,1)} %bitcast.5) 0.5 us, %copy.3.a_log_ref = f32[32,1]{1,0:T(8,128)S(1)} copy(f32[32,1]{0,1:T(1,128)} %bitcast.4) 0.4 us
+  vllm       wall      50.1 us  device      10.6 us   422.3 GB/s (52% of 819)
+  chose KdaTiles(heads=16), 3 input / 2 output buffers
+   * KdaTiles(heads=16), 3 input / 2 output buffers                                  7.8 us  overhead
+     KdaTiles(heads=32), 3 input / 2 output buffers                                 10.0 us  overhead
+  autokernel out_vs_f64 2.53e-05  conv_vs_f64 0  state_vs_f64 3.67e-08  state_vs_f64_median_head 1.28e-08  out_vs_vllm 0  conv_vs_vllm 0  state_vs_vllm 0  identical 1
+    ops: kda_decode_step.1 7.0 us, %reduce = bf16[12288]{0:T(1024)(128)(2,1)S(1)} reduce(bf16[1,12288]{1,0:T(2,128)(2,1)} %mixed_qkv.1, bf16[]{:T(256)} %constant), dimensions={0}, to_apply=%mixed_qkv.1.reduce_sub_computation 0.6 us, %copy.2.beta_hbm = bf16[1,32,1]{2,1,0:T(8,128)(2,1)S(1)} copy(bf16[1,32,1]{1,2,0:T(2,128)(2,1)} %bitcast.5) 0.5 us, %copy.3.a_log_hbm = f32[32,1]{1,0:T(8,128)S(1)} copy(f32[32,1]{0,1:T(1,128)} %bitcast.4) 0.4 us
+  kda_decode_step (KdaTiles(heads=16), 3 input / 2 output buffers): 7.9 us per call over 5 calls
+    steps                   2     (3.94 us each)
+    compute               2.5 us
+    input waits           0.5 us  (+1.8 us filling the pipeline)
+    output waits          0.0 us
+    other                 3.1 us  (decoding steps, starting copies, draining)
+    bottleneck: overhead
+    trace: /tmp/autokernel-kda_decode_step-c0b1lwbk
+  autokernel wall      56.7 us  device       8.4 us   532.9 GB/s (65% of 819)
+  xla        out_vs_f64 2.46e-05  conv_vs_f64 0  state_vs_f64 0.00176  state_vs_f64_median_head 0.00052  out_vs_vllm 3.05e-05  conv_vs_vllm 0  state_vs_vllm 0.00176  identical 0
+    ops: %fusion = f32[3,32,128,128]{3,2,1,0:T(8,128)} fusion(f32[3,32,128,128]{3,2,1,0:T(8,128)} %state.1, s32[]{:T(128)} %bitcast.4, f32[32,128]{1,0:T(8,128)S(1)} %fusion.20, f32[32,128]{1,0:T(8,128)S(1)} %bitcast_multiply_fusion, f32[32,128]{1,0:T(8,128)S(1)} %get-tuple-element.55, pred[]{:T(512)} %bitcast.3, pred[]{:T(512)} %bitcast, pred[]{:T(512)} %and_reduce_fusion), kind=kLoop, calls=%fused_computation.1 6.6 us, %fusion.1 = f32[32,2,128]{2,1,0:T(2,128)S(1)} fusion(f32[3,32,128,128]{3,2,1,0:T(8,128)} %state.1, s32[]{:T(128)} %bitcast.4, pred[]{:T(512)} %bitcast.3, f32[1,32,128,1]{2,3,1,0:T(1,128)S(1)} %bitcast.109, f32[1,32,128,1]{2,3,1,0:T(1,128)S(1)} %bitcast.108), kind=kOutput, calls=%fused_computation.2 5.1 us, %and_reduce_fusion = pred[]{:T(512)} fusion(s32[4]{0:T(128)} %constant.53, s32[1]{0:T(128)} %constant.2, s32[1]{0:T(128)} %select_n.12), kind=kLoop, calls=%fused_computation.51 0.9 us, %fusion.24 = (f32[1,32,128]{2,1,0:T(8,128)S(1)}, f32[1,32,128]{2,1,0:T(8,128)S(1)}, f32[32]{0:T(128)S(1)}, f32[32,128]{1,0:T(8,128)S(1)}) fusion(f32[1,3,32,128]{3,2,1,0:T(8,128)S(1)} %fusion.13, f32[32]{0:T(128)S(1)} %add_rsqrt_fusion.1, f32[32,128]{1,0:T(8,128)} %dt_bias.1, bf16[1,32,128]{2,1,0:T(8,128)(2,1)} %g.1, f32[32]{0:T(128)S(1)} %exponential_negate_fusion, f32[32]{0:T(128)S(1)} %add_rsqrt_fusion), kind=kLoop, calls=%fused_computation.49 0.8 us, %and_reduce_fusion.1 = pred[]{:T(512)} fusion(s32[5]{0:T(128)} %constant.47, s32[5]{0:T(128)S(1)} %concatenate.4), kind=kLoop, calls=%fused_computation.52 0.8 us, %fusion.31 = (bf16[12288]{0:T(1024)(128)(2,1)S(1)}, f32[1,12288]{1,0:T(1,128)S(1)}) fusion(bf16[1,12288]{1,0:T(2,128)(2,1)} %mixed_qkv.1), kind=kLoop, calls=%fused_computation.62 0.7 us
+  xla        wall      69.5 us  device      18.0 us   249.2 GB/s (30% of 819)
+batch 8: 35.2 MB per step, pool of 17 slots
+  vllm       out_vs_f64 5.12e-05  conv_vs_f64 0  state_vs_f64 0.000156  state_vs_f64_median_head 4.23e-05
+    ops: kda_decode_fused_conv_recurrent.1 53.3 us, %copy.5 = bf16[1,8,96,128]{3,2,1,0:T(8,128)(2,1)S(1)} copy(bf16[1,8,96,128]{3,1,2,0:T(8,128)(2,1)} %bitcast.5) 0.8 us, %copy.3.beta_ref = bf16[8,32,1]{2,1,0:T(8,128)(2,1)S(1)} copy(bf16[8,32,1]{1,0,2:T(8,128)(2,1)} %bitcast.7) 0.5 us, %copy.4.a_log_ref = f32[32,1]{1,0:T(8,128)S(1)} copy(f32[32,1]{0,1:T(1,128)} %bitcast.8) 0.4 us
+  vllm       wall      75.1 us  device      55.0 us   639.4 GB/s (78% of 819)
+  chose KdaTiles(heads=32), bursts of 4 steps
+     KdaTiles(heads=16), 3 input / 2 output buffers                                 57.2 us  dma
+     KdaTiles(heads=16), 4 input / 2 output buffers                                 57.2 us  dma
+     KdaTiles(heads=16), bursts of 16 steps                                         57.0 us  dma
+     KdaTiles(heads=16), bursts of 8 steps                                          55.7 us  dma
+     KdaTiles(heads=16), bursts of 4 steps                                          55.8 us  dma
+   * KdaTiles(heads=32), bursts of 4 steps                                          54.9 us  dma
+     KdaTiles(heads=32), bursts of 8 steps                                          56.2 us  dma
+     KdaTiles(heads=32), bursts of 2 steps                                          55.6 us  dma
+  autokernel out_vs_f64 5.12e-05  conv_vs_f64 0  state_vs_f64 0.000156  state_vs_f64_median_head 4.23e-05  out_vs_vllm 0  conv_vs_vllm 0  state_vs_vllm 0  identical 1
+    ops: kda_decode_step.1 53.5 us, %copy.5 = bf16[1,8,96,128]{3,2,1,0:T(8,128)(2,1)S(1)} copy(bf16[1,8,96,128]{3,1,2,0:T(8,128)(2,1)} %bitcast.5) 0.7 us, %copy.3.beta_hbm = bf16[8,32,1]{2,1,0:T(8,128)(2,1)S(1)} copy(bf16[8,32,1]{1,0,2:T(8,128)(2,1)} %bitcast.7) 0.5 us, %copy.4.a_log_hbm = f32[32,1]{1,0:T(8,128)S(1)} copy(f32[32,1]{0,1:T(1,128)} %bitcast.8) 0.5 us
+  kda_decode_step (KdaTiles(heads=32), bursts of 4 steps): 54.9 us per call over 5 calls
+    steps                   8     (6.86 us each)
+    compute              17.1 us
+    input waits          11.7 us  (+2.9 us filling the pipeline)
+    output waits         13.4 us
+    other                 9.8 us  (decoding steps, starting copies, draining)
+    bottleneck: dma
+    trace: /tmp/autokernel-kda_decode_step-dkrgfgg1
+  autokernel wall      67.4 us  device      55.3 us   636.3 GB/s (78% of 819)
+  xla        out_vs_f64 7.48e-05  conv_vs_f64 0  state_vs_f64 0.00178  state_vs_f64_median_head 0.000482  out_vs_vllm 6.1e-05  conv_vs_vllm 0  state_vs_vllm 0.00178  identical 0
+    ops: %copy-done.1 = f32[17,32,128,128]{3,2,1,0:T(8,128)} copy-done((f32[17,32,128,128]{3,2,1,0:T(8,128)}, f32[17,32,128,128]{3,2,1,0:T(8,128)S(1)}, u32[]{:S(2)}) %copy-start.1) 54.2 us, %while.2 = (s32[]{:T(128)}, f32[17,32,128,128]{3,2,1,0:T(8,128)}, s32[8,1]{0,1:T(1,128)S(1)}, f32[8,32,128,128]{3,2,1,0:T(8,128)S(1)}) while((s32[]{:T(128)}, f32[17,32,128,128]{3,2,1,0:T(8,128)}, s32[8,1]{0,1:T(1,128)S(1)}, f32[8,32,128,128]{3,2,1,0:T(8,128)S(1)}) %tuple.27), condition=%wide.while_cond.clone, body=%wide.while_body.sunk.clone 33.8 us, %dynamic-slice_dynamic-update-slice_fusion.3 = f32[8,32,128,128]{3,2,1,0:T(8,128)S(1)} fusion(f32[8,32,128,128]{3,2,1,0:T(8,128)S(1)} %get-tuple-element.74, s32[]{:T(128)S(6)} %copy.29, f32[17,32,128,128]{3,2,1,0:T(8,128)} %get-tuple-element.76, s32[]{:T(128)} %bitcast.99), kind=kLoop, calls=%fused_computation.3.clone.1.clone 31.1 us, %add_select_fusion = f32[8,32,128,128]{3,2,1,0:T(8,128)S(1)} fusion(f32[8,32,128,128]{3,2,1,0:T(8,128)S(1)} %get-tuple-element.7, f32[8,32,128]{2,1,0:T(8,128)S(1)} %get-tuple-element.27, f32[8,32,128]{2,1,0:T(8,128)S(1)} %fusion.22, f32[8,32,128]{2,1,0:T(8,128)S(1)} %get-tuple-element.19, pred[8]{0:T(512)(128)(4,1)S(1)} %get-tuple-element.28, pred[8]{0:T(512)(128)(4,1)S(1)} %get-tuple-element.29), kind=kLoop, calls=%fused_computation.6 17.9 us, %fusion.1 = f32[8,32,2,128]{3,2,1,0:T(2,128)S(1)} fusion(f32[8,32,128,128]{3,2,1,0:T(8,128)S(1)} %get-tuple-element.7, pred[8]{0:T(512)(128)(4,1)S(1)} %get-tuple-element.29, f32[8,32,128,1]{2,3,1,0:T(1,128)S(1)} %bitcast.106, f32[8,32,128,1]{2,3,1,0:T(1,128)S(1)} %bitcast.105), kind=kOutput, calls=%fused_computation.7 15.5 us, %copy-done = f32[17,32,128,128]{3,2,1,0:T(8,128)S(1)} copy-done((f32[17,32,128,128]{3,2,1,0:T(8,128)S(1)}, f32[17,32,128,128]{3,2,1,0:T(8,128)}, u32[]{:S(2)}) %copy-start) 12.6 us
+  xla        wall     170.1 us  device     188.8 us   186.4 GB/s (23% of 819)
+batch 32: 140.4 MB per step, pool of 65 slots
+  vllm       out_vs_f64 0.000113  conv_vs_f64 0  state_vs_f64 0.000154  state_vs_f64_median_head 3.83e-05
+    ops: kda_decode_fused_conv_recurrent.1 212.7 us, %copy.5 = bf16[4,8,96,128]{3,2,1,0:T(8,128)(2,1)S(1)} copy(bf16[4,8,96,128]{3,1,2,0:T(8,128)(2,1)} %bitcast.5) 1.7 us, %copy.3.beta_ref = bf16[32,32,1]{2,1,0:T(8,128)(2,1)S(1)} copy(bf16[32,32,1]{1,0,2:T(8,128)(2,1)} %bitcast.7) 0.7 us, %copy.4.a_log_ref = f32[32,1]{1,0:T(8,128)S(1)} copy(f32[32,1]{0,1:T(1,128)} %bitcast.8) 0.4 us
+  vllm       wall     231.0 us  device     215.5 us   651.2 GB/s (80% of 819)
+  chose KdaTiles(heads=32), bursts of 8 steps
+     KdaTiles(heads=16), 3 input / 2 output buffers                                221.2 us  dma
+     KdaTiles(heads=16), 4 input / 2 output buffers                                221.4 us  dma
+     KdaTiles(heads=16), bursts of 16 steps                                        210.9 us  dma
+     KdaTiles(heads=16), bursts of 8 steps                                         211.6 us  dma
+   * KdaTiles(heads=32), bursts of 8 steps                                         205.9 us  dma
+     KdaTiles(heads=32), bursts of 4 steps                                         207.6 us  dma
+  autokernel out_vs_f64 0.000113  conv_vs_f64 0  state_vs_f64 0.000154  state_vs_f64_median_head 3.83e-05  out_vs_vllm 0  conv_vs_vllm 0  state_vs_vllm 0  identical 1
+    ops: kda_decode_step.1 203.6 us, %copy.5 = bf16[4,8,96,128]{3,2,1,0:T(8,128)(2,1)S(1)} copy(bf16[4,8,96,128]{3,1,2,0:T(8,128)(2,1)} %bitcast.5) 1.7 us, %copy.3.beta_hbm = bf16[32,32,1]{2,1,0:T(8,128)(2,1)S(1)} copy(bf16[32,32,1]{1,0,2:T(8,128)(2,1)} %bitcast.7) 0.7 us, %copy.4.a_log_hbm = f32[32,1]{1,0:T(8,128)S(1)} copy(f32[32,1]{0,1:T(1,128)} %bitcast.8) 0.5 us
+  kda_decode_step (KdaTiles(heads=32), bursts of 8 steps): 206.2 us per call over 5 calls
+    steps                  32     (6.44 us each)
+    compute              68.4 us
+    input waits          38.2 us  (+2.6 us filling the pipeline)
+    output waits         79.4 us
+    other                17.6 us  (decoding steps, starting copies, draining)
+    bottleneck: dma
+    trace: /tmp/autokernel-kda_decode_step-wizl6t_3
+  autokernel wall     220.0 us  device     206.6 us   679.5 GB/s (83% of 819)
+  xla        out_vs_f64 8.67e-05  conv_vs_f64 0  state_vs_f64 0.00351  state_vs_f64_median_head 0.000451  out_vs_vllm 0.000183  conv_vs_vllm 0  state_vs_vllm 0.00353  identical 0
+    ops: %scatter_fusion.1 = f32[65,32,128,128]{3,2,1,0:T(8,128)} fusion(f32[65,32,128,128]{3,2,1,0:T(8,128)} %state.1, s32[32]{0:T(128)S(1)} %get-tuple-element.30, f32[32,32,128,128]{3,2,1,0:T(8,128)S(1)} %add_select_fusion), kind=kCustom, calls=%fused_computation.2 218.1 us, %while.2 = (s32[]{:T(128)}, f32[65,32,128,128]{3,2,1,0:T(8,128)}, s32[32,1]{0,1:T(1,128)S(1)}, f32[32,32,128,128]{3,2,1,0:T(8,128)S(1)}) while((s32[]{:T(128)}, f32[65,32,128,128]{3,2,1,0:T(8,128)}, s32[32,1]{0,1:T(1,128)S(1)}, f32[32,32,128,128]{3,2,1,0:T(8,128)S(1)}) %tuple.27), condition=%wide.while_cond.clone, body=%wide.while_body.sunk.clone 135.7 us, %dynamic-slice_dynamic-update-slice_fusion.3 = f32[32,32,128,128]{3,2,1,0:T(8,128)S(1)} fusion(f32[32,32,128,128]{3,2,1,0:T(8,128)S(1)} %get-tuple-element.74, s32[]{:T(128)S(6)} %copy.29, f32[65,32,128,128]{3,2,1,0:T(8,128)} %get-tuple-element.76, s32[]{:T(128)} %bitcast.99), kind=kLoop, calls=%fused_computation.3.clone.1.clone 124.8 us, %add_select_fusion = f32[32,32,128,128]{3,2,1,0:T(8,128)S(1)} fusion(f32[32,32,128,128]{3,2,1,0:T(8,128)} %copy-done, f32[32,32,128]{2,1,0:T(8,128)S(1)} %get-tuple-element.23, f32[32,32,128]{2,1,0:T(8,128)S(1)} %fusion.22, f32[32,32,128]{2,1,0:T(8,128)S(1)} %get-tuple-element.19, pred[32]{0:T(512)(128)(4,1)S(1)} %get-tuple-element.28, pred[32]{0:T(512)(128)(4,1)S(1)} %get-tuple-element.29), kind=kLoop, calls=%fused_computation.6 90.3 us, %fusion.1 = f32[32,32,2,128]{3,2,1,0:T(2,128)S(1)} fusion(f32[32,32,128,128]{3,2,1,0:T(8,128)S(1)} %get-tuple-element.7, pred[32]{0:T(512)(128)(4,1)S(1)} %get-tuple-element.29, f32[32,32,128,1]{2,3,1,0:T(1,128)S(1)} %bitcast.106, f32[32,32,128,1]{2,3,1,0:T(1,128)S(1)} %bitcast.105), kind=kOutput, calls=%fused_computation.7 62.0 us, %copy-done = f32[32,32,128,128]{3,2,1,0:T(8,128)} copy-done((f32[32,32,128,128]{3,2,1,0:T(8,128)}, f32[32,32,128,128]{3,2,1,0:T(8,128)S(1)}, u32[]{:S(2)}) %copy-start) 40.0 us
+  xla        wall     600.0 us  device     717.1 us   195.7 GB/s (24% of 819)
+batch 64: 280.6 MB per step, pool of 129 slots
+  vllm       out_vs_f64 0.000105  conv_vs_f64 0  state_vs_f64 0.000167  state_vs_f64_median_head 2.83e-05
+    ops: kda_decode_fused_conv_recurrent.1 424.3 us, %copy.6 = bf16[8,8,96,128]{3,2,1,0:T(8,128)(2,1)S(1)} copy(bf16[8,8,96,128]{3,1,2,0:T(8,128)(2,1)} %bitcast.5) 3.0 us, %copy.4.beta_ref = bf16[64,32,1]{2,1,0:T(8,128)(2,1)S(1)} copy(bf16[64,32,1]{0,1,2:T(8,128)(2,1)} %bitcast.7) 2.1 us, %copy.5.a_log_ref = f32[32,1]{1,0:T(8,128)S(1)} copy(f32[32,1]{0,1:T(1,128)} %bitcast.8) 0.4 us
+  vllm       wall     445.2 us  device     429.8 us   652.9 GB/s (80% of 819)
+  chose KdaTiles(heads=32), bursts of 8 steps
+     KdaTiles(heads=16), 3 input / 2 output buffers                                441.3 us  dma
+     KdaTiles(heads=16), 4 input / 2 output buffers                                441.3 us  dma
+     KdaTiles(heads=16), bursts of 16 steps                                        417.7 us  dma
+     KdaTiles(heads=16), bursts of 8 steps                                         420.2 us  dma
+   * KdaTiles(heads=32), bursts of 8 steps                                         408.2 us  dma
+     KdaTiles(heads=32), bursts of 4 steps                                         412.0 us  dma
+  autokernel out_vs_f64 0.000105  conv_vs_f64 0  state_vs_f64 0.000167  state_vs_f64_median_head 2.83e-05  out_vs_vllm 0  conv_vs_vllm 0  state_vs_vllm 0  identical 1
+    ops: kda_decode_step.1 403.2 us, %copy.6 = bf16[8,8,96,128]{3,2,1,0:T(8,128)(2,1)S(1)} copy(bf16[8,8,96,128]{3,1,2,0:T(8,128)(2,1)} %bitcast.5) 3.0 us, %copy.4.beta_hbm = bf16[64,32,1]{2,1,0:T(8,128)(2,1)S(1)} copy(bf16[64,32,1]{0,1,2:T(8,128)(2,1)} %bitcast.7) 2.1 us, %copy.5.a_log_hbm = f32[32,1]{1,0:T(8,128)S(1)} copy(f32[32,1]{0,1:T(1,128)} %bitcast.8) 0.4 us
+  kda_decode_step (KdaTiles(heads=32), bursts of 8 steps): 408.0 us per call over 5 calls
+    steps                  64     (6.38 us each)
+    compute             136.8 us
+    input waits          61.8 us  (+2.6 us filling the pipeline)
+    output waits        184.8 us
+    other                22.1 us  (decoding steps, starting copies, draining)
+    bottleneck: dma
+    trace: /tmp/autokernel-kda_decode_step-8oi3rgcf
+  autokernel wall     425.4 us  device     408.8 us   686.4 GB/s (84% of 819)
+  xla        out_vs_f64 7.14e-05  conv_vs_f64 0  state_vs_f64 0.00273  state_vs_f64_median_head 0.000414  out_vs_vllm 0.000122  conv_vs_vllm 0  state_vs_vllm 0.00273  identical 0
+    ops: %scatter_fusion.1 = f32[129,32,128,128]{3,2,1,0:T(8,128)} fusion(f32[129,32,128,128]{3,2,1,0:T(8,128)} %state.1, s32[64]{0:T(128)S(1)} %get-tuple-element.30, f32[64,32,128,128]{3,2,1,0:T(8,128)} %add_select_fusion), kind=kCustom, calls=%fused_computation.2 612.4 us, %while.2 = (s32[]{:T(128)}, f32[129,32,128,128]{3,2,1,0:T(8,128)}, s32[64,1]{0,1:T(1,128)S(1)}, f32[64,32,128,128]{3,2,1,0:T(8,128)}) while((s32[]{:T(128)}, f32[129,32,128,128]{3,2,1,0:T(8,128)}, s32[64,1]{0,1:T(1,128)S(1)}, f32[64,32,128,128]{3,2,1,0:T(8,128)}) %tuple.27), condition=%wide.while_cond.clone, body=%wide.while_body.sunk.clone 492.3 us, %dynamic-slice_dynamic-update-slice_fusion.3 = f32[64,32,128,128]{3,2,1,0:T(8,128)} fusion(f32[64,32,128,128]{3,2,1,0:T(8,128)} %get-tuple-element.74, s32[]{:T(128)S(6)} %copy.33, f32[129,32,128,128]{3,2,1,0:T(8,128)} %get-tuple-element.76, s32[]{:T(128)} %bitcast.99), kind=kLoop, calls=%fused_computation.3.clone.1.clone 472.1 us, %add_select_fusion = f32[64,32,128,128]{3,2,1,0:T(8,128)} fusion(f32[64,32,128,128]{3,2,1,0:T(8,128)} %get-tuple-element.7, f32[64,32,128]{2,1,0:T(8,128)S(1)} %get-tuple-element.23, f32[64,32,128]{2,1,0:T(8,128)S(1)} %fusion.22, f32[64,32,128]{2,1,0:T(8,128)S(1)} %get-tuple-element.19, pred[64]{0:T(512)(128)(4,1)S(1)} %get-tuple-element.28, pred[64]{0:T(512)(128)(4,1)S(1)} %get-tuple-element.29), kind=kLoop, calls=%fused_computation.6 404.8 us, %fusion.1 = f32[64,32,2,128]{3,2,1,0:T(2,128)S(1)} fusion(f32[64,32,128,128]{3,2,1,0:T(8,128)} %get-tuple-element.7, pred[64]{0:T(512)(128)(4,1)S(1)} %get-tuple-element.29, f32[64,32,128,1]{2,3,1,0:T(1,128)S(1)} %bitcast.106, f32[64,32,128,1]{2,3,1,0:T(1,128)S(1)} %bitcast.105), kind=kOutput, calls=%fused_computation.7 180.9 us, %constant_dynamic-slice_fusion.3 = s32[1,1]{0,1:T(1,128)} fusion(s32[64,1]{0,1:T(1,128)S(1)} %get-tuple-element.77, s32[]{:T(128)S(6)} %copy.33), kind=kLoop, calls=%fused_computation.4.clone.1.clone 20.1 us
+  xla        wall    1762.3 us  device    2235.5 us   125.5 GB/s (15% of 819)
+batch 128: 561.1 MB per step, pool of 257 slots
+  vllm       out_vs_f64 0.000102  conv_vs_f64 0  state_vs_f64 0.000183  state_vs_f64_median_head 3.13e-05
+    ops: kda_decode_fused_conv_recurrent.1 847.4 us, %copy.6 = bf16[16,8,96,128]{3,2,1,0:T(8,128)(2,1)S(1)} copy(bf16[16,8,96,128]{3,1,2,0:T(8,128)(2,1)} %bitcast.5) 5.1 us, %copy.4.beta_ref = bf16[128,32,1]{2,1,0:T(8,128)(2,1)S(1)} copy(bf16[128,32,1]{0,1,2:T(8,128)(2,1)} %bitcast.7) 3.6 us, %copy.5.a_log_ref = f32[32,1]{1,0:T(8,128)S(1)} copy(f32[32,1]{0,1:T(1,128)} %bitcast.8) 0.4 us
+  vllm       wall     876.7 us  device     856.5 us   655.1 GB/s (80% of 819)
+  chose KdaTiles(heads=32), bursts of 8 steps
+     KdaTiles(heads=16), 3 input / 2 output buffers                                880.2 us  dma
+     KdaTiles(heads=16), 4 input / 2 output buffers                                879.9 us  dma
+     KdaTiles(heads=16), bursts of 16 steps                                        829.9 us  dma
+     KdaTiles(heads=16), bursts of 8 steps                                         837.2 us  dma
+   * KdaTiles(heads=32), bursts of 8 steps                                         811.3 us  dma
+     KdaTiles(heads=32), bursts of 4 steps                                         819.0 us  dma
+  autokernel out_vs_f64 0.000102  conv_vs_f64 0  state_vs_f64 0.000183  state_vs_f64_median_head 3.13e-05  out_vs_vllm 0  conv_vs_vllm 0  state_vs_vllm 0  identical 1
+    ops: kda_decode_step.1 803.0 us, %copy.6 = bf16[16,8,96,128]{3,2,1,0:T(8,128)(2,1)S(1)} copy(bf16[16,8,96,128]{3,1,2,0:T(8,128)(2,1)} %bitcast.5) 5.1 us, %copy.4.beta_hbm = bf16[128,32,1]{2,1,0:T(8,128)(2,1)S(1)} copy(bf16[128,32,1]{0,1,2:T(8,128)(2,1)} %bitcast.7) 3.6 us, %copy.5.a_log_hbm = f32[32,1]{1,0:T(8,128)S(1)} copy(f32[32,1]{0,1:T(1,128)} %bitcast.8) 0.4 us
+  kda_decode_step (KdaTiles(heads=32), bursts of 8 steps): 811.4 us per call over 5 calls
+    steps                 128     (6.34 us each)
+    compute             273.7 us
+    input waits         109.1 us  (+2.6 us filling the pipeline)
+    output waits        396.0 us
+    other                30.1 us  (decoding steps, starting copies, draining)
+    bottleneck: dma
+    trace: /tmp/autokernel-kda_decode_step-f56i16i5
+  autokernel wall     831.2 us  device     812.2 us   690.9 GB/s (84% of 819)
+  xla        out_vs_f64 8.92e-05  conv_vs_f64 0  state_vs_f64 0.00258  state_vs_f64_median_head 0.000451  out_vs_vllm 0.000122  conv_vs_vllm 0  state_vs_vllm 0.00392  identical 0
+    ops: %scatter_fusion.1 = f32[257,32,128,128]{3,2,1,0:T(8,128)} fusion(f32[257,32,128,128]{3,2,1,0:T(8,128)} %state.1, s32[128]{0:T(128)S(1)} %get-tuple-element.30, f32[128,32,128,128]{3,2,1,0:T(8,128)} %add_select_fusion), kind=kCustom, calls=%fused_computation.2 1225.0 us, %while.2 = (s32[]{:T(128)}, f32[257,32,128,128]{3,2,1,0:T(8,128)}, s32[128,1]{0,1:T(1,128)S(1)}, f32[128,32,128,128]{3,2,1,0:T(8,128)}) while((s32[]{:T(128)}, f32[257,32,128,128]{3,2,1,0:T(8,128)}, s32[128,1]{0,1:T(1,128)S(1)}, f32[128,32,128,128]{3,2,1,0:T(8,128)}) %tuple.27), condition=%wide.while_cond.clone, body=%wide.while_body.sunk.clone 982.4 us, %dynamic-slice_dynamic-update-slice_fusion.3 = f32[128,32,128,128]{3,2,1,0:T(8,128)} fusion(f32[128,32,128,128]{3,2,1,0:T(8,128)} %get-tuple-element.74, s32[]{:T(128)S(6)} %copy.24, f32[257,32,128,128]{3,2,1,0:T(8,128)} %get-tuple-element.76, s32[]{:T(128)} %bitcast.94), kind=kLoop, calls=%fused_computation.3.clone.1.clone 942.1 us, %add_select_fusion = f32[128,32,128,128]{3,2,1,0:T(8,128)} fusion(f32[128,32,128,128]{3,2,1,0:T(8,128)} %get-tuple-element.7, f32[128,32,128]{2,1,0:T(8,128)S(1)} %get-tuple-element.23, f32[128,32,128]{2,1,0:T(8,128)S(1)} %fusion.22, f32[128,32,128]{2,1,0:T(8,128)S(1)} %get-tuple-element.19, pred[128]{0:T(512)(128)(4,1)S(1)} %get-tuple-element.28, pred[128]{0:T(512)(128)(4,1)S(1)} %get-tuple-element.29), kind=kLoop, calls=%fused_computation.6 813.4 us, %fusion.1 = f32[128,32,2,128]{3,2,1,0:T(2,128)S(1)} fusion(f32[128,32,128,128]{3,2,1,0:T(8,128)} %get-tuple-element.7, pred[128]{0:T(512)(128)(4,1)S(1)} %get-tuple-element.29, f32[128,32,128,1]{2,3,1,0:T(1,128)S(1)} %bitcast.100, f32[128,32,128,1]{2,3,1,0:T(1,128)S(1)} %bitcast.99), kind=kOutput, calls=%fused_computation.7 366.8 us, %constant_dynamic-slice_fusion.3 = s32[1,1]{0,1:T(1,128)} fusion(s32[128,1]{0,1:T(1,128)S(1)} %get-tuple-element.77, s32[]{:T(128)S(6)} %copy.24), kind=kLoop, calls=%fused_computation.4.clone.1.clone 40.1 us
+  xla        wall    3510.8 us  device    4468.9 us   125.6 GB/s (15% of 819)
+batch 256: 1122.1 MB per step, pool of 513 slots
+  vllm       out_vs_f64 6.24e-05  conv_vs_f64 0  state_vs_f64 0.000171  state_vs_f64_median_head 3.9e-05
+    ops: kda_decode_fused_conv_recurrent.1 1689.0 us, %copy.6 = bf16[32,8,96,128]{3,2,1,0:T(8,128)(2,1)S(1)} copy(bf16[32,8,96,128]{3,1,2,0:T(8,128)(2,1)} %bitcast.5) 9.4 us, %copy.4.beta_ref = bf16[256,32,1]{2,1,0:T(8,128)(2,1)S(1)} copy(bf16[256,32,1]{0,1,2:T(8,128)(2,1)} %bitcast.7) 6.9 us, %slice-done.3 = bf16[64,32,128]{2,1,0:T(8,128)(2,1)S(1)} async-done(((bf16[256,32,128]{2,1,0:T(8,128)(2,1)}), bf16[64,32,128]{2,1,0:T(8,128)(2,1)S(1)}, s32[]{:S(2)}) %slice-start.3) 0.7 us, %slice-done.2 = bf16[64,32,128]{2,1,0:T(8,128)(2,1)S(1)} async-done(((bf16[256,32,128]{2,1,0:T(8,128)(2,1)}), bf16[64,32,128]{2,1,0:T(8,128)(2,1)S(1)}, s32[]{:S(2)}) %slice-start.2) 0.6 us, %copy.5.a_log_ref = f32[32,1]{1,0:T(8,128)S(1)} copy(f32[32,1]{0,1:T(1,128)} %bitcast.8) 0.4 us
+  vllm       wall    1725.1 us  device    1707.4 us   657.2 GB/s (80% of 819)
+  chose KdaTiles(heads=32), bursts of 8 steps
+     KdaTiles(heads=16), 3 input / 2 output buffers                               1758.6 us  dma
+     KdaTiles(heads=16), 4 input / 2 output buffers                               1758.8 us  dma
+     KdaTiles(heads=16), bursts of 16 steps                                       1653.2 us  dma
+     KdaTiles(heads=16), bursts of 8 steps                                        1670.5 us  dma
+   * KdaTiles(heads=32), bursts of 8 steps                                        1617.1 us  dma
+     KdaTiles(heads=32), bursts of 4 steps                                        1633.7 us  dma
+  autokernel out_vs_f64 6.24e-05  conv_vs_f64 0  state_vs_f64 0.000171  state_vs_f64_median_head 3.9e-05  out_vs_vllm 0  conv_vs_vllm 0  state_vs_vllm 0  identical 1
+    ops: kda_decode_step.1 1598.9 us, %copy.6 = bf16[32,8,96,128]{3,2,1,0:T(8,128)(2,1)S(1)} copy(bf16[32,8,96,128]{3,1,2,0:T(8,128)(2,1)} %bitcast.5) 9.5 us, %copy.4.beta_hbm = bf16[256,32,1]{2,1,0:T(8,128)(2,1)S(1)} copy(bf16[256,32,1]{0,1,2:T(8,128)(2,1)} %bitcast.7) 7.0 us, %slice-done.3 = bf16[64,32,128]{2,1,0:T(8,128)(2,1)S(1)} async-done(((bf16[256,32,128]{2,1,0:T(8,128)(2,1)}), bf16[64,32,128]{2,1,0:T(8,128)(2,1)S(1)}, s32[]{:S(2)}) %slice-start.3) 0.7 us, %slice-done.2 = bf16[64,32,128]{2,1,0:T(8,128)(2,1)S(1)} async-done(((bf16[256,32,128]{2,1,0:T(8,128)(2,1)}), bf16[64,32,128]{2,1,0:T(8,128)(2,1)S(1)}, s32[]{:S(2)}) %slice-start.2) 0.5 us, %copy.5.a_log_hbm = f32[32,1]{1,0:T(8,128)S(1)} copy(f32[32,1]{0,1:T(1,128)} %bitcast.8) 0.4 us
+  kda_decode_step (KdaTiles(heads=32), bursts of 8 steps): 1617.8 us per call over 5 calls
+    steps                 256     (6.32 us each)
+    compute             547.3 us
+    input waits         203.4 us  (+2.6 us filling the pipeline)
+    output waits        817.3 us
+    other                47.2 us  (decoding steps, starting copies, draining)
+    bottleneck: dma
+    trace: /tmp/autokernel-kda_decode_step-d_tyk3_p
+  autokernel wall    1636.9 us  device    1617.2 us   693.8 GB/s (85% of 819)
+  xla        out_vs_f64 9.29e-05  conv_vs_f64 0  state_vs_f64 0.0029  state_vs_f64_median_head 0.000471  out_vs_vllm 0.000153  conv_vs_vllm 0  state_vs_vllm 0.00362  identical 0
+    ops: %scatter_fusion.1 = f32[513,32,128,128]{3,2,1,0:T(8,128)} fusion(f32[513,32,128,128]{3,2,1,0:T(8,128)} %state.1, s32[256]{0:T(256)S(1)} %bitcast.101, f32[256,32,128,128]{3,2,1,0:T(8,128)} %add_select_fusion), kind=kCustom, calls=%fused_computation.2 2450.1 us, %while.2 = (s32[]{:T(128)}, f32[513,32,128,128]{3,2,1,0:T(8,128)}, s32[256,1]{0,1:T(1,128)S(1)}, f32[256,32,128,128]{3,2,1,0:T(8,128)}) while((s32[]{:T(128)}, f32[513,32,128,128]{3,2,1,0:T(8,128)}, s32[256,1]{0,1:T(1,128)S(1)}, f32[256,32,128,128]{3,2,1,0:T(8,128)}) %tuple.30), condition=%wide.while_cond.clone, body=%wide.while_body.sunk.clone 1963.6 us, %dynamic-slice_dynamic-update-slice_fusion.3 = f32[256,32,128,128]{3,2,1,0:T(8,128)} fusion(f32[256,32,128,128]{3,2,1,0:T(8,128)} %get-tuple-element.72, s32[]{:T(128)S(6)} %copy.24, f32[513,32,128,128]{3,2,1,0:T(8,128)} %get-tuple-element.74, s32[]{:T(128)} %bitcast.93), kind=kLoop, calls=%fused_computation.3.clone.1.clone 1882.6 us, %add_select_fusion = f32[256,32,128,128]{3,2,1,0:T(8,128)} fusion(f32[256,32,128,128]{3,2,1,0:T(8,128)} %get-tuple-element.7, f32[256,32,128]{2,1,0:T(8,128)S(1)} %get-tuple-element.25, f32[256,32,128]{2,1,0:T(8,128)S(1)} %fusion.22, f32[256,32,128]{2,1,0:T(8,128)S(1)} %get-tuple-element.19, pred[256]{0:T(512)(128)(4,1)S(1)} %get-tuple-element.23, pred[256]{0:T(512)(128)(4,1)S(1)} %get-tuple-element.22), kind=kLoop, calls=%fused_computation.6 1629.8 us, %fusion.1 = f32[256,32,2,128]{3,2,1,0:T(2,128)S(1)} fusion(f32[256,32,128,128]{3,2,1,0:T(8,128)} %get-tuple-element.7, pred[256]{0:T(512)(128)(4,1)S(1)} %get-tuple-element.22, f32[256,32,128,1]{2,3,1,0:T(1,128)S(1)} %bitcast.99, f32[256,32,128,1]{2,3,1,0:T(1,128)S(1)} %bitcast.98), kind=kOutput, calls=%fused_computation.7 713.1 us, %constant_dynamic-slice_fusion.3 = s32[1,1]{0,1:T(1,128)} fusion(s32[256,1]{0,1:T(1,128)S(1)} %get-tuple-element.75, s32[]{:T(128)S(6)} %copy.24), kind=kLoop, calls=%fused_computation.4.clone.1.clone 80.5 us
+  xla        wall    6989.2 us  device    8927.0 us   125.7 GB/s (15% of 819)
+[exit 0]

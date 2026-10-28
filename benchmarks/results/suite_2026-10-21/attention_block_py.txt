@@ -1,0 +1,92 @@
+# TPU v5e (Colab), 2026-10-21, commit 080fc71: python benchmarks/attention_block.py  [complete]
+B=4 H=8 S=2048 Dh=128 F=4096 (D=1024): ms (TFLOP/s)
+  splash (default blocks) + RMSNorm + FFN        4.224  (  40.7)
+  splash (1024 x 1024) + RMSNorm + FFN        1.247  ( 137.8)
+  autokernel fused block, tuned                  1.106  ( 155.3)
+  speedup 3.82x over default splash, 1.13x over the best splash; max |fused - unfused| 0.0156 (outputs up to 3.50)
+    chose BlockTiles(block_q=512, block_kv=512, block_f=1024), 3 input / 2 output buffers
+       BlockTiles(block_q=256, block_kv=256, block_f=1024), 3 input / 2 output buffers     1165.2 us  compute
+       BlockTiles(block_q=512, block_kv=256, block_f=1024), 3 input / 2 output buffers     1162.8 us  compute
+       BlockTiles(block_q=256, block_kv=512, block_f=1024), 3 input / 2 output buffers     1127.3 us  compute
+     * BlockTiles(block_q=512, block_kv=512, block_f=1024), 3 input / 2 output buffers     1095.1 us  compute
+       BlockTiles(block_q=1024, block_kv=512, block_f=1024), 3 input / 2 output buffers     1149.2 us  compute
+       BlockTiles(block_q=512, block_kv=512, block_f=2048), 3 input / 2 output buffers     1085.8 us  compute
+       BlockTiles(block_q=512, block_kv=1024, block_f=1024), 3 input / 2 output buffers     1145.7 us  compute
+       BlockTiles(block_q=512, block_kv=512, block_f=512), 3 input / 2 output buffers     1109.1 us  compute
+B=8 H=8 S=1024 Dh=128 F=4096 (D=1024): ms (TFLOP/s)
+  splash (default blocks) + RMSNorm + FFN        2.606  (  59.3)
+  splash (  512 x 512) + RMSNorm + FFN        1.102  ( 140.3)
+  autokernel fused block, tuned                  1.020  ( 151.6)
+  speedup 2.55x over default splash, 1.08x over the best splash; max |fused - unfused| 0.0156 (outputs up to 3.64)
+    chose BlockTiles(block_q=256, block_kv=256, block_f=1024), 3 input / 2 output buffers
+     * BlockTiles(block_q=256, block_kv=256, block_f=1024), 3 input / 2 output buffers     1012.3 us  compute
+       BlockTiles(block_q=512, block_kv=256, block_f=1024), 3 input / 2 output buffers     1013.4 us  compute
+       BlockTiles(block_q=256, block_kv=256, block_f=2048), 3 input / 2 output buffers     1128.9 us  compute
+       BlockTiles(block_q=256, block_kv=512, block_f=1024), 3 input / 2 output buffers     1002.6 us  compute
+       BlockTiles(block_q=256, block_kv=128, block_f=1024), 3 input / 2 output buffers     1155.1 us  compute
+       BlockTiles(block_q=256, block_kv=256, block_f=512), 3 input / 2 output buffers     1028.0 us  compute
+       BlockTiles(block_q=128, block_kv=256, block_f=1024), 3 input / 2 output buffers     1721.8 us  dma
+B=2 H=16 S=2048 Dh=128 F=8192 (D=2048): ms (TFLOP/s)
+  splash (default blocks) + RMSNorm + FFN        4.928  (  62.7)
+  splash (1024 x 1024) + RMSNorm + FFN        1.955  ( 158.2)
+  autokernel fused block, tuned                  1.816  ( 170.3)
+  speedup 2.71x over default splash, 1.08x over the best splash; max |fused - unfused| 0.0156 (outputs up to 3.39)
+    chose BlockTiles(block_q=512, block_kv=512, block_f=1024), 3 input / 2 output buffers
+       BlockTiles(block_q=256, block_kv=256, block_f=1024), 3 input / 2 output buffers     1873.7 us  compute
+       BlockTiles(block_q=512, block_kv=256, block_f=1024), 3 input / 2 output buffers     1869.6 us  compute
+       BlockTiles(block_q=256, block_kv=256, block_f=2048), 3 input / 2 output buffers     2016.0 us  compute
+       BlockTiles(block_q=256, block_kv=512, block_f=1024), 3 input / 2 output buffers     1839.9 us  compute
+     * BlockTiles(block_q=512, block_kv=512, block_f=1024), 3 input / 2 output buffers     1804.1 us  compute
+       BlockTiles(block_q=1024, block_kv=512, block_f=1024), 3 input / 2 output buffers   JaxRuntimeError: RESOURCE_EXHAUSTED: XLA:TPU compile permanent error. Ran out of memory in memory space vmem. Used 136.80M of 128.00M vmem. Exceeded vmem capacity by 8.80M.
+       BlockTiles(block_q=512, block_kv=512, block_f=2048), 3 input / 2 output buffers     2917.3 us  overhead
+       BlockTiles(block_q=512, block_kv=1024, block_f=1024), 3 input / 2 output buffers     3627.3 us  overhead
+       BlockTiles(block_q=512, block_kv=512, block_f=512), 3 input / 2 output buffers     1815.1 us  compute
+B=1 H=16 S=4096 Dh=128 F=8192 (D=2048): ms (TFLOP/s)
+  splash (default blocks) + RMSNorm + FFN        7.324  (  46.9)
+  splash (1024 x 1024) + RMSNorm + FFN        2.199  ( 156.2)
+  autokernel fused block, tuned                  2.058  ( 166.9)
+  speedup 3.56x over default splash, 1.07x over the best splash; max |fused - unfused| 0.0156 (outputs up to 3.34)
+    chose BlockTiles(block_q=512, block_kv=512, block_f=1024), 3 input / 2 output buffers
+       BlockTiles(block_q=256, block_kv=256, block_f=1024), 3 input / 2 output buffers     2168.5 us  compute
+       BlockTiles(block_q=512, block_kv=256, block_f=1024), 3 input / 2 output buffers     2165.0 us  compute
+       BlockTiles(block_q=256, block_kv=512, block_f=1024), 3 input / 2 output buffers     2082.0 us  compute
+     * BlockTiles(block_q=512, block_kv=512, block_f=1024), 3 input / 2 output buffers     2046.3 us  compute
+       BlockTiles(block_q=1024, block_kv=512, block_f=1024), 3 input / 2 output buffers   JaxRuntimeError: RESOURCE_EXHAUSTED: XLA:TPU compile permanent error. Ran out of memory in memory space vmem. Used 136.80M of 128.00M vmem. Exceeded vmem capacity by 8.80M.
+       BlockTiles(block_q=512, block_kv=512, block_f=2048), 3 input / 2 output buffers     3559.2 us  overhead
+       BlockTiles(block_q=512, block_kv=1024, block_f=1024), 3 input / 2 output buffers     4026.3 us  overhead
+       BlockTiles(block_q=512, block_kv=512, block_f=512), 3 input / 2 output buffers     2053.5 us  compute
+B=4 H=16 S=2048 Dh=64 F=4096 (D=1024): ms (TFLOP/s)
+  splash (default blocks) + RMSNorm + FFN        6.787  (  25.3)
+  splash (  512 x 512) + RMSNorm + FFN        1.838  (  93.5)
+  autokernel fused block, tuned                  1.709  ( 100.5)
+  speedup 3.97x over default splash, 1.08x over the best splash; max |fused - unfused| 0.0156 (outputs up to 3.70)
+    chose BlockTiles(block_q=512, block_kv=512, block_f=1024), 3 input / 2 output buffers
+       BlockTiles(block_q=256, block_kv=256, block_f=1024), 3 input / 2 output buffers     1795.3 us  compute
+       BlockTiles(block_q=512, block_kv=256, block_f=1024), 3 input / 2 output buffers     1847.0 us  compute
+       BlockTiles(block_q=256, block_kv=512, block_f=1024), 3 input / 2 output buffers     1740.8 us  compute
+     * BlockTiles(block_q=512, block_kv=512, block_f=1024), 3 input / 2 output buffers     1697.0 us  compute
+       BlockTiles(block_q=1024, block_kv=512, block_f=1024), 3 input / 2 output buffers     2276.2 us  overhead
+       BlockTiles(block_q=512, block_kv=512, block_f=2048), 3 input / 2 output buffers     1687.4 us  compute
+       BlockTiles(block_q=512, block_kv=1024, block_f=1024), 3 input / 2 output buffers     2958.7 us  overhead
+       BlockTiles(block_q=512, block_kv=512, block_f=512), 3 input / 2 output buffers     1708.8 us  compute
+B=1 H=32 S=2048 Dh=128 F=16384 (D=4096): ms (TFLOP/s)
+  splash (default blocks) + RMSNorm + FFN        6.115  (  95.5)
+  splash (1024 x 1024) + RMSNorm + FFN        3.541  ( 165.0)
+  autokernel fused block, tuned                  3.267  ( 178.8)
+  speedup 1.87x over default splash, 1.08x over the best splash; max |fused - unfused| 0.0156 (outputs up to 3.38)
+    chose BlockTiles(block_q=256, block_kv=256, block_f=1024), 3 input / 2 output buffers
+     * BlockTiles(block_q=256, block_kv=256, block_f=1024), 3 input / 2 output buffers     3249.5 us  compute
+       BlockTiles(block_q=512, block_kv=256, block_f=1024), 2 input / 2 output buffers   JaxRuntimeError: RESOURCE_EXHAUSTED: E1001: CompileTimeScopedVmemOom:
+       BlockTiles(block_q=256, block_kv=512, block_f=1024), 2 input / 2 output buffers     3261.6 us  compute
+       BlockTiles(block_q=256, block_kv=128, block_f=1024), 3 input / 2 output buffers     3450.2 us  compute
+       BlockTiles(block_q=256, block_kv=256, block_f=512), 3 input / 2 output buffers     3260.1 us  compute
+       BlockTiles(block_q=128, block_kv=256, block_f=1024), 3 input / 2 output buffers     6143.9 us  dma
+
+B  H   S     Dh  F      default splash  best splash  autokernel  vs default  vs best
+4  8   2048  128 4096            4.224        1.247       1.106       3.82x    1.13x
+8  8   1024  128 4096            2.606        1.102       1.020       2.55x    1.08x
+2  16  2048  128 8192            4.928        1.955       1.816       2.71x    1.08x
+1  16  4096  128 8192            7.324        2.199       2.058       3.56x    1.07x
+4  16  2048  64  4096            6.787        1.838       1.709       3.97x    1.08x
+1  32  2048  128 16384           6.115        3.541       3.267       1.87x    1.08x
+[exit 0]

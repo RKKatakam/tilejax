@@ -1,5 +1,5 @@
-"""Test-wide setup: trace regions on (a TPU records them only if told before JAX starts), the examples
-importable, and `tpu` tests run only on a TPU v5e."""
+"""Test-wide setup: trace regions on (a TPU records them only if told before JAX starts), 8 simulated
+chips off a TPU, the examples importable, and `tpu` tests run only on a TPU v5e."""
 
 import os
 import sys
@@ -7,6 +7,9 @@ from pathlib import Path
 
 REGION_FLAG = "--xla_enable_custom_call_region_trace=true"  # autokernel.profiling.REGION_FLAG
 os.environ["LIBTPU_INIT_ARGS"] = f"{os.environ.get('LIBTPU_INIT_ARGS', '')} {REGION_FLAG}".strip()
+# Off a TPU, 8 CPU devices: kernels gathering across chips run on a simulated mesh of them.
+CHIPS_FLAG = "--xla_force_host_platform_device_count=8"
+os.environ["XLA_FLAGS"] = f"{os.environ.get('XLA_FLAGS', '')} {CHIPS_FLAG}".strip()
 
 import jax  # noqa: E402
 import pytest  # noqa: E402

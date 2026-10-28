@@ -3,14 +3,16 @@
 A schedule (`Config`) is the kernel's tunable (its block sizes, or whatever its fields mean) and its
 buffering (`Pipeline`). Tuning runs on the TPU, on the inputs of the call that asked for it (random inputs of
 their shapes if they are being traced, under `jax.jit`): a kernel whose masks read index arrays runs the
-steps those inputs need.
+steps those inputs need. (Random index arrays that place stores into an output updated in place hold
+distinct values: two tiles storing one window would race.)
 
 1. **Test.** Every candidate's output is compared with the loop nest run as plain JAX; a schedule that
    computes something else (or doesn't build, or doesn't compile) is out.
 2. **Trace.** Each candidate runs under the JAX profiler. Its device time ranks it, and its trace
    regions (profiling.py) say what limits it.
 3. **Change the schedule** the way the bottleneck says, and keep what's faster:
-   - copies exposed (`dma`): more input buffers, then the neighbouring schedules that move fewer bytes;
+   - copies exposed (`dma`): more input buffers (in a kernel whose tiles take one step, copies in bursts
+     too: pipeline.py), then the neighbouring schedules that move fewer bytes (or as many in fewer steps);
    - output copies exposed: more output buffers;
    - per-step overhead (`overhead`): the neighbouring schedules with fewer, bigger steps;
    - compute-bound, or no regions: every neighbouring schedule, fewest steps first.
@@ -35,7 +37,7 @@ import numpy as np
 
 from . import profiling, v5e
 from .errors import KernelError
-from .pipeline import MAX_INPUT_BUFFERS, MAX_OUTPUT_BUFFERS, Pipeline, default_pipeline, fits, vmem_bytes
+from .pipeline import MAX_BURST, MAX_INPUT_BUFFERS, MAX_OUTPUT_BUFFERS, Pipeline, default_pipeline, fits, vmem_bytes
 from .plan import Kind, Operand, Plan
 from .profiling import KernelProfile
 from .schedule import Schedule
@@ -54,16 +56,20 @@ MIN_GAIN = 0.01  # a schedule must be this much faster to replace the best so fa
 
 @dataclass(frozen=True)
 class Config:
-    """A schedule: the kernel's tunable (None if it has none) and its buffering."""
+    """A schedule: the kernel's tunable (None if it has none), its buffering, and, where its runtime masks
+    allow either (`Plan.either`), whether it finds its steps with a cursor as it runs rather than from
+    tables the device makes before it."""
 
     tunable: Any
     pipeline: Pipeline
+    cursor: bool = False
 
     def __str__(self) -> str:
+        rest = f"{self.pipeline}, steps found as it runs" if self.cursor else str(self.pipeline)
         if self.tunable is None:
-            return str(self.pipeline)
+            return rest
         fields = ", ".join(f"{k}={getattr(self.tunable, k)!r}" for k in choices(self.tunable))
-        return f"{type(self.tunable).__name__}({fields}), {self.pipeline}"
+        return f"{type(self.tunable).__name__}({fields}), {rest}"
 
 
 @dataclass
@@ -143,7 +149,8 @@ def _stats(plan: Plan, schedule: Schedule) -> _Stats:
 
     moved = sum(copies(op) * _bytes(op.tile.shape, op.tile.dtype) for op in plan.operands)
     for out in plan.outputs:
-        stores = schedule.tiles + schedule.fills if out.phase is None else schedule.phase_steps[out.phase]
+        fills = schedule.fills if out.fill is not None else 0  # (an input updated in place isn't filled)
+        stores = schedule.tiles + fills if out.phase is None else schedule.phase_steps[out.phase]
         moved += stores * _bytes(out.tile.shape, out.dtype)
     return _Stats(schedule.steps, moved)
 
@@ -163,7 +170,7 @@ def proposals(kernel: Kernel, signature: Signature, trial: Trial) -> list[Config
     config, profile = trial.config, trial.profile
     if profile is None:  # it didn't run: the neighbours that need the least VMEM first, then less buffering
         return _smaller(kernel, signature, config)
-    plan, schedule = kernel.build(signature, config.tunable)
+    plan, schedule = kernel.build(signature, config.tunable, config.cursor)
     here, pipe, loops = _stats(plan, schedule), config.pipeline, _loop_steps(plan)
     exposed = EXPOSED_SHARE * profile.device_s
     buffering = []
@@ -171,26 +178,56 @@ def proposals(kernel: Kernel, signature: Signature, trial: Trial) -> list[Config
         buffering.append(dataclasses.replace(pipe, input_buffers=pipe.input_buffers + 1))
     if profile.regions and profile.out_wait_s > exposed and pipe.output_buffers < MAX_OUTPUT_BUFFERS:
         buffering.append(dataclasses.replace(pipe, output_buffers=pipe.output_buffers + 1))
-    moves = [Config(config.tunable, p) for p in buffering if fits(plan, schedule, p)]
+    if pipe.burst:
+        buffering = []  # (a burst's slots follow from its steps)
+    if plan.single_step and not schedule.runtime_tiles and profile.bottleneck == "dma":
+        buffering += [Pipeline.bursts(g) for g in _bursts(pipe.burst)]
+    moves = [Config(config.tunable, p, config.cursor) for p in buffering if fits(plan, schedule, p)]
+    if plan.either:  # the other way of finding the steps (decode kernels gain by a cursor, grouped matmuls lose)
+        moves.insert(0, dataclasses.replace(config, cursor=not config.cursor))
 
     near: list[tuple[_Stats, Config]] = []
     for tunable in neighbours(config.tunable) if config.tunable is not None else ():
         try:
-            plan, schedule = kernel.build(signature, tunable)
-            # Keep the buffering if it fits with the new tiles, else the most that does.
-            pipeline = pipe if fits(plan, schedule, pipe) else default_pipeline(plan, schedule)
+            plan, schedule = kernel.build(signature, tunable, config.cursor)
+            pipeline = _keep(plan, schedule, pipe, here)
         except KernelError:
             continue  # breaks a layout rule, doesn't divide a loop, doesn't fit in VMEM, ...
         if _loop_steps(plan) == loops:
             continue  # the same kernel (the code clamps the field to the array, say)
-        near.append((_stats(plan, schedule), Config(tunable, pipeline)))
-    if profile.bottleneck == "dma":
-        near = sorted((n for n in near if n[0].dma_bytes < here.dma_bytes), key=lambda n: n[0].dma_bytes)
+        near.append((_stats(plan, schedule), Config(tunable, pipeline, config.cursor)))
+    if profile.bottleneck == "dma":  # (fewer bytes; or as many in fewer steps, which never costs more)
+        near = [n for n in near if (n[0].dma_bytes, n[0].steps) < (here.dma_bytes, here.steps)]
+        near = sorted(near, key=lambda n: (n[0].dma_bytes, n[0].steps))
     elif profile.bottleneck == "overhead":
         near = sorted((n for n in near if n[0].steps < here.steps), key=lambda n: n[0].steps)
     else:
         near = sorted(near, key=lambda n: n[0].steps)
     return moves + [c for _, c in near]
+
+
+def _keep(plan: Plan, schedule: Schedule, pipe: Pipeline, before: _Stats) -> Pipeline:
+    """The buffering for new tiles: `pipe` if it fits with them, else the most that does. Bursts keep the
+    bytes they move (what a burst gains depends on), as near as a power of two of steps does, as long as
+    that fits; none if the new tiles take more than one step."""
+    if not pipe.burst:
+        return pipe if fits(plan, schedule, pipe) else default_pipeline(plan, schedule)
+    if not plan.single_step:
+        return default_pipeline(plan, schedule)
+    after = _stats(plan, schedule)
+    burst = pipe.burst * (before.dma_bytes / before.steps) / (after.dma_bytes / after.steps)
+    burst = min(MAX_BURST, 2 ** max(0, round(math.log2(burst))))
+    while burst > 1 and not fits(plan, schedule, Pipeline.bursts(burst)):
+        burst //= 2
+    return Pipeline.bursts(burst)
+
+
+def _bursts(burst: int) -> list[int]:
+    """The bursts (in steps) to try after copies in bursts of `burst` steps (0: no bursts): the largest
+    first from none (on a v5e, bursts of 8-16 MiB moved the most), else twice and half as many steps."""
+    if not burst:
+        return [g for g in (16, 8, 4) if g <= MAX_BURST]
+    return [g for g in (2 * burst, burst // 2) if 2 <= g <= MAX_BURST]
 
 
 def _smaller(kernel: Kernel, signature: Signature, config: Config) -> list[Config]:
@@ -208,13 +245,19 @@ def _smaller(kernel: Kernel, signature: Signature, config: Config) -> list[Confi
     return found + [c for _, c in sorted(near, key=lambda n: n[0])]
 
 
-def random_inputs(signature: Signature, bounds: dict[int, int] | None = None, seed: int = 0) -> list[jax.Array]:
+def random_inputs(
+    signature: Signature, bounds: dict[int, int] | None = None, seed: int = 0, distinct: frozenset[int] = frozenset()
+) -> list[jax.Array]:
     """Inputs of these shapes and dtypes to tune on: normal floats, small integers, random booleans; the
-    inputs `bounds` names (index arrays) from 0 to their bound."""
+    inputs `bounds` names (index arrays) from 0 to their bound, distinct values for those in `distinct` (as
+    far as the bound allows)."""
     keys = jax.random.split(jax.random.key(seed), len(signature))
     inputs = []
     for i, (key, (shape, dtype)) in enumerate(zip(keys, signature, strict=True)):
-        if bounds and i in bounds:
+        if bounds and i in distinct and math.prod(shape) <= bounds[i] + 1:
+            values = jax.random.permutation(key, bounds[i] + 1)[: math.prod(shape)]
+            inputs.append(values.reshape(shape).astype(dtype))
+        elif bounds and i in bounds:
             inputs.append(jax.random.randint(key, shape, 0, bounds[i] + 1).astype(dtype))
         elif jnp.issubdtype(dtype, jnp.floating):
             inputs.append(jax.random.normal(key, shape, jnp.float32).astype(dtype))
@@ -225,12 +268,22 @@ def random_inputs(signature: Signature, bounds: dict[int, int] | None = None, se
     return inputs
 
 
-def _index_bounds(kernel: Kernel, signature: Signature, start: Config) -> dict[int, int]:
+def _index_bounds(kernel: Kernel, signature: Signature, start: Config) -> tuple[dict[int, int], frozenset[int]]:
     """For each index array, the bound of the values to tune on: the furthest any loop goes (sequence
-    lengths up to a cache's size, expert offsets up to the rows, ...)."""
+    lengths up to a cache's size, expert offsets up to the rows, ...), or for one that places stores, the
+    last element of the dim it indexes; and those that place stores (their values must be distinct)."""
     plan, _ = kernel.build(signature, start.tunable)
     furthest = max(r.start + r.count * r.step for r in plan.loops)
-    return {index.param: furthest for index in plan.indices}
+    bounds = {index.param: furthest for index in plan.indices}
+    params = {index.name: index.param for index in plan.indices}
+    distinct = set()
+    for out in plan.outputs:
+        for window, dim in zip(out.tile.windows, out.shape, strict=True):
+            if window.index is not None:
+                param = params[window.index.value.id]  # type: ignore[attr-defined]
+                bounds[param] = min(bounds[param], dim - 1)
+                distinct.add(param)
+    return bounds, frozenset(distinct)
 
 
 def _reference_config(kernel: Kernel, signature: Signature, start: Config) -> Any:
@@ -289,14 +342,17 @@ def tune(kernel: Kernel, signature: Signature, arrays: Sequence[Any] | None = No
     docstring)."""
     start = kernel.default_config(signature)
     kernel.lowered(signature, start)  # the default schedule builds, before anything runs
-    if not _can_time():
+    # (A kernel gathering across chips runs only inside jax.shard_map, on all of them at once: not yet timed
+    # here, it runs its default schedule.)
+    if not _can_time() or kernel.nest.all_gathers:
         return Tuning(Trial(start))
 
     def run() -> Tuning:
         if _concrete(arrays):
             inputs = list(arrays)  # type: ignore[arg-type]
         else:
-            inputs = random_inputs(signature, _index_bounds(kernel, signature, start))
+            bounds, distinct = _index_bounds(kernel, signature, start)
+            inputs = random_inputs(signature, bounds, distinct=distinct)
         args = [_reference_config(kernel, signature, start)] if start.tunable is not None else []
         want = kernel.reference(*inputs, *args)
         return search(

@@ -1,0 +1,28 @@
+# TPU v5e (Colab), 2026-10-21, commit 080fc71: python benchmarks/matmul.py  [complete]
+8192^3 bf16, ms (TFLOP/s of the dense matmul's work)
+  XLA dense                                           5.904  ( 186.2)
+  XLA causal (tril)                                   5.912
+  autokernel dense, tuned                             5.779  ( 190.3)
+    chose MatmulTiles(tm=2048, tn=1024, tk=512), 3 input / 2 output buffers
+       MatmulTiles(tm=512, tn=512, tk=512), 3 input / 2 output buffers              6346.5 us  compute
+       MatmulTiles(tm=1024, tn=512, tk=512), 3 input / 2 output buffers             6005.5 us  compute
+       MatmulTiles(tm=2048, tn=512, tk=512), 3 input / 2 output buffers             5836.3 us  compute
+     * MatmulTiles(tm=2048, tn=1024, tk=512), 3 input / 2 output buffers            5764.8 us  compute
+       MatmulTiles(tm=2048, tn=2048, tk=512), 3 input / 2 output buffers            5722.6 us  compute
+       MatmulTiles(tm=2048, tn=1024, tk=1024), 3 input / 2 output buffers           5721.6 us  compute
+       MatmulTiles(tm=1024, tn=1024, tk=512), 3 input / 2 output buffers            5857.7 us  compute
+       MatmulTiles(tm=2048, tn=1024, tk=256), 3 input / 2 output buffers            5839.1 us  compute
+  autokernel dense, default MatmulTiles(tm=512, tn=512, tk=512)    6.347  ( 173.2)
+  autokernel causal, tuned                            3.254  ( 337.9)
+    chose MatmulTiles(tm=512, tn=512, tk=2048), 3 input / 2 output buffers
+       MatmulTiles(tm=512, tn=512, tk=512), 3 input / 2 output buffers              3447.8 us  compute
+       MatmulTiles(tm=512, tn=512, tk=1024), 3 input / 2 output buffers             3357.2 us  compute
+       MatmulTiles(tm=512, tn=512, tk=1024), 4 input / 2 output buffers             3356.7 us  compute
+     * MatmulTiles(tm=512, tn=512, tk=2048), 3 input / 2 output buffers             3263.9 us  compute
+       MatmulTiles(tm=512, tn=512, tk=2048), 4 input / 2 output buffers             3264.0 us  compute
+       MatmulTiles(tm=1024, tn=512, tk=2048), 3 input / 2 output buffers            3253.4 us  compute
+       MatmulTiles(tm=512, tn=1024, tk=2048), 3 input / 2 output buffers            3259.5 us  compute
+       MatmulTiles(tm=256, tn=512, tk=2048), 3 input / 2 output buffers             4759.6 us  dma
+       MatmulTiles(tm=512, tn=256, tk=2048), 3 input / 2 output buffers             4817.4 us  dma
+  autokernel causal, default MatmulTiles(tm=512, tn=512, tk=512)    3.488  ( 315.3)
+[exit 0]

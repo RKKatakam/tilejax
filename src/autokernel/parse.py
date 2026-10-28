@@ -33,6 +33,9 @@ kernel, the next layer's weights fetched while this one's run.
 An input read only element by element, `lengths[b]` (integer indices, no slices), is an index array: the
 kernel keeps it whole in SMEM, and tile code, reduction masks and the indices of tile reads
 (`w[expert[e], :, :]`) read its elements when the kernel runs.
+
+An input gathered across the chips of a mesh axis in the prologue, `xs = autokernel.all_gather(x, "x")`
+(collective.py), is read like an input: the parallel loop over its rows walks them as they arrive.
 """
 
 from __future__ import annotations
@@ -46,7 +49,7 @@ from dataclasses import dataclass, field
 from .errors import KernelError
 from .tilecode import Store, as_store, assigned, element_reads, flatten, reads
 
-__all__ = ["Loop", "Nest", "Repeat", "parse"]
+__all__ = ["AllGather", "Loop", "Nest", "Repeat", "parse"]
 
 # Prologue statements: Python run on shapes when the kernel is planned.
 _PROLOGUE_STATEMENTS = (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Assert, ast.Pass)
@@ -75,13 +78,24 @@ class Repeat:
 
 
 @dataclass(frozen=True)
+class AllGather:
+    """`name = autokernel.all_gather(source, axis)` in the prologue: input `source` gathered across the chips of
+    the mesh axis `axis`."""
+
+    name: str
+    source: str
+    axis: str
+    node: ast.Assign
+
+
+@dataclass(frozen=True)
 class Nest:
     """A kernel function's loop nest, as written."""
 
     name: str
     filename: str
     function: ast.FunctionDef  # line numbers are the file's
-    params: tuple[str, ...]  # the input arrays
+    params: tuple[str, ...]  # the arrays the tile code reads tiles of: the input arrays, then the gathered ones
     tunable: str | None  # the last parameter, if it has a default: the tunable autokernel optimizes over
     prologue: tuple[ast.stmt, ...]
     allocations: dict[str, ast.Assign]  # output -> the prologue statement allocating it
@@ -95,6 +109,7 @@ class Nest:
     repeats: tuple[Repeat, ...]
     stores: dict[str, Store]  # output -> its store: in the last segment, or a reduction loop's body
     stored_in: dict[str, int | None]  # output -> the reduction loop storing a tile of it per step (None: per tile)
+    all_gathers: tuple[AllGather, ...] = ()  # inputs gathered across chips (their names end `params`)
     _store_nodes: dict[int, Store] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
@@ -112,6 +127,11 @@ class Nest:
         return out
 
     @property
+    def inputs(self) -> tuple[str, ...]:
+        """The function's input arrays (`params` without the gathered ones)."""
+        return self.params[: len(self.params) - len(self.all_gathers)]
+
+    @property
     def loops(self) -> tuple[Loop, ...]:
         return self.parallel + self.reductions + tuple(rep.loop for rep in self.repeats)
 
@@ -121,8 +141,12 @@ class Nest:
 
     @property
     def runtime_masks(self) -> bool:
-        """Do masks read elements of index arrays? Then they are evaluated when the kernel runs."""
-        return any(loop.mask is not None and element_reads(loop.mask, self.params) for loop in self.reductions)
+        """Do masks or loop bounds read elements of index arrays (or of values the tile code computes)? Then
+        they are evaluated when the kernel runs (and the function itself only runs eagerly)."""
+        arrays = set(self.params) | assigned(self.tile)
+        return any(loop.mask is not None and element_reads(loop.mask, self.params) for loop in self.reductions) or any(
+            element_reads(bound, arrays) for loop in self.loops for bound in loop.bounds
+        )
 
     def store(self, stmt: ast.stmt) -> Store | None:
         """The output store `stmt` is, if it is one."""
@@ -177,6 +201,7 @@ class _Parser:
             raise self.error("the loop nest must be followed by `return` of the outputs, and nothing else", node)
         outputs = self._outputs(body[at + 1])  # type: ignore[arg-type]
         allocations = self._allocations(prologue, outputs, body[at + 1])
+        all_gathers = self._all_gathers(prologue, params, outputs)
 
         parallel, tile = self._parallel_loops(body[at])  # type: ignore[arg-type]
         reductions, bodies, segments, repeats = self._split_tile(tile)
@@ -185,7 +210,7 @@ class _Parser:
             name=self.name,
             filename=self.filename,
             function=self.fdef,
-            params=params,
+            params=params + tuple(g.name for g in all_gathers),
             tunable=tunable,
             prologue=prologue,
             allocations=allocations,
@@ -197,6 +222,7 @@ class _Parser:
             repeats=repeats,
             stores=stores,
             stored_in=stored_in,
+            all_gathers=all_gathers,
         )
         self._check_names(nest)
         return nest
@@ -244,6 +270,38 @@ class _Parser:
             if name not in allocations:
                 raise self.error(f"output `{name}` must be allocated before the loops: `{name} = jnp.zeros(...)`", ret)
         return allocations
+
+    def _all_gathers(
+        self, prologue: tuple[ast.stmt, ...], params: tuple[str, ...], outputs: tuple[str, ...]
+    ) -> tuple[AllGather, ...]:
+        """The prologue's `xs = autokernel.all_gather(x, "axis")` statements (plan.py checks the function is
+        autokernel's)."""
+        usage = 'gather an input across chips as a statement of its own: `xs = autokernel.all_gather(x, "axis")`'
+        gathers: list[AllGather] = []
+        for stmt in prologue:
+            value = getattr(stmt, "value", None)
+            if not (isinstance(value, ast.Call) and _function_name(value.func) == "all_gather"):
+                continue
+            target = stmt.targets[0] if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 else None
+            source, axis = value.args if len(value.args) == 2 and not value.keywords else (None, None)
+            if not (
+                isinstance(target, ast.Name)
+                and isinstance(source, ast.Name)
+                and source.id in params
+                and isinstance(axis, ast.Constant)
+                and isinstance(axis.value, str)
+            ):
+                raise self.error(usage + ", x an input and the axis a string", stmt)
+            if target.id in params or target.id in outputs:
+                raise self.error(f"`{target.id}` is an input or an output: gather into a name of its own", stmt)
+            gathers.append(AllGather(target.id, source.id, axis.value, stmt))  # type: ignore[arg-type]
+        if len(gathers) > 1:
+            raise self.error("a kernel gathers one input across chips", gathers[1].node)
+        for gather in gathers:
+            for stmt in prologue:
+                if stmt is not gather.node and gather.name in assigned([stmt]):
+                    raise self.error(f"`{gather.name}` is gathered across chips: don't assign it again", stmt)
+        return tuple(gathers)
 
     # ------------------------------------------------------------------ loops
 
@@ -462,6 +520,11 @@ class _Parser:
             for stmt in flatten(outside):  # (masks outside it can't read it: they read only enclosing loops)
                 if rep.loop.var in reads(stmt):
                     raise self.error(f"`{rep.loop.var}` is only defined inside its repeat loop", stmt)
+
+
+def _function_name(func: ast.expr) -> str | None:
+    """The name a call calls a function by: `f(...)` or `module.f(...)`."""
+    return func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else None
 
 
 def _names_only(target: ast.expr) -> bool:

@@ -816,3 +816,30 @@ def test_a_value_the_tile_updates_part_of_lives_in_vmem():
     out = check(kernel, x)
     np.testing.assert_allclose(f64(out[0]), f64(x)) and np.testing.assert_allclose(f64(out[1]), 0.0)
     assert "acc_ref[0] = " in kernel.source(x)
+
+
+def test_phases_share_rings_of_windows_of_one_shape():
+    kernel = make_kernel(
+        """
+        def f(x, w, v, u):
+            out = jnp.zeros((16, 128))
+            for i in range(0, 16, 8):
+                acc = jnp.zeros((8, 128))
+                for k in range(0, 256, 128):
+                    acc += x[i : i + 8, k : k + 128] @ w[k : k + 128, :]
+                for j in range(0, 256, 128):
+                    acc += x[i : i + 8, j : j + 128] @ (v[j : j + 128, :] + u[j : j + 128, :])
+                out = out.at[i : i + 8, :].set(acc)
+            return out
+        """
+    )
+    x, w, v, u = rand((16, 256)), rand((256, 128), 1), rand((256, 128), 2), rand((256, 128), 3)
+    out = check(kernel, x, w, v, u)
+    want = f64(x) @ (f64(w) + f64(v) + f64(u))
+    np.testing.assert_allclose(f64(out), want, rtol=1e-4, atol=1e-4)
+    lowered = kernel.lower(x, w, v, u)
+    # The second phase's x and v take the first phase's rings; u, read beside v, has a ring of its own.
+    src = lowered.source
+    assert "# w_bufs: w[k:k + 128, :], v[j:j + 128, :]" in src and "# u_bufs: u[j:j + 128, :]" in src
+    assert "# x_bufs: x[i:i + 8, k:k + 128], x[i:i + 8, j:j + 128]" in src
+    assert lowered.vmem_bytes == 3 * (8 * 128 + 2 * 128 * 128) * 4 + 2 * 8 * 128 * 4 + 8 * 128 * 4

@@ -54,7 +54,7 @@ writes each chunk's operands to HBM (bf16: [W; Gamma Q], U, the decayed attentio
 transposed: 640 x 128 per chunk and head, and the chunk's decay), and a thin sequential kernel
 (`delta_scan`) runs the state chain over them, a tile per (batch, group of heads). It moves 3.5x the
 fused kernel's bytes. (Under `jax.jit` the scan tunes on random operands, whose recurrence would grow
-without bound: it clamps its states to STATE_MAX, which real ones never reach.)
+without bound: it clamps its states to STATE_MAX every 512 tokens, which real ones never reach.)
 
 `reference_recurrent` is the recurrence above in float64 NumPy; `baseline_chunked` the chunked algorithm
 in plain JAX (intra-chunk work batched over every chunk, a `lax.scan` over chunks for the state, outputs
@@ -81,6 +81,7 @@ KDA_GATE_MIN = -5.0  # KDA: per-token log decays are clamped to [KDA_GATE_MIN, 0
 NORM_EPS = 1e-6  # q and k L2 normalization, as flash-linear-attention's
 PACKED = 5 * CHUNK  # the split form's rows per chunk and head: [W; Gamma Q], U, attention, keys^T
 STATE_MAX = 1e8  # the split form's scan clamps its states to this, far beyond what real inputs reach
+STATE_CLAMP_CHUNKS = 4  # ... every this many chunks (512 tokens), whatever its block
 
 
 @autokernel.tunable
@@ -498,12 +499,16 @@ def kda_chunks(q, k, v, g, rows, tiles=ChunkTiles()):
     return packed, decays
 
 
-def scan_step(packed, decays, state):
+def scan_step(packed, decays, state, first):
     """A step of `delta_scan`: packed (chunks, PACKED, heads * HEAD_DIM) operands and decays (chunks, 1,
-    heads * HEAD_DIM); the chunks' outputs (chunks, C, heads * d_v) f32 and the states after them."""
+    heads * HEAD_DIM), from chunk `first` on; the chunks' outputs (chunks, C, heads * d_v) f32 and the states
+    after them."""
     # The delta rule's states stay near the size of its values (each token's update is a contraction plus
     # beta k v^T); on random operands, which tuning runs on, they would grow ~100x per chunk and overflow.
-    state = jnp.clip(state, -STATE_MAX, STATE_MAX)
+    # Clamped every STATE_CLAMP_CHUNKS chunks of the sequence, not every step: a step's chunks are the
+    # tunable's, and the result mustn't be.
+    limit = jnp.where(first % STATE_CLAMP_CHUNKS == 0, STATE_MAX, jnp.inf)
+    state = jnp.clip(state, -limit, limit)
     ops = []
     for c in range(packed.shape[0]):
         for h in range(0, packed.shape[2], HEAD_DIM):
@@ -522,12 +527,13 @@ def delta_scan(packed, decays, tiles=SCAN_TILES):
     G = min(tiles.heads, D // HEAD_DIM)
     W = G * HEAD_DIM
     N = min(tiles.block // CHUNK, NC)
+    assert N == NC or STATE_CLAMP_CHUNKS % N == 0  # (every step starts at the chunks the states are clamped at)
     out = jnp.zeros((B, NC, CHUNK, D), jnp.bfloat16)
     for b in range(B):
         for j in range(0, D, W):
             state = jnp.zeros((G, HEAD_DIM, HEAD_DIM), jnp.float32)
             for c in range(0, NC, N):
-                o, state = scan_step(packed[b, c : c + N, :, j : j + W], decays[b, c : c + N, :, j : j + W], state)
+                o, state = scan_step(packed[b, c : c + N, :, j : j + W], decays[b, c : c + N, :, j : j + W], state, c)
                 out = out.at[b, c : c + N, :, j : j + W].set(o.astype(jnp.bfloat16))
     return out
 
