@@ -30,6 +30,8 @@ from linear_attention import (
     split_inputs,
 )
 
+from autokernel.api import compare
+
 KERNELS = {False: gated_delta_rule, True: kimi_delta_attention}  # by: decays per key channel?
 SPLIT = {False: gated_delta_rule_split, True: kimi_delta_attention_split}
 
@@ -156,6 +158,12 @@ def test_split_form_is_finite_on_random_operands():
     out = delta_scan(packed, decays, DeltaTiles(heads=2, block=512))
     assert np.isfinite(f64(out)).all()
     delta_scan.verify(packed, decays, DeltaTiles(heads=2, block=512))
+    # Tuning compares every block with the reference at the largest one: the states are clamped at the same
+    # tokens whatever the block.
+    want = delta_scan.reference(packed, decays, DeltaTiles(heads=2, block=512))
+    for block in (128, 256):
+        got = delta_scan(packed, decays, DeltaTiles(heads=2, block=block))
+        compare(f"delta_scan at block {block}", got, want, inputs=(jnp.bfloat16,))
 
 
 def _gated_rmsnorm(o, z, weight, eps=1e-6):
